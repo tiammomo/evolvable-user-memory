@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Evolvable Memory 可追溯用户记忆工作台" />
+    <meta name="api-port" content="38089" />
+    <title>Evolvable Memory · 记忆工作台</title>
+    <link rel="icon" href="./mark.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="mobile-scrim" id="mobile-scrim" aria-hidden="true"></div>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" role="img">
+              <path d="M16 4.5a11.5 11.5 0 1 0 0 23 11.5 11.5 0 0 0 0-23Z" />
+              <path d="M11 12.5h10M11 16h7M11 19.5h9" />
+            </svg>
+          </span>
+          <span>
+            <strong>Evolvable</strong>
+            <small>Memory Console</small>
+          </span>
+        </div>
+
+        <nav class="main-nav" aria-label="主导航">
+          <button class="nav-item is-active" type="button" data-view="overview">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z" /></svg>
+            <span>工作台</span>
+          </button>
+          <button class="nav-item" type="button" data-view="capture">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+            <span>写入记忆</span>
+          </button>
+          <button class="nav-item" type="button" data-view="memories">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5C5 4.7 5.7 4 6.5 4H19v15H6.5C5.7 19 5 18.3 5 17.5v-12Z" /><path d="M8 8h7m-7 4h5M5 16h14" /></svg>
+            <span>当前记忆</span>
+          </button>
+          <button class="nav-item" type="button" data-view="recall">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 4 4" /></svg>
+            <span>记忆召回</span>
+          </button>
+          <button class="nav-item" type="button" data-view="architecture">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2" /><circle cx="6" cy="18" r="2" /><circle cx="18" cy="18" r="2" /><path d="M12 7v4m0 0-6 5m6-5 6 5" /></svg>
+            <span>系统架构</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-bottom">
+          <a class="docs-link" href="http://127.0.0.1:38089/docs" data-backend-link="/docs" target="_blank" rel="noreferrer">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h8l4 4v14H7V3Z" /><path d="M15 3v5h4M10 12h6m-6 4h6" /></svg>
+            <span>API 文档</span>
+            <svg class="external-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5m0-5-8 8M19 14v5H5V5h5" /></svg>
+          </a>
+          <div class="service-state">
+            <span class="status-dot" id="status-dot"></span>
+            <span>
+              <strong id="status-label">正在连接</strong>
+              <small id="status-detail">检查 API 状态…</small>
+            </span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div class="topbar-title">
+            <button class="icon-button mobile-menu" id="mobile-menu" type="button" aria-label="打开导航">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+            </button>
+            <div>
+              <p class="eyebrow" id="page-eyebrow">MEMORY OVERVIEW</p>
+              <h1 id="page-title">记忆工作台</h1>
+            </div>
+          </div>
+          <div class="scope-control" aria-label="当前数据作用域">
+            <div class="scope-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M4 20h16M6 20V8l6-4 6 4v12M9 11h2m2 0h2m-6 4h2m2 0h2" /></svg>
+            </div>
+            <label>
+              <span>租户</span>
+              <input id="tenant-id" value="demo" autocomplete="off" />
+            </label>
+            <span class="scope-divider"></span>
+            <label>
+              <span>用户</span>
+              <input id="subject-id" value="alice" autocomplete="off" />
+            </label>
+            <button class="scope-save" id="save-scope" type="button">应用</button>
+          </div>
+        </header>
+
+        <div class="page-container">
+          <section class="view is-active" id="view-overview" data-title="记忆工作台" data-eyebrow="MEMORY OVERVIEW">
+            <div class="hero-panel">
+              <div class="hero-copy">
+                <span class="hero-kicker"><i></i> Evidence-grounded memory</span>
+                <h2>让每一次记住，<br /><em>都有据可循。</em></h2>
+                <p>把观察、信念与真实结果分开管理。记忆不会因为被读取而自我强化，只从可归因的反馈中成长。</p>
+                <div class="hero-actions">
+                  <button class="button button-primary" type="button" data-go="capture">
+                    写入一条记忆
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+                  </button>
+                  <button class="button button-quiet" type="button" data-go="recall">开始召回</button>
+                </div>
+              </div>
+              <div class="hero-visual" aria-hidden="true">
+                <div class="orbit orbit-one"></div>
+                <div class="orbit orbit-two"></div>
+                <div class="memory-core">
+                  <svg viewBox="0 0 80 80"><path d="M40 12c-13.8 0-25 10-25 22.4 0 7.2 3.8 13.6 9.7 17.7V65l10-6.2c1.7.3 3.5.5 5.3.5 13.8 0 25-10 25-22.4S53.8 12 40 12Z" /><path d="M29 33h22M29 40h16" /></svg>
+                </div>
+                <span class="node node-a">Evidence</span>
+                <span class="node node-b">Belief</span>
+                <span class="node node-c">Outcome</span>
+                <span class="spark spark-a"></span>
+                <span class="spark spark-b"></span>
+              </div>
+            </div>
+
+            <article class="quickstart-panel" aria-labelledby="quickstart-title">
+              <div class="quickstart-copy">
+                <span class="quickstart-label">FIRST 10 MINUTES</span>
+                <h3 id="quickstart-title">第一次使用？完成这四步</h3>
+                <p>跟随完整闭环体验证据如何成为记忆，以及真实结果如何更新效用。</p>
+              </div>
+              <ol class="journey-steps">
+                <li class="is-done" id="journey-scope"><span>1</span><div><strong>确认作用域</strong><small>demo / alice</small></div></li>
+                <li id="journey-write"><span>2</span><div><strong>写入偏好</strong><small>保留原始证据</small></div></li>
+                <li id="journey-recall"><span>3</span><div><strong>执行召回</strong><small>生成 Trace</small></div></li>
+                <li id="journey-outcome"><span>4</span><div><strong>提交反馈</strong><small>更新上下文效用</small></div></li>
+              </ol>
+              <button class="button button-primary" id="start-example" type="button">使用示例开始</button>
+            </article>
+
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">CURRENT SESSION</p>
+                <h3>本次会话概览</h3>
+              </div>
+              <span class="session-note">服务重启后内存数据会清空</span>
+            </div>
+            <div class="stats-grid">
+              <article class="stat-card stat-green">
+                <span class="stat-icon"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg></span>
+                <div><strong id="stat-writes">0</strong><span>写入次数</span></div>
+                <small>含记忆修正</small>
+              </article>
+              <article class="stat-card stat-blue">
+                <span class="stat-icon"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 4 4" /></svg></span>
+                <div><strong id="stat-recalls">0</strong><span>召回次数</span></div>
+                <small id="stat-result-count">尚无召回结果</small>
+              </article>
+              <article class="stat-card stat-orange">
+                <span class="stat-icon"><svg viewBox="0 0 24 24"><path d="M5 12.5 9.5 17 19 7.5" /></svg></span>
+                <div><strong id="stat-outcomes">0</strong><span>结果反馈</span></div>
+                <small>用于学习上下文效用</small>
+              </article>
+              <article class="stat-card stat-violet">
+                <span class="stat-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3" /><path d="M5 20c.6-4 3-6 7-6s6.4 2 7 6" /></svg></span>
+                <div><strong id="stat-scope">demo</strong><span id="stat-subject">alice</span></div>
+                <small>当前隔离作用域</small>
+              </article>
+            </div>
+
+            <div class="overview-grid">
+              <article class="panel activity-panel">
+                <div class="panel-heading">
+                  <div><p class="eyebrow">AUDITABLE FLOW</p><h3>最近活动</h3></div>
+                  <span class="live-pill"><i></i> 实时</span>
+                </div>
+                <div class="activity-list" id="activity-list">
+                  <div class="empty-activity">
+                    <span><svg viewBox="0 0 24 24"><path d="M4 12h4l2-5 4 10 2-5h4" /></svg></span>
+                    <div><strong>等待第一条活动</strong><p>写入、召回与反馈会显示在这里。</p></div>
+                  </div>
+                </div>
+              </article>
+              <article class="panel principle-panel">
+                <div class="panel-heading">
+                  <div><p class="eyebrow">CORE PRINCIPLE</p><h3>读，不等于强化</h3></div>
+                  <span class="shield-icon"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.8 2.9 8.1 7 10 4.1-1.9 7-5.2 7-10V6l-7-3Z" /><path d="m9 12 2 2 4-5" /></svg></span>
+                </div>
+                <p>召回只会生成一条可审计的 Trace。只有引用该 Trace 的真实 Outcome，才会改变上下文效用。</p>
+                <button class="text-link" type="button" data-go="architecture">了解五平面架构 <span>→</span></button>
+              </article>
+            </div>
+          </section>
+
+          <section class="view" id="view-capture" data-title="写入记忆" data-eyebrow="CAPTURE EVIDENCE">
+            <div class="content-heading">
+              <div><span class="number-label">01</span><h2>记录一条可追溯偏好</h2><p>原始证据会保持不变，并成为新记忆修订的依据。</p></div>
+            </div>
+            <div class="example-banner">
+              <span class="example-icon">i</span>
+              <div><strong>不知道如何填写？</strong><p>加载一条“晚间饮品偏好”示例，提交后即可继续体验召回与反馈。</p></div>
+              <button class="mini-button" id="load-example" type="button">载入示例</button>
+            </div>
+            <div class="form-layout">
+              <form class="panel form-panel" id="memory-form">
+                <div class="form-section">
+                  <div class="form-section-title"><span>基本信息</span><small>定义要记住的事实</small></div>
+                  <div class="field-grid two-columns">
+                    <label class="field">
+                      <span>记忆键 <b>*</b></span>
+                      <input name="key" placeholder="例如 drink.preference" required />
+                      <small>建议使用稳定的点分命名</small>
+                    </label>
+                    <label class="field">
+                      <span>偏好值 <b>*</b></span>
+                      <input name="value" placeholder="例如 decaf coffee" required />
+                    </label>
+                  </div>
+                  <label class="field">
+                    <span>原始证据 <b>*</b></span>
+                    <textarea name="evidence_text" rows="4" placeholder="粘贴或输入用户的原始表达，例如：晚上我只喝低因咖啡" required></textarea>
+                    <small>默认不会被写入服务日志</small>
+                  </label>
+                </div>
+
+                <div class="form-section">
+                  <div class="form-section-title"><span>上下文</span><small>同一偏好可在不同场景下共存</small></div>
+                  <div class="context-list" id="capture-context"></div>
+                  <button class="add-context" type="button" data-add-context="capture-context">
+                    <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg> 添加上下文
+                  </button>
+                </div>
+
+                <div class="form-section compact-section">
+                  <div class="field-grid two-columns">
+                    <label class="field">
+                      <span>证据来源</span>
+                      <input name="source" value="web-console" required />
+                    </label>
+                    <label class="field range-field">
+                      <span>初始置信度 <output id="confidence-value">0.85</output></span>
+                      <input id="confidence" name="confidence" type="range" min="0" max="1" step="0.01" value="0.85" />
+                      <span class="range-labels"><i>不确定</i><i>非常确定</i></span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="form-actions">
+                  <button class="button button-primary" type="submit">
+                    <span class="button-label">保存为记忆</span><span class="spinner"></span>
+                  </button>
+                  <button class="button button-quiet" type="reset">清空表单</button>
+                </div>
+              </form>
+
+              <aside class="side-stack">
+                <article class="panel explainer-card">
+                  <div class="explainer-number">1</div><div><strong>观察成为证据</strong><p>原始输入以不可变 Observation 保存。</p></div>
+                  <span class="connector"></span>
+                  <div class="explainer-number">2</div><div><strong>证据形成候选</strong><p>键、值与上下文组成待接受解释。</p></div>
+                  <span class="connector"></span>
+                  <div class="explainer-number">3</div><div><strong>生成不可变修订</strong><p>后续更正只追加新版本，不覆盖历史。</p></div>
+                </article>
+                <article class="panel result-panel is-hidden" id="capture-result" aria-live="polite"></article>
+              </aside>
+            </div>
+          </section>
+
+          <section class="view" id="view-memories" data-title="当前记忆" data-eyebrow="ACTIVE BELIEFS">
+            <div class="library-header">
+              <div class="content-heading compact">
+                <div><span class="number-label">02</span><h2>当前有效记忆</h2><p>这里展示当前作用域内每条偏好的最新修订；旧版本仍保留在不可变历史中。</p></div>
+              </div>
+              <div class="library-actions">
+                <span class="library-count" id="memory-count">0 条记忆</span>
+                <button class="button button-quiet" id="refresh-memories" type="button">刷新列表</button>
+                <button class="button button-primary" type="button" data-go="capture">写入记忆</button>
+              </div>
+            </div>
+            <div class="library-note">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.8 2.9 8.1 7 10 4.1-1.9 7-5.2 7-10V6l-7-3Z" /><path d="M9 12h6" /></svg>
+              <p><strong>只读视图：</strong>打开或刷新记忆库不会加强信念，也不会更新效用。</p>
+            </div>
+            <div class="memory-library" id="memory-library">
+              <div class="empty-results">
+                <div class="empty-rings"><svg viewBox="0 0 48 48"><path d="M14 12h22v26H14z" /><path d="M19 19h12m-12 6h9" /></svg></div>
+                <h3>当前作用域还没有记忆</h3>
+                <p>先写入一条带证据的偏好，随后可在这里查看、修正与追溯历史。</p>
+                <button class="button button-primary" type="button" data-go="capture">写入第一条记忆</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="view" id="view-recall" data-title="记忆召回" data-eyebrow="CONTEXTUAL RECALL">
+            <div class="recall-header">
+              <div class="content-heading compact">
+                <div><span class="number-label">03</span><h2>在当前语境中召回</h2><p>每次查询都会生成可归因的召回轨迹，不会修改记忆或效用。</p></div>
+              </div>
+              <span class="neutral-badge"><svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.8 2.9 8.1 7 10 4.1-1.9 7-5.2 7-10V6l-7-3Z" /><path d="M9 12h6" /></svg> Read-only</span>
+            </div>
+            <form class="panel recall-form" id="recall-form">
+              <label class="search-box">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 4 4" /></svg>
+                <input name="query" placeholder="描述你现在需要什么，例如：晚上应该准备什么饮料？" required />
+                <kbd>↵</kbd>
+              </label>
+              <div class="query-examples" aria-label="查询示例">
+                <span>可以试试：</span>
+                <button type="button" data-query-example="晚上应该准备什么饮料？">晚间饮品</button>
+                <button type="button" data-query-example="用户喜欢怎样的界面字体？">界面偏好</button>
+                <button type="button" data-query-example="沟通时应该注意什么？">沟通方式</button>
+              </div>
+              <div class="recall-options">
+                <div>
+                  <span class="option-label">当前上下文</span>
+                  <div class="context-list inline-context" id="recall-context"></div>
+                  <button class="add-context small" type="button" data-add-context="recall-context">＋ 添加</button>
+                </div>
+                <label class="limit-field"><span class="option-label">返回数量</span><select name="limit"><option>3</option><option selected>5</option><option>10</option><option>20</option></select></label>
+                <button class="button button-primary recall-button" type="submit"><span class="button-label">开始召回</span><span class="spinner"></span></button>
+              </div>
+            </form>
+
+            <div class="recall-meta is-hidden" id="recall-meta"></div>
+            <div class="recall-results" id="recall-results">
+              <div class="empty-results">
+                <div class="empty-rings"><svg viewBox="0 0 48 48"><circle cx="21" cy="21" r="10" /><path d="m29 29 8 8" /></svg></div>
+                <h3>输入一个问题，开始检索记忆</h3>
+                <p>系统会综合语义、上下文、信念、效用与时效性进行排序。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="view" id="view-architecture" data-title="系统架构" data-eyebrow="FIVE-PLANE MODEL">
+            <div class="architecture-hero">
+              <p class="eyebrow">SEPARATION BY DESIGN</p>
+              <h2>五个平面，一条可信记忆链</h2>
+              <p>系统把事实、解释、使用结果、检索视图与策略变化分别建模，避免读取得越多、错误越自信。</p>
+            </div>
+            <div class="planes-flow">
+              <article class="plane-card plane-evidence"><span class="plane-index">01</span><div class="plane-icon"><svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6V3Z" /><path d="M15 3v5h4M9 12h7m-7 4h5" /></svg></div><h3>Evidence</h3><strong>证据平面</strong><p>保存不可变的 Observation、EvidenceSpan 与输入来源。</p><small>只追加 · 可溯源</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="plane-card plane-belief"><span class="plane-index">02</span><div class="plane-icon"><svg viewBox="0 0 24 24"><path d="M12 4a4 4 0 0 0-4 4v1a4 4 0 0 0-2 7.5V18h12v-1.5A4 4 0 0 0 16 9V8a4 4 0 0 0-4-4Z" /><path d="M9 13h6" /></svg></div><h3>Belief</h3><strong>信念平面</strong><p>用不可变 Revision 表示当前相信什么以及置信程度。</p><small>版本化 · 保留历史</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="plane-card plane-experience"><span class="plane-index">03</span><div class="plane-icon"><svg viewBox="0 0 24 24"><path d="M4 18 9 13l3 3 7-9" /><path d="M15 7h4v4" /></svg></div><h3>Experience</h3><strong>经验平面</strong><p>通过 RecallTrace 与 Outcome 学习真实场景下的效用。</p><small>结果驱动 · 可归因</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="plane-card plane-projection"><span class="plane-index">04</span><div class="plane-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /><path d="M4 12h16M12 4c2 2.2 3 4.9 3 8s-1 5.8-3 8c-2-2.2-3-4.9-3-8s1-5.8 3-8Z" /></svg></div><h3>Projection</h3><strong>投影平面</strong><p>可丢弃、可重建的检索索引，不充当事实来源。</p><small>可重建 · 非权威</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="plane-card plane-evolution"><span class="plane-index">05</span><div class="plane-icon"><svg viewBox="0 0 24 24"><path d="M5 17c5 0 8-3 8-8" /><path d="m9 9 4-4 4 4M19 15c-3 0-5 2-5 5" /></svg></div><h3>Evolution</h3><strong>演化平面</strong><p>在门禁内调整策略快照，永不修改授权与隔离规则。</p><small>有界变化 · 可回滚</small></article>
+            </div>
+            <div class="architecture-bottom">
+              <article class="panel invariant-list">
+                <div class="panel-heading"><div><p class="eyebrow">HARD INVARIANTS</p><h3>不可突破的边界</h3></div></div>
+                <ul>
+                  <li><span>01</span><p><strong>租户与用户隔离</strong>每个有状态操作都携带明确 Scope。</p></li>
+                  <li><span>02</span><p><strong>历史不可改写</strong>观察、修订、轨迹与结果只追加。</p></li>
+                  <li><span>03</span><p><strong>反馈必须可归因</strong>Outcome 必须引用包含该 Revision 的 Trace。</p></li>
+                  <li><span>04</span><p><strong>召回保持中性</strong>单纯读取不改变信念或效用。</p></li>
+                </ul>
+              </article>
+              <article class="panel api-card">
+                <span class="api-overline">DEVELOPER ACCESS</span>
+                <h3>通过 API 构建你的记忆体验</h3>
+                <p>打开交互式 OpenAPI 文档，查看请求结构与响应模型。</p>
+                <a class="button button-dark" href="http://127.0.0.1:38089/docs" data-backend-link="/docs" target="_blank" rel="noreferrer">打开 API 文档 <span>↗</span></a>
+              </article>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <dialog class="modal" id="history-modal">
+      <div class="modal-shell">
+        <header><div><p class="eyebrow">IMMUTABLE HISTORY</p><h2>记忆修订历史</h2></div><button class="modal-close" type="button" aria-label="关闭">×</button></header>
+        <div class="modal-body" id="history-content"></div>
+      </div>
+    </dialog>
+
+    <dialog class="modal" id="correction-modal">
+      <form class="modal-shell" id="correction-form">
+        <header><div><p class="eyebrow">APPEND A REVISION</p><h2>修正这条记忆</h2></div><button class="modal-close" type="button" aria-label="关闭">×</button></header>
+        <div class="modal-body">
+          <input name="record_id" type="hidden" />
+          <p class="modal-intro">修正会创建新的不可变版本，原有内容仍保留在历史中。</p>
+          <label class="field"><span>新的偏好值 <b>*</b></span><input name="value" required /></label>
+          <label class="field"><span>修正证据 <b>*</b></span><textarea name="evidence_text" rows="3" placeholder="输入用户明确表达的修正内容" required></textarea></label>
+          <label class="field"><span>修正原因 <b>*</b></span><input name="reason" value="user correction" required /></label>
+          <label class="field"><span>证据来源</span><input name="source" value="web-console-correction" required /></label>
+        </div>
+        <footer><button class="button button-quiet modal-close" type="button">取消</button><button class="button button-primary" type="submit"><span class="button-label">追加新修订</span><span class="spinner"></span></button></footer>
+      </form>
+    </dialog>
+
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>

@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "evolvable-user-memory"
+version = "0.1.0"
+description = "Evidence-grounded, outcome-aware, evolvable memory service for AI applications"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-only" }
+authors = [{ name = "tiammomo" }]
+keywords = ["ai", "memory", "agent", "retrieval", "personalization"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28,<1",
+    "mypy>=1.15,<2",
+    "pytest>=8.3,<10",
+    "pytest-cov>=6,<8",
+    "ruff>=0.11,<1",
+]
+
+[project.scripts]
+evolvable-memory = "evolvable_memory.main:run"
+evolvable-memory-frontend = "evolvable_memory.frontend:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/evolvable_memory"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers --cov=evolvable_memory --cov-report=term-missing"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["evolvable_memory"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["evolvable_memory"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["evolvable_memory"]
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "uvicorn.*"
+ignore_missing_imports = true
