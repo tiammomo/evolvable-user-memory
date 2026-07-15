@@ -86,13 +86,26 @@ class CorrectPreference:
 
 @dataclass(frozen=True, slots=True)
 class RecallMemory:
+    """Recall at independent business-valid and system-knowledge timestamps.
+
+    The application resolves either omitted axis from the same clock reading. A
+    future ``valid_at`` is meaningful for scheduled beliefs; future knowledge is
+    rejected because the system cannot reproduce state it has not observed yet.
+    """
+
     scope: Scope
     query: str
     context: ContextSignature
     limit: int = 10
+    valid_at: datetime | None = None
+    known_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "query", require_text(self.query, "query"))
+        if self.valid_at is not None:
+            object.__setattr__(self, "valid_at", require_utc(self.valid_at, "valid_at"))
+        if self.known_at is not None:
+            object.__setattr__(self, "known_at", require_utc(self.known_at, "known_at"))
 
 
 @dataclass(frozen=True, slots=True)

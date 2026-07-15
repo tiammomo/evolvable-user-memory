@@ -96,6 +96,16 @@ class MemoryStore(Protocol):
 
     def active_memories(self, scope: Scope) -> tuple[MemorySnapshot, ...]: ...
 
+    def memories_as_of(
+        self,
+        scope: Scope,
+        *,
+        valid_at: datetime,
+        known_at: datetime,
+    ) -> tuple[MemorySnapshot, ...]:
+        """Return each transaction-latest revision eligible on both time axes."""
+        ...
+
     def revision_history(self, scope: Scope, record_id: UUID) -> tuple[MemoryRevision, ...]: ...
 
     def save_trace(self, trace: RecallTrace) -> None: ...
@@ -108,6 +118,17 @@ class MemoryStore(Protocol):
         revision_id: UUID,
         context: ContextSignature,
     ) -> UtilityEstimate: ...
+
+    def utility_for_as_of(
+        self,
+        scope: Scope,
+        revision_id: UUID,
+        context: ContextSignature,
+        *,
+        known_at: datetime,
+    ) -> UtilityEstimate:
+        """Rebuild utility only from attributable outcomes recorded by known_at."""
+        ...
 
     def apply_outcome(
         self,

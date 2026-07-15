@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,7 +22,7 @@ from evolvable_memory.config import Settings
 
 
 def test_http_vertical_slice(harness: Harness) -> None:
-    client = TestClient(create_app(harness.app))
+    client = TestClient(create_app(harness.app, clock=harness.clock))
     create = client.post(
         "/v1/preferences",
         json={
@@ -52,6 +53,8 @@ def test_http_vertical_slice(harness: Harness) -> None:
     assert recall.status_code == 200
     trace = recall.json()
     assert trace["items"][0]["revision_id"] == memory["revision_id"]
+    assert trace["valid_at"] == trace["known_at"] == trace["created_at"]
+    assert trace["items"][0]["revision_valid_from"] == trace["items"][0]["revision_recorded_at"]
 
     outcome = client.post(
         "/v1/outcomes",
@@ -103,7 +106,7 @@ def test_http_vertical_slice(harness: Harness) -> None:
 
 
 def test_http_maps_domain_errors_and_validates_payload(harness: Harness) -> None:
-    client = TestClient(create_app(harness.app))
+    client = TestClient(create_app(harness.app, clock=harness.clock))
     missing = client.get(
         "/v1/preferences/00000000-0000-0000-0000-000000000099/revisions",
         params={"tenant_id": "tenant-a", "subject_id": "alice"},
@@ -124,8 +127,94 @@ def test_http_maps_domain_errors_and_validates_payload(harness: Harness) -> None
     assert invalid.status_code == 422
 
 
+def test_http_recall_exposes_bitemporal_boundaries_and_fails_closed(
+    harness: Harness,
+) -> None:
+    client = TestClient(create_app(harness.app, clock=harness.clock))
+    original_valid_at = harness.clock.current - timedelta(days=30)
+    created = client.post(
+        "/v1/preferences",
+        json={
+            "tenant_id": "tenant-time",
+            "subject_id": "alice",
+            "source": "conversation",
+            "idempotency_key": "time/write",
+            "key": "drink.preference",
+            "value": "coffee",
+            "context": {"time_of_day": "morning"},
+            "evidence_text": "I drank coffee last month",
+            "confidence": 0.9,
+            "occurred_at": original_valid_at.isoformat(),
+        },
+    ).json()
+    known_before_correction = harness.clock.current
+    harness.clock.advance(days=1)
+    corrected = client.post(
+        f"/v1/preferences/{created['record_id']}/corrections",
+        json={
+            "tenant_id": "tenant-time",
+            "subject_id": "alice",
+            "source": "explicit-feedback",
+            "idempotency_key": "time/correction",
+            "value": "tea",
+            "evidence_text": "I switched to tea three weeks ago",
+            "reason": "late correction",
+            "occurred_at": (original_valid_at + timedelta(days=7)).isoformat(),
+        },
+    ).json()
+
+    historical = client.post(
+        "/v1/recall",
+        json={
+            "tenant_id": "tenant-time",
+            "subject_id": "alice",
+            "query": "drink preference coffee tea",
+            "context": {"time_of_day": "morning"},
+            "valid_at": harness.clock.current.isoformat(),
+            "known_at": known_before_correction.isoformat(),
+        },
+    )
+    current = client.post(
+        "/v1/recall",
+        json={
+            "tenant_id": "tenant-time",
+            "subject_id": "alice",
+            "query": "drink preference coffee tea",
+            "context": {"time_of_day": "morning"},
+        },
+    )
+    naive = client.post(
+        "/v1/recall",
+        json={
+            "tenant_id": "tenant-time",
+            "subject_id": "alice",
+            "query": "drink",
+            "known_at": "2026-07-14T04:00:00",
+        },
+    )
+    future_known = client.post(
+        "/v1/recall",
+        json={
+            "tenant_id": "tenant-time",
+            "subject_id": "alice",
+            "query": "drink",
+            "known_at": (harness.clock.current + timedelta(seconds=1)).isoformat(),
+        },
+    )
+
+    assert historical.status_code == current.status_code == 200
+    assert historical.json()["items"][0]["revision_id"] == created["revision_id"]
+    assert current.json()["items"][0]["revision_id"] == corrected["revision_id"]
+    assert historical.json()["known_at"] == known_before_correction.isoformat().replace(
+        "+00:00", "Z"
+    )
+    assert naive.status_code == 422
+    assert future_known.status_code == 400
+    assert future_known.json()["error"] == "DomainError"
+
+
 def test_http_rejects_oversized_text_and_context_inputs(harness: Harness) -> None:
-    client = TestClient(create_app(harness.app))
+    client = TestClient(create_app(harness.app, clock=harness.clock))
     preference_payload = {
         "tenant_id": "tenant-a",
         "subject_id": "alice",
@@ -195,7 +284,7 @@ def test_http_rejects_oversized_text_and_context_inputs(harness: Harness) -> Non
 
 
 def test_health(harness: Harness) -> None:
-    client = TestClient(create_app(harness.app))
+    client = TestClient(create_app(harness.app, clock=harness.clock))
     assert client.get("/health").json() == {
         "status": "ok",
         "version": "0.1.0",
@@ -208,7 +297,7 @@ def test_health(harness: Harness) -> None:
 
 
 def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harness) -> None:
-    client = TestClient(create_app(harness.app))
+    client = TestClient(create_app(harness.app, clock=harness.clock))
 
     service = client.get("/")
     schema = client.get("/openapi.json").json()
@@ -234,10 +323,15 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
     assert outcome_schema["example"]["kind"] == "helpful"
     correction_schema = schema["components"]["schemas"]["PreferenceCorrectionRequest"]
     assert "expected_revision_id" in correction_schema["properties"]
+    recall_schema = schema["components"]["schemas"]["RecallRequest"]
+    assert recall_schema["properties"]["valid_at"]["anyOf"][0]["format"] == "date-time"
+    assert recall_schema["properties"]["known_at"]["anyOf"][0]["format"] == "date-time"
+    recall_response = schema["components"]["schemas"]["RecallResponse"]
+    assert {"valid_at", "known_at"} <= set(recall_response["required"])
 
 
 def test_frontend_origin_is_allowed_by_cors(harness: Harness) -> None:
-    client = TestClient(create_app(harness.app))
+    client = TestClient(create_app(harness.app, clock=harness.clock))
 
     preflight = client.options(
         "/v1/recall",
@@ -269,7 +363,7 @@ def test_request_ids_security_headers_and_metadata_only_access_logs(
     harness: Harness,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    client = TestClient(create_app(harness.app))
+    client = TestClient(create_app(harness.app, clock=harness.clock))
     request_id = "caller.request-42"
     secret_evidence = "raw-evidence-must-not-appear-in-logs"
 
@@ -323,7 +417,7 @@ def test_request_body_limit_checks_content_length_and_streamed_bytes(
     harness: Harness,
 ) -> None:
     settings = Settings(max_request_body_bytes=128)
-    client = TestClient(create_app(harness.app, settings=settings))
+    client = TestClient(create_app(harness.app, settings=settings, clock=harness.clock))
 
     normal = client.post(
         "/v1/recall",
@@ -373,7 +467,7 @@ def test_unhandled_errors_return_safe_correlated_responses_and_logs(
     harness: Harness,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    application = create_app(harness.app)
+    application = create_app(harness.app, clock=harness.clock)
     leaked_detail = "raw-evidence-must-never-escape"
 
     @application.get("/_test/unhandled")

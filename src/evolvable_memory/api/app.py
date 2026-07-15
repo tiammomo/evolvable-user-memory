@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request, Security, status
@@ -48,6 +48,7 @@ from evolvable_memory.application.commands import (
 from evolvable_memory.application.ports import (
     AuthorizationAuditPort,
     AuthorizationPort,
+    Clock,
     MemoryStore,
 )
 from evolvable_memory.application.security import (
@@ -78,7 +79,7 @@ _OPENAPI_TAGS = [
     },
     {
         "name": "recall",
-        "description": "按语义、上下文、信念、效用和时效进行可追踪召回。",
+        "description": "按双时间可见性、相关性、上下文、信念、效用和时效进行可追踪召回。",
     },
     {
         "name": "experience",
@@ -100,14 +101,15 @@ def create_app(
     application: MemoryApplication | None = None,
     settings: Settings | None = None,
     *,
+    clock: Clock | None = None,
     authorization: AuthorizationPort | None = None,
     authorization_audit: AuthorizationAuditPort | None = None,
     identity_resolver: IdentityResolver | None = None,
 ) -> FastAPI:
     runtime = settings or Settings.from_environment()
+    runtime_clock = clock or SystemClock()
     owns_application = application is None
-    service = application or _build_application(runtime)
-    clock = SystemClock()
+    service = application or _build_application(runtime, runtime_clock)
     access = AuthorizedMemoryApplication(
         application=service,
         authorization=authorization or RolePolicyAuthorizer(),
@@ -115,7 +117,7 @@ def create_app(
         or LoggingAuthorizationAuditSink(
             (runtime.auth_audit_hmac_key or "development-only-audit-key-change-me").encode()
         ),
-        clock=clock,
+        clock=runtime_clock,
     )
     identities = identity_resolver or _build_identity_resolver(runtime)
 
@@ -305,7 +307,7 @@ def create_app(
                 context=ContextSignature.from_mapping(payload.context),
                 evidence_text=payload.evidence_text,
                 confidence=payload.confidence,
-                occurred_at=_occurred_at(payload.occurred_at),
+                occurred_at=_occurred_at(payload.occurred_at, runtime_clock),
             ),
         )
         return PreferenceResponse.from_result(result)
@@ -336,7 +338,7 @@ def create_app(
                 evidence_text=payload.evidence_text,
                 reason=payload.reason,
                 expected_revision_id=payload.expected_revision_id,
-                occurred_at=_occurred_at(payload.occurred_at),
+                occurred_at=_occurred_at(payload.occurred_at, runtime_clock),
             ),
         )
         return PreferenceResponse.from_result(result)
@@ -391,7 +393,9 @@ def create_app(
         tags=["recall"],
         summary="执行上下文记忆召回",
         description=(
-            "返回带评分拆解的结果和 trace_id。召回本身不会修改信念或效用; "
+            "返回带双时间边界、评分拆解的结果和 trace_id。valid_at 控制业务有效时点。"
+            "known_at 控制系统知识截止时点。两者缺省为同一次服务端当前时间。"
+            "召回使用当前不可变策略快照。本身不会修改信念或效用。"
             "业务结果应通过 /v1/outcomes 回传。"
         ),
     )
@@ -408,6 +412,8 @@ def create_app(
                 query=payload.query,
                 context=ContextSignature.from_mapping(payload.context),
                 limit=payload.limit,
+                valid_at=payload.valid_at,
+                known_at=payload.known_at,
             ),
         )
         return RecallResponse.from_trace(trace)
@@ -437,7 +443,7 @@ def create_app(
                 revision_id=payload.revision_id,
                 kind=payload.kind,
                 idempotency_key=payload.idempotency_key,
-                occurred_at=_occurred_at(payload.occurred_at),
+                occurred_at=_occurred_at(payload.occurred_at, runtime_clock),
                 weight=payload.weight,
                 note=payload.note,
             ),
@@ -447,7 +453,7 @@ def create_app(
     return app
 
 
-def _build_application(settings: Settings) -> MemoryApplication:
+def _build_application(settings: Settings, clock: Clock) -> MemoryApplication:
     store: MemoryStore
     if settings.store == "postgres":
         if settings.database_url is None:
@@ -459,7 +465,7 @@ def _build_application(settings: Settings) -> MemoryApplication:
         )
     else:
         store = InMemoryMemoryStore()
-    return MemoryApplication(store=store, clock=SystemClock(), ids=Uuid4Generator())
+    return MemoryApplication(store=store, clock=clock, ids=Uuid4Generator())
 
 
 def _build_identity_resolver(settings: Settings) -> IdentityResolver:
@@ -490,8 +496,8 @@ def _invocation(
     return InvocationContext(actor=actor, purpose=purpose, request_id=request_id)
 
 
-def _occurred_at(value: datetime | None) -> datetime:
-    return value if value is not None else datetime.now(tz=UTC)
+def _occurred_at(value: datetime | None, clock: Clock) -> datetime:
+    return value if value is not None else clock.now()
 
 
 app = create_app()

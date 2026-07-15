@@ -41,12 +41,24 @@ class RecalledItem:
     key: str
     value: str
     context: ContextSignature
+    revision_valid_from: datetime
+    revision_recorded_at: datetime
     rank: int
     score: float
     breakdown: ScoreBreakdown
     evidence_ids: tuple[UUID, ...]
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "revision_valid_from",
+            require_utc(self.revision_valid_from, "revision_valid_from"),
+        )
+        object.__setattr__(
+            self,
+            "revision_recorded_at",
+            require_utc(self.revision_recorded_at, "revision_recorded_at"),
+        )
         if self.rank < 1:
             raise DomainError("recall rank must be positive")
         if not 0.0 <= self.score <= 1.0:
@@ -62,12 +74,23 @@ class RecallTrace:
     policy_id: UUID
     policy_version: int
     items: tuple[RecalledItem, ...]
+    valid_at: datetime
+    known_at: datetime
     created_at: datetime
 
     def __post_init__(self) -> None:
         if not self.query.strip():
             raise DomainError("recall query must not be blank")
+        object.__setattr__(self, "valid_at", require_utc(self.valid_at, "valid_at"))
+        object.__setattr__(self, "known_at", require_utc(self.known_at, "known_at"))
         object.__setattr__(self, "created_at", require_utc(self.created_at, "created_at"))
+        if self.known_at > self.created_at:
+            raise DomainError("known_at must not be later than trace creation")
+        for item in self.items:
+            if item.revision_valid_from > self.valid_at:
+                raise DomainError("recalled revision was not valid at valid_at")
+            if item.revision_recorded_at > self.known_at:
+                raise DomainError("recalled revision was not known at known_at")
 
 
 class OutcomeKind(StrEnum):
@@ -93,6 +116,7 @@ class OutcomeEvent:
     kind: OutcomeKind
     idempotency_key: str
     occurred_at: datetime
+    recorded_at: datetime
     weight: float = 1.0
     note: str | None = None
 
@@ -105,6 +129,7 @@ class OutcomeEvent:
         if not 0.0 < self.weight <= 10.0:
             raise DomainError("outcome weight must be in (0, 10]")
         object.__setattr__(self, "occurred_at", require_utc(self.occurred_at, "occurred_at"))
+        object.__setattr__(self, "recorded_at", require_utc(self.recorded_at, "recorded_at"))
         if self.note is not None:
             normalized = self.note.strip()
             object.__setattr__(self, "note", normalized or None)

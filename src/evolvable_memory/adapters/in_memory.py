@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from datetime import datetime
 from threading import RLock
 from types import TracebackType
 from uuid import UUID
@@ -181,6 +182,43 @@ class InMemoryMemoryStore:
             ]
             return tuple(snapshots)
 
+    def memories_as_of(
+        self,
+        scope: Scope,
+        *,
+        valid_at: datetime,
+        known_at: datetime,
+    ) -> tuple[MemorySnapshot, ...]:
+        """Reconstruct each transaction head that was effective on both time axes."""
+        with self._lock:
+            snapshots: list[MemorySnapshot] = []
+            for record in self._records.values():
+                if record.scope != scope or record.created_at > known_at:
+                    continue
+                eligible = (
+                    self._revisions[revision_id]
+                    for revision_id in self._revision_ids_by_record.get(record.id, ())
+                    if self._revisions[revision_id].recorded_at <= known_at
+                    and self._revisions[revision_id].valid_from <= valid_at
+                )
+                revision = max(
+                    eligible,
+                    key=lambda item: (item.recorded_at, item.sequence, str(item.id)),
+                    default=None,
+                )
+                if revision is not None:
+                    snapshots.append(MemorySnapshot(record=record, revision=revision))
+            return tuple(
+                sorted(
+                    snapshots,
+                    key=lambda snapshot: (
+                        snapshot.record.key,
+                        snapshot.record.context.fingerprint,
+                        str(snapshot.record.id),
+                    ),
+                )
+            )
+
     def revision_history(self, scope: Scope, record_id: UUID) -> tuple[MemoryRevision, ...]:
         with self._lock:
             record = self._records.get(record_id)
@@ -213,6 +251,40 @@ class InMemoryMemoryStore:
                 UtilityEstimate(
                     revision_id=revision_id,
                     context_fingerprint=context.fingerprint,
+                ),
+            )
+
+    def utility_for_as_of(
+        self,
+        scope: Scope,
+        revision_id: UUID,
+        context: ContextSignature,
+        *,
+        known_at: datetime,
+    ) -> UtilityEstimate:
+        with self._lock:
+            outcomes = tuple(
+                outcome
+                for outcome in self._outcomes.values()
+                if outcome.scope == scope
+                and outcome.revision_id == revision_id
+                and outcome.recorded_at <= known_at
+                and (trace := self._traces.get(outcome.trace_id)) is not None
+                and trace.scope == scope
+                and trace.context.fingerprint == context.fingerprint
+            )
+            return UtilityEstimate(
+                revision_id=revision_id,
+                context_fingerprint=context.fingerprint,
+                positive_weight=sum(
+                    outcome.kind.success_value * outcome.weight for outcome in outcomes
+                ),
+                negative_weight=sum(
+                    (1.0 - outcome.kind.success_value) * outcome.weight for outcome in outcomes
+                ),
+                last_outcome_at=max(
+                    (outcome.occurred_at for outcome in outcomes),
+                    default=None,
                 ),
             )
 

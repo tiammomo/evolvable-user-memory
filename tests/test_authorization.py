@@ -235,6 +235,7 @@ def test_jwt_authentication_and_api_authorization_fail_closed(
         create_app(
             harness.app,
             settings=_jwt_settings(),
+            clock=harness.clock,
             identity_resolver=resolver,
             authorization_audit=audit,
         )
@@ -365,6 +366,7 @@ def test_authorization_audit_failure_prevents_memory_mutation(harness: Harness) 
     client = TestClient(
         create_app(
             harness.app,
+            clock=harness.clock,
             authorization_audit=FailingAuthorizationAuditSink(),
         )
     )

@@ -16,6 +16,7 @@ from evolvable_memory.domain.common import (
     AttributionError,
     ConflictError,
     ContextSignature,
+    DomainError,
     NotFoundError,
     Scope,
 )
@@ -182,6 +183,138 @@ def test_correction_preserves_history_and_recall_uses_new_head(harness: Harness)
     assert [item.revision_id for item in trace.items] == [corrected.revision_id]
 
 
+def test_valid_time_hides_a_future_correction_until_it_becomes_effective(
+    harness: Harness,
+) -> None:
+    original = harness.app.remember_preference(preference(occurred_at=NOW - timedelta(days=1)))
+    harness.clock.advance(hours=1)
+    future_valid_at = NOW + timedelta(days=30)
+    corrected = harness.app.correct_preference(
+        CorrectPreference(
+            scope=ALICE,
+            record_id=original.record_id,
+            source="explicit-user-correction",
+            idempotency_key="turn-2:future-correction",
+            value="herbal tea",
+            evidence_text="Starting next month I prefer herbal tea",
+            reason="scheduled preference change",
+            occurred_at=future_valid_at,
+        )
+    )
+
+    before_effective = harness.app.recall(
+        RecallMemory(scope=ALICE, query="drink preference", context=EVENING)
+    )
+    after_effective = harness.app.recall(
+        RecallMemory(
+            scope=ALICE,
+            query="drink preference",
+            context=EVENING,
+            valid_at=future_valid_at,
+        )
+    )
+
+    assert [item.revision_id for item in before_effective.items] == [original.revision_id]
+    assert [item.revision_id for item in after_effective.items] == [corrected.revision_id]
+    assert before_effective.items[0].revision_valid_from == NOW - timedelta(days=1)
+    assert before_effective.items[0].revision_recorded_at == NOW
+    assert after_effective.items[0].revision_valid_from == future_valid_at
+    assert after_effective.items[0].revision_recorded_at == harness.clock.current
+    assert before_effective.valid_at == harness.clock.current
+    assert before_effective.known_at == harness.clock.current
+    assert after_effective.valid_at == future_valid_at
+    assert after_effective.known_at == harness.clock.current
+    assert [item.revision.id for item in harness.app.list_preferences(ALICE)] == [
+        original.revision_id
+    ]
+
+
+def test_system_time_excludes_a_late_correction_until_it_was_known(
+    harness: Harness,
+) -> None:
+    original = harness.app.remember_preference(preference(occurred_at=NOW - timedelta(days=30)))
+    known_before_correction = harness.clock.current
+    harness.clock.advance(days=1)
+    corrected = harness.app.correct_preference(
+        CorrectPreference(
+            scope=ALICE,
+            record_id=original.record_id,
+            source="profile-reconciliation",
+            idempotency_key="turn-2:late-correction",
+            value="herbal tea",
+            evidence_text="The preference changed three weeks ago",
+            reason="late-arriving correction",
+            occurred_at=NOW - timedelta(days=21),
+        )
+    )
+    query_valid_at = harness.clock.current
+
+    before_recorded = harness.app.recall(
+        RecallMemory(
+            scope=ALICE,
+            query="drink preference",
+            context=EVENING,
+            valid_at=query_valid_at,
+            known_at=known_before_correction - timedelta(microseconds=1),
+        )
+    )
+    before_known = harness.app.recall(
+        RecallMemory(
+            scope=ALICE,
+            query="drink preference",
+            context=EVENING,
+            valid_at=query_valid_at,
+            known_at=known_before_correction,
+        )
+    )
+    after_known = harness.app.recall(
+        RecallMemory(
+            scope=ALICE,
+            query="drink preference",
+            context=EVENING,
+            valid_at=query_valid_at,
+            known_at=harness.clock.current,
+        )
+    )
+
+    assert before_recorded.items == ()
+    assert [item.revision_id for item in before_known.items] == [original.revision_id]
+    assert [item.revision_id for item in after_known.items] == [corrected.revision_id]
+    assert before_known.known_at == known_before_correction
+    assert after_known.known_at == harness.clock.current
+
+
+def test_later_recorded_correction_wins_even_with_an_earlier_valid_time(
+    harness: Harness,
+) -> None:
+    original = harness.app.remember_preference(preference(occurred_at=NOW - timedelta(days=10)))
+    harness.clock.advance(days=1)
+    corrected = harness.app.correct_preference(
+        CorrectPreference(
+            scope=ALICE,
+            record_id=original.record_id,
+            source="historical-reconciliation",
+            idempotency_key="turn-2:retroactive-correction",
+            value="herbal tea",
+            evidence_text="The earlier preference should have been herbal tea",
+            reason="retroactive correction",
+            occurred_at=NOW - timedelta(days=20),
+        )
+    )
+
+    trace = harness.app.recall(
+        RecallMemory(
+            scope=ALICE,
+            query="drink preference",
+            context=EVENING,
+            valid_at=NOW,
+            known_at=harness.clock.current,
+        )
+    )
+
+    assert [item.revision_id for item in trace.items] == [corrected.revision_id]
+
+
 def test_correction_rejects_a_stale_expected_revision_but_allows_its_retry(
     harness: Harness,
 ) -> None:
@@ -344,6 +477,145 @@ def test_recall_does_not_reinforce_belief_or_utility(harness: Harness) -> None:
     assert before_utility.sample_weight == 0.0
 
 
+def test_as_of_recall_is_scope_local_read_only_and_reproducible(
+    harness: Harness,
+) -> None:
+    memory = harness.app.remember_preference(preference())
+    valid_at = harness.clock.current
+    known_at = harness.clock.current
+    before_history = harness.app.history(ALICE, memory.record_id)
+    before_utility = harness.store.utility_for(ALICE, memory.revision_id, EVENING)
+
+    first = harness.app.recall(
+        RecallMemory(
+            scope=ALICE,
+            query="decaf coffee",
+            context=EVENING,
+            valid_at=valid_at,
+            known_at=known_at,
+        )
+    )
+    cross_scope = harness.app.recall(
+        RecallMemory(
+            scope=Scope("tenant-b", "alice"),
+            query="decaf coffee",
+            context=EVENING,
+            valid_at=valid_at,
+            known_at=known_at,
+        )
+    )
+    harness.clock.advance(days=365)
+    replay = harness.app.recall(
+        RecallMemory(
+            scope=ALICE,
+            query="decaf coffee",
+            context=EVENING,
+            valid_at=valid_at,
+            known_at=known_at,
+        )
+    )
+
+    assert cross_scope.items == ()
+    assert [item.revision_id for item in first.items] == [memory.revision_id]
+    assert replay.items == first.items
+    assert replay.valid_at == first.valid_at == valid_at
+    assert replay.known_at == first.known_at == known_at
+    assert harness.app.history(ALICE, memory.record_id) == before_history
+    assert harness.store.utility_for(ALICE, memory.revision_id, EVENING) == before_utility
+
+
+def test_as_of_recall_uses_only_outcomes_known_at_the_query_time(
+    harness: Harness,
+) -> None:
+    memory = harness.app.remember_preference(preference())
+    before_outcome = harness.app.recall(
+        RecallMemory(scope=ALICE, query="decaf coffee", context=EVENING)
+    )
+    harness.clock.advance(days=1)
+    harness.app.record_outcome(
+        RecordOutcome(
+            scope=ALICE,
+            trace_id=before_outcome.id,
+            revision_id=memory.revision_id,
+            kind=OutcomeKind.HELPFUL,
+            idempotency_key="task-10:outcome-1",
+            occurred_at=harness.clock.current,
+        )
+    )
+
+    historical = harness.app.recall(
+        RecallMemory(
+            scope=ALICE,
+            query="decaf coffee",
+            context=EVENING,
+            valid_at=harness.clock.current,
+            known_at=before_outcome.known_at,
+        )
+    )
+    current = harness.app.recall(RecallMemory(scope=ALICE, query="decaf coffee", context=EVENING))
+
+    assert historical.items[0].breakdown.utility == 0.5
+    assert current.items[0].breakdown.utility == pytest.approx(2 / 3)
+    assert harness.app.history(ALICE, memory.record_id)[-1].id == memory.revision_id
+
+
+def test_recall_rejects_invalid_as_of_times(harness: Harness) -> None:
+    naive = datetime(2026, 7, 14, 4, 0)
+    with pytest.raises(DomainError, match="valid_at must be timezone-aware"):
+        RecallMemory(
+            scope=ALICE,
+            query="drink",
+            context=EVENING,
+            valid_at=naive,
+        )
+    with pytest.raises(DomainError, match="known_at must be timezone-aware"):
+        RecallMemory(
+            scope=ALICE,
+            query="drink",
+            context=EVENING,
+            known_at=naive,
+        )
+    with pytest.raises(DomainError, match="known_at must not be in the future"):
+        harness.app.recall(
+            RecallMemory(
+                scope=ALICE,
+                query="drink",
+                context=EVENING,
+                known_at=harness.clock.current + timedelta(microseconds=1),
+            )
+        )
+
+
+def test_recall_abstains_without_lexical_or_explicit_context_relevance(
+    harness: Harness,
+) -> None:
+    memory = harness.app.remember_preference(preference())
+    before_history = harness.app.history(ALICE, memory.record_id)
+    before_utility = harness.store.utility_for(ALICE, memory.revision_id, EVENING)
+
+    trace = harness.app.recall(
+        RecallMemory(
+            scope=ALICE,
+            query="preferred code editor theme",
+            context=ContextSignature(),
+        )
+    )
+
+    assert trace.items == ()
+    assert harness.app.history(ALICE, memory.record_id) == before_history
+    assert harness.store.utility_for(ALICE, memory.revision_id, EVENING) == before_utility
+
+
+def test_explicit_context_can_bridge_query_and_memory_vocabulary(harness: Harness) -> None:
+    memory = harness.app.remember_preference(preference())
+
+    trace = harness.app.recall(
+        RecallMemory(scope=ALICE, query="晚上应该准备什么饮料", context=EVENING)
+    )
+
+    assert [item.record_id for item in trace.items] == [memory.record_id]
+
+
 def test_attributable_outcome_updates_contextual_utility_once(harness: Harness) -> None:
     memory = harness.app.remember_preference(preference())
     trace = harness.app.recall(RecallMemory(scope=ALICE, query="decaf coffee", context=EVENING))
@@ -361,6 +633,7 @@ def test_attributable_outcome_updates_contextual_utility_once(harness: Harness) 
 
     assert first.idempotent_replay is False
     assert replay.idempotent_replay is True
+    assert first.outcome.recorded_at == harness.clock.current
     assert first.utility.mean == pytest.approx(2 / 3)
     assert replay.utility == first.utility
     assert harness.store.outcome_count == 1

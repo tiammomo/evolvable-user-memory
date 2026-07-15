@@ -18,6 +18,7 @@ from evolvable_memory.application.ports import Clock, IdGenerator, MemoryStore
 from evolvable_memory.domain.common import (
     AttributionError,
     ConflictError,
+    ContextSignature,
     DomainError,
     NotFoundError,
     Scope,
@@ -248,17 +249,32 @@ class MemoryApplication:
             raise DomainError("recall query must not be blank")
 
         now = self._clock.now()
+        valid_at = command.valid_at or now
+        known_at = command.known_at or now
+        if known_at > now:
+            raise DomainError("known_at must not be in the future")
+
         scored: list[tuple[float, datetime, MemoryRecord, MemoryRevision, ScoreBreakdown]] = []
-        for snapshot in self._store.active_memories(command.scope):
+        snapshots = self._store.memories_as_of(
+            command.scope,
+            valid_at=valid_at,
+            known_at=known_at,
+        )
+        for snapshot in snapshots:
             record = snapshot.record
             revision = snapshot.revision
             semantic = _lexical_similarity(query, f"{record.key} {revision.value}")
             context = record.context.similarity(command.context)
             belief = revision.belief.confidence
-            utility = self._store.utility_for(command.scope, revision.id, command.context).mean
+            utility = self._store.utility_for_as_of(
+                command.scope,
+                revision.id,
+                command.context,
+                known_at=known_at,
+            ).mean
             age_days = max(
                 0.0,
-                (now - revision.belief.last_evidence_at).total_seconds() / 86_400.0,
+                (valid_at - revision.belief.last_evidence_at).total_seconds() / 86_400.0,
             )
             recency = pow(0.5, age_days / self._policy.recency_half_life_days)
             breakdown = ScoreBreakdown(
@@ -268,6 +284,13 @@ class MemoryApplication:
                 utility=utility,
                 recency=recency,
             )
+            if not _passes_relevance_admission(
+                semantic=semantic,
+                stored_context=record.context,
+                requested_context=command.context,
+                context_score=context,
+            ):
+                continue
             score = _weighted_score(breakdown, self._policy.weights)
             if score >= self._policy.min_score:
                 scored.append((score, revision.recorded_at, record, revision, breakdown))
@@ -280,6 +303,8 @@ class MemoryApplication:
                 key=record.key,
                 value=revision.value,
                 context=record.context,
+                revision_valid_from=revision.valid_from,
+                revision_recorded_at=revision.recorded_at,
                 rank=rank,
                 score=score,
                 breakdown=breakdown,
@@ -297,6 +322,8 @@ class MemoryApplication:
             policy_id=self._policy.id,
             policy_version=self._policy.version,
             items=items,
+            valid_at=valid_at,
+            known_at=known_at,
             created_at=now,
         )
         self._store.save_trace(trace)
@@ -318,6 +345,7 @@ class MemoryApplication:
                 kind=command.kind,
                 idempotency_key=command.idempotency_key,
                 occurred_at=command.occurred_at,
+                recorded_at=self._clock.now(),
                 weight=command.weight,
                 note=command.note,
             )
@@ -337,7 +365,8 @@ class MemoryApplication:
 
     def list_preferences(self, scope: Scope) -> tuple[MemorySnapshot, ...]:
         """Return current preference heads in a stable, scope-local order."""
-        snapshots = self._store.active_memories(scope)
+        now = self._clock.now()
+        snapshots = self._store.memories_as_of(scope, valid_at=now, known_at=now)
         preferences = (
             snapshot for snapshot in snapshots if snapshot.record.kind is MemoryKind.PREFERENCE
         )
@@ -532,6 +561,25 @@ def _lexical_similarity(query: str, document: str) -> float:
     if not query_tokens or not document_tokens:
         return 0.0
     return len(query_tokens & document_tokens) / len(query_tokens | document_tokens)
+
+
+def _passes_relevance_admission(
+    *,
+    semantic: float,
+    stored_context: ContextSignature,
+    requested_context: ContextSignature,
+    context_score: float,
+) -> bool:
+    """Keep belief strength and freshness from making an unrelated item relevant.
+
+    Explicit context is allowed to bridge vocabulary differences (for example a
+    Chinese query recalling an English-valued preference), but an absent context is
+    not itself evidence of relevance. This admission rule is deliberately outside
+    the evolvable weight snapshot: strategy tuning must not remove the safety floor.
+    """
+    if semantic > 0.0:
+        return True
+    return bool(stored_context.facets and requested_context.facets) and context_score > 0.0
 
 
 def _weighted_score(breakdown: ScoreBreakdown, weights: RetrievalWeights) -> float:

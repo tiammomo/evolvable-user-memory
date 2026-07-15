@@ -364,6 +364,26 @@ class PostgresMemoryStore:
             ).fetchall()
         return tuple(_snapshot(row) for row in rows)
 
+    def memories_as_of(
+        self,
+        scope: Scope,
+        *,
+        valid_at: datetime,
+        known_at: datetime,
+    ) -> tuple[MemorySnapshot, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                _AS_OF_SNAPSHOT_SELECT,
+                (
+                    known_at,
+                    valid_at,
+                    scope.tenant_id,
+                    scope.subject_id,
+                    known_at,
+                ),
+            ).fetchall()
+        return tuple(_snapshot(row) for row in rows)
+
     def revision_history(
         self,
         scope: Scope,
@@ -451,8 +471,8 @@ class PostgresMemoryStore:
                     """
                     INSERT INTO recall_traces (
                         id, tenant_id, subject_id, query, context, context_fingerprint,
-                        policy_id, policy_version, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        policy_id, policy_version, valid_at, known_at, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         trace.id,
@@ -463,6 +483,8 @@ class PostgresMemoryStore:
                         trace.context.fingerprint,
                         trace.policy_id,
                         trace.policy_version,
+                        trace.valid_at,
+                        trace.known_at,
                         trace.created_at,
                     ),
                 )
@@ -471,8 +493,12 @@ class PostgresMemoryStore:
                         """
                         INSERT INTO recall_trace_items (
                             trace_id, revision_id, record_id, tenant_id, subject_id,
-                            key, value, context, rank, score, score_breakdown, evidence_ids
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            key, value, context, revision_valid_from, revision_recorded_at,
+                            rank, score, score_breakdown, evidence_ids
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s
+                        )
                         """,
                         (
                             trace.id,
@@ -483,6 +509,8 @@ class PostgresMemoryStore:
                             item.key,
                             item.value,
                             Jsonb(item.context.as_dict()),
+                            item.revision_valid_from,
+                            item.revision_recorded_at,
                             item.rank,
                             item.score,
                             Jsonb(
@@ -527,6 +555,8 @@ class PostgresMemoryStore:
             policy_id=row["policy_id"],
             policy_version=row["policy_version"],
             items=tuple(_recalled_item(item) for item in item_rows),
+            valid_at=row["valid_at"],
+            known_at=row["known_at"],
             created_at=row["created_at"],
         )
 
@@ -556,6 +586,57 @@ class PostgresMemoryStore:
                 context_fingerprint=context.fingerprint,
             )
         return _utility(row)
+
+    def utility_for_as_of(
+        self,
+        scope: Scope,
+        revision_id: UUID,
+        context: ContextSignature,
+        *,
+        known_at: datetime,
+    ) -> UtilityEstimate:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COALESCE(
+                        SUM(o.weight) FILTER (WHERE o.kind IN ('helpful', 'accepted')),
+                        0.0
+                    ) AS positive_weight,
+                    COALESCE(
+                        SUM(o.weight) FILTER (
+                            WHERE o.kind IN ('harmful', 'rejected', 'corrected')
+                        ),
+                        0.0
+                    ) AS negative_weight,
+                    MAX(o.occurred_at) AS last_outcome_at
+                FROM outcomes o
+                JOIN recall_traces t
+                  ON t.id = o.trace_id
+                 AND t.tenant_id = o.tenant_id
+                 AND t.subject_id = o.subject_id
+                WHERE o.tenant_id = %s AND o.subject_id = %s
+                  AND o.revision_id = %s
+                  AND t.context_fingerprint = %s
+                  AND o.recorded_at <= %s
+                """,
+                (
+                    scope.tenant_id,
+                    scope.subject_id,
+                    revision_id,
+                    context.fingerprint,
+                    known_at,
+                ),
+            ).fetchone()
+        if row is None:
+            raise ConflictError("historical utility aggregation returned no row")
+        return UtilityEstimate(
+            revision_id=revision_id,
+            context_fingerprint=context.fingerprint,
+            positive_weight=float(row["positive_weight"]),
+            negative_weight=float(row["negative_weight"]),
+            last_outcome_at=row["last_outcome_at"],
+        )
 
     def apply_outcome(
         self,
@@ -589,8 +670,8 @@ class PostgresMemoryStore:
                 """
                 INSERT INTO outcomes (
                     id, tenant_id, subject_id, trace_id, revision_id, kind,
-                    idempotency_key, occurred_at, weight, note
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    idempotency_key, occurred_at, recorded_at, weight, note
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     outcome.id,
@@ -601,6 +682,7 @@ class PostgresMemoryStore:
                     outcome.kind.value,
                     outcome.idempotency_key,
                     outcome.occurred_at,
+                    outcome.recorded_at,
                     outcome.weight,
                     outcome.note,
                 ),
@@ -638,13 +720,14 @@ class PostgresMemoryStore:
                 aggregate_type="outcome",
                 aggregate_id=outcome.id,
                 event_type="outcome.recorded",
-                occurred_at=outcome.occurred_at,
+                occurred_at=outcome.recorded_at,
                 payload={
                     "tenant_id": outcome.scope.tenant_id,
                     "subject_id": outcome.scope.subject_id,
                     "trace_id": str(outcome.trace_id),
                     "revision_id": str(outcome.revision_id),
                     "kind": outcome.kind.value,
+                    "occurred_at": outcome.occurred_at.isoformat(),
                 },
             )
             return utility_row
@@ -797,6 +880,45 @@ _SNAPSHOT_SELECT = """
 """
 
 
+_AS_OF_SNAPSHOT_SELECT = """
+    SELECT
+        r.id AS record_id,
+        r.tenant_id,
+        r.subject_id,
+        r.kind AS record_kind,
+        r.key AS record_key,
+        r.context AS record_context,
+        r.created_at AS record_created_at,
+        v.id AS revision_id,
+        v.sequence,
+        v.value,
+        v.confidence,
+        v.support_count,
+        v.contradiction_count,
+        v.source_diversity,
+        v.source_keys,
+        v.last_evidence_at,
+        v.evidence_ids,
+        v.valid_from,
+        v.recorded_at,
+        v.supersedes_revision_id
+    FROM memory_records r
+    JOIN LATERAL (
+        SELECT candidate.*
+        FROM memory_revisions candidate
+        WHERE candidate.record_id = r.id
+          AND candidate.tenant_id = r.tenant_id
+          AND candidate.subject_id = r.subject_id
+          AND candidate.recorded_at <= %s
+          AND candidate.valid_from <= %s
+        ORDER BY candidate.recorded_at DESC, candidate.sequence DESC, candidate.id DESC
+        LIMIT 1
+    ) v ON TRUE
+    WHERE r.tenant_id = %s AND r.subject_id = %s AND r.created_at <= %s
+    ORDER BY r.key, r.context_fingerprint, r.id
+"""
+
+
 def _observation(row: DbRow) -> Observation:
     metadata_value = row["metadata"]
     metadata = tuple((str(item[0]), str(item[1])) for item in metadata_value)
@@ -887,6 +1009,8 @@ def _recalled_item(row: DbRow) -> RecalledItem:
         key=row["key"],
         value=row["value"],
         context=_context(row["context"]),
+        revision_valid_from=row["revision_valid_from"],
+        revision_recorded_at=row["revision_recorded_at"],
         rank=row["rank"],
         score=row["score"],
         breakdown=ScoreBreakdown(
@@ -909,6 +1033,7 @@ def _outcome(row: DbRow) -> OutcomeEvent:
         kind=OutcomeKind(row["kind"]),
         idempotency_key=row["idempotency_key"],
         occurred_at=row["occurred_at"],
+        recorded_at=row["recorded_at"],
         weight=row["weight"],
         note=row["note"],
     )

@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
 
 from evolvable_memory.application.commands import OutcomeResult, PreferenceResult
 from evolvable_memory.domain.experience import OutcomeKind, RecallTrace, UtilityEstimate
@@ -215,6 +215,20 @@ class RecallRequest(ApiModel):
     query: QueryText
     context: ContextMap = Field(default_factory=dict)
     limit: int = Field(default=10, ge=1, le=100)
+    valid_at: AwareDatetime | None = Field(
+        default=None,
+        description=(
+            "可选业务有效时点。只考虑 valid_from 不晚于该时点的修订。"
+            "省略时使用本次请求的服务端 UTC 时间。"
+        ),
+    )
+    known_at: AwareDatetime | None = Field(
+        default=None,
+        description=(
+            "可选系统知识截止时点。只使用不晚于该时点记录的修订与 Outcome。"
+            "不能晚于本次请求的服务端时间。省略时使用服务端 UTC 时间。"
+        ),
+    )
     purpose: PurposeText = "personalization"
 
     model_config = ConfigDict(
@@ -245,6 +259,8 @@ class RecallItemResponse(ApiModel):
     key: str
     value: str
     context: dict[str, str]
+    revision_valid_from: datetime
+    revision_recorded_at: datetime
     rank: int
     score: float
     breakdown: ScoreResponse
@@ -255,6 +271,8 @@ class RecallResponse(ApiModel):
     trace_id: UUID
     policy_id: UUID
     policy_version: int
+    valid_at: datetime
+    known_at: datetime
     created_at: datetime
     items: list[RecallItemResponse]
 
@@ -264,6 +282,8 @@ class RecallResponse(ApiModel):
             trace_id=trace.id,
             policy_id=trace.policy_id,
             policy_version=trace.policy_version,
+            valid_at=trace.valid_at,
+            known_at=trace.known_at,
             created_at=trace.created_at,
             items=[
                 RecallItemResponse(
@@ -272,6 +292,8 @@ class RecallResponse(ApiModel):
                     key=item.key,
                     value=item.value,
                     context=item.context.as_dict(),
+                    revision_valid_from=item.revision_valid_from,
+                    revision_recorded_at=item.revision_recorded_at,
                     rank=item.rank,
                     score=item.score,
                     breakdown=ScoreResponse(
