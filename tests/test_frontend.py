@@ -66,6 +66,8 @@ def test_frontend_server_serves_console_without_cache(
 
     script = (frontend._STATIC_DIRECTORY / "app.js").read_text(encoding="utf-8")
     assert "updateStorageDisplay(health.storage)" in script
+    assert "updateAuthorizationDisplay(health.auth_mode)" in script
+    assert 'health.auth_mode === "jwt" ? "JWT 权限" : "开发身份"' in script
     assert "form.elements.expected_revision_id.value = item.revision_id" in script
     assert "--muted: #5f6e67;" in styles
     assert ".status-retry {" in styles

@@ -25,6 +25,7 @@ MAX_CONTEXT_VALUE_LENGTH = 512
 MAX_REASON_LENGTH = 2_048
 MAX_QUERY_LENGTH = 4_096
 MAX_NOTE_LENGTH = 4_096
+MAX_PURPOSE_LENGTH = 128
 
 ScopeId = Annotated[
     str,
@@ -75,6 +76,10 @@ NoteText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, max_length=MAX_NOTE_LENGTH),
 ]
+PurposeText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_PURPOSE_LENGTH),
+]
 
 
 class ApiModel(BaseModel):
@@ -96,6 +101,10 @@ class PreferenceWriteRequest(ApiModel):
     )
     evidence_text: EvidenceText = Field(description="用户或来源的原始证据文本。")
     confidence: Confidence = 0.80
+    purpose: PurposeText = Field(
+        default="personalization",
+        description="受控处理目的。生产授权必须显式允许该目的。",
+    )
     occurred_at: datetime | None = Field(
         default=None,
         description="证据实际发生时间; 省略时使用服务端当前 UTC 时间。",
@@ -127,6 +136,7 @@ class PreferenceCorrectionRequest(ApiModel):
     value: MemoryValue
     evidence_text: EvidenceText
     reason: ReasonText
+    purpose: PurposeText = "personalization"
     occurred_at: datetime | None = None
     expected_revision_id: UUID | None = Field(
         default=None,
@@ -205,6 +215,7 @@ class RecallRequest(ApiModel):
     query: QueryText
     context: ContextMap = Field(default_factory=dict)
     limit: int = Field(default=10, ge=1, le=100)
+    purpose: PurposeText = "personalization"
 
     model_config = ConfigDict(
         extra="forbid",
@@ -287,6 +298,7 @@ class OutcomeWriteRequest(ApiModel):
     occurred_at: datetime | None = None
     weight: OutcomeWeight = 1.0
     note: NoteText | None = None
+    purpose: PurposeText = "personalization"
 
     model_config = ConfigDict(
         extra="forbid",
@@ -380,6 +392,8 @@ class ServiceInfoResponse(ApiModel):
     version: str
     status: str
     storage: str
+    auth_mode: str
+    scope_source: str
     frontend_url: str
     documentation_url: str
     production_ready: bool

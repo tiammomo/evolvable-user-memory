@@ -53,6 +53,7 @@ services:
       EMF_HOST: 0.0.0.0
       EMF_PORT: "38089"
       EMF_LOG_LEVEL: INFO
+      EMF_AUTH_MODE: development
       EMF_STORE: postgres
       EMF_DATABASE_URL: *database-url
       EMF_DATABASE_POOL_MIN_SIZE: "1"

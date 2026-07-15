@@ -18,7 +18,11 @@ def _runtime_logging_config(level: str) -> dict[str, Any]:
         "formatter": "emf_json",
         "stream": "ext://sys.stdout",
     }
-    for logger_name in ("evolvable_memory.access", "evolvable_memory.error"):
+    for logger_name in (
+        "evolvable_memory.access",
+        "evolvable_memory.authorization",
+        "evolvable_memory.error",
+    ):
         config["loggers"][logger_name] = {
             "handlers": ["emf_json"],
             "level": level,

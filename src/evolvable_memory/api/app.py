@@ -5,10 +5,15 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from evolvable_memory.adapters.authorization import (
+    LoggingAuthorizationAuditSink,
+    RolePolicyAuthorizer,
+)
 from evolvable_memory.adapters.in_memory import InMemoryMemoryStore
 from evolvable_memory.adapters.postgres import PostgresMemoryStore
 from evolvable_memory.adapters.system import SystemClock, Uuid4Generator
@@ -21,18 +26,36 @@ from evolvable_memory.api.schemas import (
     PreferenceResponse,
     PreferenceSummaryResponse,
     PreferenceWriteRequest,
+    PurposeText,
     RecallRequest,
     RecallResponse,
     RevisionResponse,
     ServiceInfoResponse,
 )
+from evolvable_memory.api.security import (
+    DevelopmentIdentityResolver,
+    IdentityResolver,
+    JwtIdentityResolver,
+    PyJwkSigningKeyProvider,
+)
+from evolvable_memory.application.access import AuthorizedMemoryApplication
 from evolvable_memory.application.commands import (
     CorrectPreference,
     RecallMemory,
     RecordOutcome,
     RememberPreference,
 )
-from evolvable_memory.application.ports import MemoryStore
+from evolvable_memory.application.ports import (
+    AuthorizationAuditPort,
+    AuthorizationPort,
+    MemoryStore,
+)
+from evolvable_memory.application.security import (
+    ActorContext,
+    AuthenticationError,
+    AuthorizationDeniedError,
+    InvocationContext,
+)
 from evolvable_memory.application.service import MemoryApplication
 from evolvable_memory.config import Settings
 from evolvable_memory.domain.common import (
@@ -62,15 +85,47 @@ _OPENAPI_TAGS = [
         "description": "记录引用 RecallTrace 的真实结果, 更新上下文效用。",
     },
 ]
+_BEARER = HTTPBearer(
+    auto_error=False,
+    scheme_name="OAuth2AccessToken",
+    description=(
+        "Production mode requires an RFC 9068-style access token. "
+        "Development mode uses an explicit local-only identity adapter."
+    ),
+)
+_BEARER_DEPENDENCY = Security(_BEARER)
 
 
 def create_app(
     application: MemoryApplication | None = None,
     settings: Settings | None = None,
+    *,
+    authorization: AuthorizationPort | None = None,
+    authorization_audit: AuthorizationAuditPort | None = None,
+    identity_resolver: IdentityResolver | None = None,
 ) -> FastAPI:
     runtime = settings or Settings.from_environment()
     owns_application = application is None
     service = application or _build_application(runtime)
+    clock = SystemClock()
+    access = AuthorizedMemoryApplication(
+        application=service,
+        authorization=authorization or RolePolicyAuthorizer(),
+        audit=authorization_audit
+        or LoggingAuthorizationAuditSink(
+            (runtime.auth_audit_hmac_key or "development-only-audit-key-change-me").encode()
+        ),
+        clock=clock,
+    )
+    identities = identity_resolver or _build_identity_resolver(runtime)
+
+    def authenticated_actor(
+        credentials: HTTPAuthorizationCredentials | None = _BEARER_DEPENDENCY,
+    ) -> ActorContext:
+        token = credentials.credentials if credentials is not None else None
+        return identities.authenticate(token)
+
+    actor_dependency = Depends(authenticated_actor)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -87,19 +142,23 @@ def create_app(
             + (
                 "当前运行于进程内存模式, 仅用于开发和语义验证; 重启会清空数据。"
                 if runtime.store == "memory"
-                else "当前使用 PostgreSQL 权威存储; 仍需生产认证和隐私治理后才能接入真实数据。"
+                else (
+                    "当前使用 PostgreSQL 权威存储; 仍需完整权限治理、隐私治理"
+                    "和生产运维后才能接入真实数据。"
+                )
             )
         ),
         openapi_tags=_OPENAPI_TAGS,
         lifespan=lifespan,
     )
     app.state.memory_application = service
+    app.state.authorized_memory_application = access
     app.state.settings = runtime
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(runtime.cors_origins),
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-Request-ID"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
         expose_headers=["X-Request-ID"],
     )
     app.add_middleware(
@@ -121,6 +180,35 @@ def create_app(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             content=body.model_dump(mode="json"),
         )
+
+    @app.exception_handler(AuthenticationError)
+    async def authentication_error_handler(
+        request: Request,
+        _exc: AuthenticationError,
+    ) -> JSONResponse:
+        body = ErrorResponse(
+            error="AuthenticationError",
+            detail="A valid bearer access token is required.",
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            headers={"WWW-Authenticate": "Bearer"},
+            content=body.model_dump(mode="json"),
+        )
+
+    @app.exception_handler(AuthorizationDeniedError)
+    async def authorization_error_handler(
+        request: Request,
+        exc: AuthorizationDeniedError,
+    ) -> JSONResponse:
+        code = status.HTTP_404_NOT_FOUND if exc.conceal_resource else status.HTTP_403_FORBIDDEN
+        body = ErrorResponse(
+            error="NotFoundError" if exc.conceal_resource else "AuthorizationDeniedError",
+            detail=str(exc),
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return JSONResponse(status_code=code, content=body.model_dump(mode="json"))
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(_request: Request, exc: DomainError) -> JSONResponse:
@@ -152,6 +240,8 @@ def create_app(
             version="0.1.0",
             status="ok",
             storage=runtime.store,
+            auth_mode=runtime.auth_mode,
+            scope_source="request" if runtime.auth_mode == "development" else "access_token",
             frontend_url=runtime.frontend_url,
             documentation_url=f"{runtime.public_api_url.rstrip('/')}/docs",
             production_ready=False,
@@ -159,15 +249,21 @@ def create_app(
                 "Development contract: data is cleared when the backend restarts."
                 if runtime.store == "memory"
                 else (
-                    "PostgreSQL authority enabled; authentication and privacy policy "
-                    "remain required."
+                    "PostgreSQL authority and authorization baseline enabled; permission "
+                    "governance and privacy policy remain required."
                 )
             ),
         )
 
     @app.get("/health", tags=["operations"], summary="检查服务存活状态")
     def health() -> dict[str, str]:
-        return {"status": "ok", "version": "0.1.0", "storage": runtime.store}
+        return {
+            "status": "ok",
+            "version": "0.1.0",
+            "storage": runtime.store,
+            "auth_mode": runtime.auth_mode,
+            "scope_source": ("request" if runtime.auth_mode == "development" else "access_token"),
+        }
 
     @app.get("/livez", tags=["operations"], summary="检查进程存活状态")
     def livez() -> dict[str, str]:
@@ -192,19 +288,25 @@ def create_app(
             "相同作用域和幂等键的安全重试不会重复写入。"
         ),
     )
-    def remember_preference(request: PreferenceWriteRequest) -> PreferenceResponse:
-        result = service.remember_preference(
+    def remember_preference(
+        payload: PreferenceWriteRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
+    ) -> PreferenceResponse:
+        scope = Scope(payload.tenant_id, payload.subject_id)
+        result = access.remember_preference(
+            _invocation(http_request, actor, payload.purpose),
             RememberPreference(
-                scope=Scope(request.tenant_id, request.subject_id),
-                source=request.source,
-                idempotency_key=request.idempotency_key,
-                key=request.key,
-                value=request.value,
-                context=ContextSignature.from_mapping(request.context),
-                evidence_text=request.evidence_text,
-                confidence=request.confidence,
-                occurred_at=_occurred_at(request.occurred_at),
-            )
+                scope=scope,
+                source=payload.source,
+                idempotency_key=payload.idempotency_key,
+                key=payload.key,
+                value=payload.value,
+                context=ContextSignature.from_mapping(payload.context),
+                evidence_text=payload.evidence_text,
+                confidence=payload.confidence,
+                occurred_at=_occurred_at(payload.occurred_at),
+            ),
         )
         return PreferenceResponse.from_result(result)
 
@@ -217,20 +319,25 @@ def create_app(
         description="追加新修订并保留旧版本; 不会原地覆盖历史。",
     )
     def correct_preference(
-        record_id: UUID, request: PreferenceCorrectionRequest
+        record_id: UUID,
+        payload: PreferenceCorrectionRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
     ) -> PreferenceResponse:
-        result = service.correct_preference(
+        scope = Scope(payload.tenant_id, payload.subject_id)
+        result = access.correct_preference(
+            _invocation(http_request, actor, payload.purpose),
             CorrectPreference(
-                scope=Scope(request.tenant_id, request.subject_id),
+                scope=scope,
                 record_id=record_id,
-                source=request.source,
-                idempotency_key=request.idempotency_key,
-                value=request.value,
-                evidence_text=request.evidence_text,
-                reason=request.reason,
-                expected_revision_id=request.expected_revision_id,
-                occurred_at=_occurred_at(request.occurred_at),
-            )
+                source=payload.source,
+                idempotency_key=payload.idempotency_key,
+                value=payload.value,
+                evidence_text=payload.evidence_text,
+                reason=payload.reason,
+                expected_revision_id=payload.expected_revision_id,
+                occurred_at=_occurred_at(payload.occurred_at),
+            ),
         )
         return PreferenceResponse.from_result(result)
 
@@ -241,8 +348,18 @@ def create_app(
         summary="列出当前有效偏好",
         description="只返回指定租户和用户作用域内每条偏好的当前有效修订。",
     )
-    def list_preferences(tenant_id: str, subject_id: str) -> list[PreferenceSummaryResponse]:
-        snapshots = service.list_preferences(Scope(tenant_id, subject_id))
+    def list_preferences(
+        http_request: Request,
+        tenant_id: str,
+        subject_id: str,
+        actor: ActorContext = actor_dependency,
+        purpose: PurposeText = "personalization",
+    ) -> list[PreferenceSummaryResponse]:
+        scope = Scope(tenant_id, subject_id)
+        snapshots = access.list_preferences(
+            _invocation(http_request, actor, purpose),
+            scope,
+        )
         return [PreferenceSummaryResponse.from_snapshot(snapshot) for snapshot in snapshots]
 
     @app.get(
@@ -253,9 +370,19 @@ def create_app(
         description="按修订序号返回完整的不可变版本链。",
     )
     def preference_history(
-        record_id: UUID, tenant_id: str, subject_id: str
+        record_id: UUID,
+        http_request: Request,
+        tenant_id: str,
+        subject_id: str,
+        actor: ActorContext = actor_dependency,
+        purpose: PurposeText = "personalization",
     ) -> list[RevisionResponse]:
-        revisions = service.history(Scope(tenant_id, subject_id), record_id)
+        scope = Scope(tenant_id, subject_id)
+        revisions = access.history(
+            _invocation(http_request, actor, purpose),
+            scope,
+            record_id,
+        )
         return [RevisionResponse.from_revision(revision) for revision in revisions]
 
     @app.post(
@@ -268,14 +395,20 @@ def create_app(
             "业务结果应通过 /v1/outcomes 回传。"
         ),
     )
-    def recall(request: RecallRequest) -> RecallResponse:
-        trace = service.recall(
+    def recall(
+        payload: RecallRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
+    ) -> RecallResponse:
+        scope = Scope(payload.tenant_id, payload.subject_id)
+        trace = access.recall(
+            _invocation(http_request, actor, payload.purpose),
             RecallMemory(
-                scope=Scope(request.tenant_id, request.subject_id),
-                query=request.query,
-                context=ContextSignature.from_mapping(request.context),
-                limit=request.limit,
-            )
+                scope=scope,
+                query=payload.query,
+                context=ContextSignature.from_mapping(payload.context),
+                limit=payload.limit,
+            ),
         )
         return RecallResponse.from_trace(trace)
 
@@ -290,18 +423,24 @@ def create_app(
             "这是一条记忆学习上下文效用的唯一入口。"
         ),
     )
-    def record_outcome(request: OutcomeWriteRequest) -> OutcomeResponse:
-        result = service.record_outcome(
+    def record_outcome(
+        payload: OutcomeWriteRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
+    ) -> OutcomeResponse:
+        scope = Scope(payload.tenant_id, payload.subject_id)
+        result = access.record_outcome(
+            _invocation(http_request, actor, payload.purpose),
             RecordOutcome(
-                scope=Scope(request.tenant_id, request.subject_id),
-                trace_id=request.trace_id,
-                revision_id=request.revision_id,
-                kind=request.kind,
-                idempotency_key=request.idempotency_key,
-                occurred_at=_occurred_at(request.occurred_at),
-                weight=request.weight,
-                note=request.note,
-            )
+                scope=scope,
+                trace_id=payload.trace_id,
+                revision_id=payload.revision_id,
+                kind=payload.kind,
+                idempotency_key=payload.idempotency_key,
+                occurred_at=_occurred_at(payload.occurred_at),
+                weight=payload.weight,
+                note=payload.note,
+            ),
         )
         return OutcomeResponse.from_result(result)
 
@@ -321,6 +460,34 @@ def _build_application(settings: Settings) -> MemoryApplication:
     else:
         store = InMemoryMemoryStore()
     return MemoryApplication(store=store, clock=SystemClock(), ids=Uuid4Generator())
+
+
+def _build_identity_resolver(settings: Settings) -> IdentityResolver:
+    if settings.auth_mode == "development":
+        return DevelopmentIdentityResolver()
+    issuer = settings.auth_jwt_issuer
+    audience = settings.auth_jwt_audience
+    jwks_url = settings.auth_jwt_jwks_url
+    if issuer is None or audience is None or jwks_url is None:
+        raise RuntimeError("JWT identity settings were not validated")
+    return JwtIdentityResolver(
+        issuer=issuer,
+        audience=audience,
+        algorithms=settings.auth_jwt_algorithms,
+        required_scope=settings.auth_required_scope,
+        key_provider=PyJwkSigningKeyProvider(jwks_url),
+    )
+
+
+def _invocation(
+    request: Request,
+    actor: ActorContext,
+    purpose: str,
+) -> InvocationContext:
+    request_id = getattr(request.state, "request_id", None)
+    if not isinstance(request_id, str):
+        raise RuntimeError("request identity middleware did not establish a request ID")
+    return InvocationContext(actor=actor, purpose=purpose, request_id=request_id)
 
 
 def _occurred_at(value: datetime | None) -> datetime:

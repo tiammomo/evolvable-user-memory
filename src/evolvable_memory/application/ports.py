@@ -5,6 +5,11 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
+from evolvable_memory.application.security import (
+    AuthorizationAuditEvent,
+    AuthorizationDecision,
+    AuthorizationRequest,
+)
 from evolvable_memory.domain.common import ContextSignature, Scope
 from evolvable_memory.domain.evidence import Candidate, EvidenceSpan, Observation
 from evolvable_memory.domain.evolution import StrategySnapshot
@@ -27,6 +32,14 @@ class Clock(Protocol):
 
 class IdGenerator(Protocol):
     def new(self) -> UUID: ...
+
+
+class AuthorizationPort(Protocol):
+    def decide(self, request: AuthorizationRequest) -> AuthorizationDecision: ...
+
+
+class AuthorizationAuditPort(Protocol):
+    def record(self, event: AuthorizationAuditEvent) -> None: ...
 
 
 class MemoryStore(Protocol):

@@ -48,8 +48,70 @@ def test_invalid_service_settings_are_rejected() -> None:
         Settings(database_pool_min_size=3, database_pool_max_size=2)
     with pytest.raises(DomainError, match="max_request_body_bytes"):
         Settings(max_request_body_bytes=0)
+    with pytest.raises(DomainError, match="auth_mode"):
+        Settings(auth_mode="none")
+    with pytest.raises(DomainError, match="forbidden"):
+        Settings(environment="production", auth_mode="development")
+    with pytest.raises(DomainError, match="environment"):
+        Settings(environment="demo", auth_mode="development")
+    with pytest.raises(DomainError, match="issuer"):
+        Settings(auth_mode="jwt")
+    with pytest.raises(DomainError, match="asymmetric"):
+        Settings(
+            auth_mode="jwt",
+            auth_jwt_issuer="https://identity.example",
+            auth_jwt_audience="memory-api",
+            auth_jwt_jwks_url="https://identity.example/jwks.json",
+            auth_jwt_algorithms=("HS256",),
+            auth_audit_hmac_key="x" * 32,
+        )
+    with pytest.raises(DomainError, match="audit HMAC"):
+        Settings(
+            auth_mode="jwt",
+            auth_jwt_issuer="https://identity.example",
+            auth_jwt_audience="memory-api",
+            auth_jwt_jwks_url="https://identity.example/jwks.json",
+            auth_audit_hmac_key="short",
+        )
+    with pytest.raises(DomainError, match="issuer must use HTTPS"):
+        Settings(
+            environment="production",
+            auth_mode="jwt",
+            auth_jwt_issuer="http://identity.example",
+            auth_jwt_audience="memory-api",
+            auth_jwt_jwks_url="https://identity.example/jwks.json",
+            auth_audit_hmac_key="x" * 32,
+        )
+    with pytest.raises(DomainError, match="JWKS URL must use HTTPS"):
+        Settings(
+            environment="production",
+            auth_mode="jwt",
+            auth_jwt_issuer="https://identity.example",
+            auth_jwt_audience="memory-api",
+            auth_jwt_jwks_url="http://identity.example/jwks.json",
+            auth_audit_hmac_key="x" * 32,
+        )
     with pytest.raises(DomainError, match="frontend port"):
         FrontendSettings(port=65_536)
+
+
+def test_jwt_authorization_settings_are_loaded_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EMF_ENVIRONMENT", "production")
+    monkeypatch.setenv("EMF_AUTH_MODE", "jwt")
+    monkeypatch.setenv("EMF_AUTH_JWT_ISSUER", "https://identity.example")
+    monkeypatch.setenv("EMF_AUTH_JWT_AUDIENCE", "memory-api")
+    monkeypatch.setenv("EMF_AUTH_JWT_JWKS_URL", "https://identity.example/jwks.json")
+    monkeypatch.setenv("EMF_AUTH_JWT_ALGORITHMS", "RS256,ES256")
+    monkeypatch.setenv("EMF_AUTH_REQUIRED_SCOPE", "memory.read")
+    monkeypatch.setenv("EMF_AUTH_AUDIT_HMAC_KEY", "x" * 32)
+
+    settings = Settings.from_environment()
+
+    assert settings.auth_mode == "jwt"
+    assert settings.auth_jwt_algorithms == ("RS256", "ES256")
+    assert settings.auth_required_scope == "memory.read"
 
 
 def test_postgres_settings_and_runtime_urls_are_loaded(
@@ -98,7 +160,11 @@ def test_backend_entrypoint_disables_query_bearing_uvicorn_access_logs(
     assert captured["access_log"] is False
     log_config = captured["log_config"]
     assert isinstance(log_config, dict)
-    for logger_name in ("evolvable_memory.access", "evolvable_memory.error"):
+    for logger_name in (
+        "evolvable_memory.access",
+        "evolvable_memory.authorization",
+        "evolvable_memory.error",
+    ):
         assert log_config["loggers"][logger_name] == {
             "handlers": ["emf_json"],
             "level": "INFO",

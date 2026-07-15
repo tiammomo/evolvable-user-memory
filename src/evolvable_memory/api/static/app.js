@@ -18,6 +18,7 @@ const state = {
   idempotencyOperations: new Map(),
   healthController: null,
   storage: "unknown",
+  authMode: "unknown",
 };
 
 const viewCopy = {
@@ -1136,7 +1137,9 @@ async function checkHealth() {
     dot.className = "status-dot is-online";
     label.textContent = "API 在线";
     updateStorageDisplay(health.storage);
-    detail.textContent = `v${health.version} · ${health.storage === "postgres" ? "PostgreSQL" : "进程内存"}`;
+    updateAuthorizationDisplay(health.auth_mode);
+    const authLabel = health.auth_mode === "jwt" ? "JWT 权限" : "开发身份";
+    detail.textContent = `v${health.version} · ${health.storage === "postgres" ? "PostgreSQL" : "进程内存"} · ${authLabel}`;
   } catch (error) {
     if (isRequestCancelled(error)) return;
     dot.className = "status-dot is-offline";
@@ -1161,6 +1164,15 @@ function updateStorageDisplay(storage) {
   $("#session-storage-note").textContent = persistent
     ? "当前使用 PostgreSQL，后端重启后数据保留"
     : "当前使用进程内存，后端重启后数据清空";
+}
+
+function updateAuthorizationDisplay(authMode) {
+  state.authMode = authMode;
+  const control = $(".scope-control");
+  control.dataset.authMode = authMode;
+  control.title = authMode === "jwt"
+    ? "Scope 是目标选择器，后端会按可信 JWT grant 校验权限"
+    : "当前使用仅限本机评估的开发身份，Scope 可手动切换";
 }
 
 function bindEvents() {

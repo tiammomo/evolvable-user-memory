@@ -200,6 +200,8 @@ def test_health(harness: Harness) -> None:
         "status": "ok",
         "version": "0.1.0",
         "storage": "memory",
+        "auth_mode": "development",
+        "scope_source": "request",
     }
     assert client.get("/livez").json() == {"status": "ok"}
     assert client.get("/readyz").json() == {"status": "ready", "storage": "memory"}
@@ -216,6 +218,18 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
     assert service.json()["production_ready"] is False
     assert "/v1/preferences" in schema["paths"]
     assert schema["paths"]["/v1/recall"]["post"]["summary"] == "执行上下文记忆召回"
+    bearer = schema["components"]["securitySchemes"]["OAuth2AccessToken"]
+    assert bearer["type"] == "http"
+    assert bearer["scheme"] == "bearer"
+    for path, method in (
+        ("/v1/preferences", "post"),
+        ("/v1/preferences", "get"),
+        ("/v1/preferences/{record_id}/corrections", "post"),
+        ("/v1/preferences/{record_id}/revisions", "get"),
+        ("/v1/recall", "post"),
+        ("/v1/outcomes", "post"),
+    ):
+        assert schema["paths"][path][method]["security"] == [{"OAuth2AccessToken": []}]
     outcome_schema = schema["components"]["schemas"]["OutcomeWriteRequest"]
     assert outcome_schema["example"]["kind"] == "helpful"
     correction_schema = schema["components"]["schemas"]["PreferenceCorrectionRequest"]
@@ -244,7 +258,9 @@ def test_frontend_origin_is_allowed_by_cors(harness: Harness) -> None:
 
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == "http://127.0.0.1:33009"
-    assert "x-request-id" in preflight.headers["access-control-allow-headers"].lower()
+    allowed_headers = preflight.headers["access-control-allow-headers"].lower()
+    assert "authorization" in allowed_headers
+    assert "x-request-id" in allowed_headers
     assert allowed.headers["access-control-expose-headers"].lower() == "x-request-id"
     assert "access-control-allow-origin" not in disallowed.headers
 
