@@ -11,6 +11,7 @@
     <script src="./app.js" defer></script>
   </head>
   <body>
+    <a class="skip-link" href="#main-content">跳转到主要内容</a>
     <div class="mobile-scrim" id="mobile-scrim" aria-hidden="true"></div>
     <div class="app-shell">
       <aside class="sidebar" id="sidebar">
@@ -28,7 +29,7 @@
         </div>
 
         <nav class="main-nav" aria-label="主导航">
-          <button class="nav-item is-active" type="button" data-view="overview">
+          <button class="nav-item is-active" type="button" data-view="overview" aria-current="page">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z" /></svg>
             <span>工作台</span>
           </button>
@@ -58,18 +59,19 @@
           </a>
           <div class="service-state">
             <span class="status-dot" id="status-dot"></span>
-            <span>
+            <span class="service-copy" role="status" aria-live="polite">
               <strong id="status-label">正在连接</strong>
               <small id="status-detail">检查 API 状态…</small>
             </span>
+            <button class="status-retry" id="retry-health" type="button" aria-label="重新检查 API 状态">重试</button>
           </div>
         </div>
       </aside>
 
-      <main class="main-content">
+      <main class="main-content" id="main-content" tabindex="-1">
         <header class="topbar">
           <div class="topbar-title">
-            <button class="icon-button mobile-menu" id="mobile-menu" type="button" aria-label="打开导航">
+            <button class="icon-button mobile-menu" id="mobile-menu" type="button" aria-label="打开导航" aria-controls="sidebar" aria-expanded="false">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
             </button>
             <div>
@@ -77,20 +79,26 @@
               <h1 id="page-title">记忆工作台</h1>
             </div>
           </div>
-          <div class="scope-control" aria-label="当前数据作用域">
-            <div class="scope-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><path d="M4 20h16M6 20V8l6-4 6 4v12M9 11h2m2 0h2m-6 4h2m2 0h2" /></svg>
+          <div class="topbar-actions">
+            <button class="guide-button" id="open-onboarding" type="button" aria-haspopup="dialog" aria-controls="onboarding-dialog">
+              <span aria-hidden="true">?</span>
+              新手引导
+            </button>
+            <div class="scope-control" aria-label="当前数据作用域">
+              <div class="scope-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M4 20h16M6 20V8l6-4 6 4v12M9 11h2m2 0h2m-6 4h2m2 0h2" /></svg>
+              </div>
+              <label>
+                <span>租户</span>
+                <input id="tenant-id" value="demo" autocomplete="off" />
+              </label>
+              <span class="scope-divider"></span>
+              <label>
+                <span>用户</span>
+                <input id="subject-id" value="alice" autocomplete="off" />
+              </label>
+              <button class="scope-save" id="save-scope" type="button">应用</button>
             </div>
-            <label>
-              <span>租户</span>
-              <input id="tenant-id" value="demo" autocomplete="off" />
-            </label>
-            <span class="scope-divider"></span>
-            <label>
-              <span>用户</span>
-              <input id="subject-id" value="alice" autocomplete="off" />
-            </label>
-            <button class="scope-save" id="save-scope" type="button">应用</button>
           </div>
         </header>
 
@@ -125,15 +133,16 @@
 
             <article class="quickstart-panel" aria-labelledby="quickstart-title">
               <div class="quickstart-copy">
-                <span class="quickstart-label">FIRST 10 MINUTES</span>
-                <h3 id="quickstart-title">第一次使用？完成这四步</h3>
+                <div class="quickstart-meta"><span class="quickstart-label">FIRST 10 MINUTES</span><strong id="journey-progress">已完成 1 / 5</strong></div>
+                <h3 id="quickstart-title">第一次使用？完成这五步</h3>
                 <p>跟随完整闭环体验证据如何成为记忆，以及真实结果如何更新效用。</p>
               </div>
               <ol class="journey-steps">
-                <li class="is-done" id="journey-scope"><span>1</span><div><strong>确认作用域</strong><small>demo / alice</small></div></li>
-                <li id="journey-write"><span>2</span><div><strong>写入偏好</strong><small>保留原始证据</small></div></li>
-                <li id="journey-recall"><span>3</span><div><strong>执行召回</strong><small>生成 Trace</small></div></li>
-                <li id="journey-outcome"><span>4</span><div><strong>提交反馈</strong><small>更新上下文效用</small></div></li>
+                <li class="is-done" id="journey-scope"><button class="journey-step" type="button" data-journey-action="scope"><span class="journey-number">1</span><span class="journey-copy"><strong>确认作用域</strong><small>demo / alice</small></span></button></li>
+                <li id="journey-write"><button class="journey-step" type="button" data-journey-action="write"><span class="journey-number">2</span><span class="journey-copy"><strong>写入偏好</strong><small>保留原始证据</small></span></button></li>
+                <li id="journey-view"><button class="journey-step" type="button" data-journey-action="view"><span class="journey-number">3</span><span class="journey-copy"><strong>查看记忆</strong><small>读取不会强化</small></span></button></li>
+                <li id="journey-recall"><button class="journey-step" type="button" data-journey-action="recall"><span class="journey-number">4</span><span class="journey-copy"><strong>执行召回</strong><small>生成 Trace</small></span></button></li>
+                <li id="journey-outcome"><button class="journey-step" type="button" data-journey-action="outcome"><span class="journey-number">5</span><span class="journey-copy"><strong>提交反馈</strong><small>更新上下文效用</small></span></button></li>
               </ol>
               <button class="button button-primary" id="start-example" type="button">使用示例开始</button>
             </article>
@@ -143,7 +152,7 @@
                 <p class="eyebrow">CURRENT SESSION</p>
                 <h3>本次会话概览</h3>
               </div>
-              <span class="session-note">服务重启后内存数据会清空</span>
+              <span class="session-note" id="session-storage-note">正在确认后端存储方式</span>
             </div>
             <div class="stats-grid">
               <article class="stat-card stat-green">
@@ -254,12 +263,16 @@
               </form>
 
               <aside class="side-stack">
+                <article class="panel storage-card">
+                  <span class="storage-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="3" /><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6" /></svg></span>
+                  <div><span class="storage-overline">CURRENT STORAGE</span><h3 id="storage-title">正在检测存储</h3><p id="storage-description">连接后端后会在这里显示权威记忆保存位置和重启行为。</p></div>
+                </article>
                 <article class="panel explainer-card">
-                  <div class="explainer-number">1</div><div><strong>观察成为证据</strong><p>原始输入以不可变 Observation 保存。</p></div>
+                  <div class="explainer-step"><div class="explainer-number">1</div><div><strong>观察成为证据</strong><p>原始输入以不可变 Observation 保存。</p></div></div>
                   <span class="connector"></span>
-                  <div class="explainer-number">2</div><div><strong>证据形成候选</strong><p>键、值与上下文组成待接受解释。</p></div>
+                  <div class="explainer-step"><div class="explainer-number">2</div><div><strong>证据形成候选</strong><p>键、值与上下文组成待接受解释。</p></div></div>
                   <span class="connector"></span>
-                  <div class="explainer-number">3</div><div><strong>生成不可变修订</strong><p>后续更正只追加新版本，不覆盖历史。</p></div>
+                  <div class="explainer-step"><div class="explainer-number">3</div><div><strong>生成不可变修订</strong><p>后续更正只追加新版本，不覆盖历史。</p></div></div>
                 </article>
                 <article class="panel result-panel is-hidden" id="capture-result" aria-live="polite"></article>
               </aside>
@@ -275,13 +288,14 @@
                 <span class="library-count" id="memory-count">0 条记忆</span>
                 <button class="button button-quiet" id="refresh-memories" type="button">刷新列表</button>
                 <button class="button button-primary" type="button" data-go="capture">写入记忆</button>
+                <button class="button button-dark" id="continue-to-recall" type="button">继续召回</button>
               </div>
             </div>
             <div class="library-note">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.8 2.9 8.1 7 10 4.1-1.9 7-5.2 7-10V6l-7-3Z" /><path d="M9 12h6" /></svg>
               <p><strong>只读视图：</strong>打开或刷新记忆库不会加强信念，也不会更新效用。</p>
             </div>
-            <div class="memory-library" id="memory-library">
+            <div class="memory-library" id="memory-library" aria-live="polite">
               <div class="empty-results">
                 <div class="empty-rings"><svg viewBox="0 0 48 48"><path d="M14 12h22v26H14z" /><path d="M19 19h12m-12 6h9" /></svg></div>
                 <h3>当前作用域还没有记忆</h3>
@@ -322,11 +336,12 @@
             </form>
 
             <div class="recall-meta is-hidden" id="recall-meta"></div>
-            <div class="recall-results" id="recall-results">
+            <div class="next-step-banner is-hidden" id="recall-guidance" role="status"></div>
+            <div class="recall-results" id="recall-results" aria-live="polite">
               <div class="empty-results">
                 <div class="empty-rings"><svg viewBox="0 0 48 48"><circle cx="21" cy="21" r="10" /><path d="m29 29 8 8" /></svg></div>
                 <h3>输入一个问题，开始检索记忆</h3>
-                <p>系统会综合语义、上下文、信念、效用与时效性进行排序。</p>
+                <p>系统会综合词法相关性、上下文、信念、效用与时效性进行排序。</p>
               </div>
             </div>
           </section>
@@ -370,19 +385,53 @@
       </main>
     </div>
 
-    <dialog class="modal" id="history-modal">
+    <dialog class="onboarding-modal" id="onboarding-dialog" aria-labelledby="onboarding-title" aria-describedby="onboarding-description">
+      <div class="onboarding-shell">
+        <aside class="onboarding-rail" aria-hidden="true">
+          <div class="onboarding-brand"><span>EM</span><strong>Evolvable Memory</strong></div>
+          <div class="onboarding-visual">
+            <span class="onboarding-orbit orbit-small"></span>
+            <span class="onboarding-orbit orbit-large"></span>
+            <strong id="onboarding-visual-number">01</strong>
+          </div>
+          <p>Evidence → Belief → Trace → Outcome</p>
+        </aside>
+        <section class="onboarding-content">
+          <button class="onboarding-close" id="onboarding-close" type="button" aria-label="关闭新手引导">×</button>
+          <header>
+            <span class="onboarding-count" id="onboarding-count">第 1 步，共 5 步</span>
+            <p class="eyebrow" id="onboarding-eyebrow">01 · SCOPE</p>
+            <h2 id="onboarding-title">先确认数据属于谁</h2>
+            <p id="onboarding-description"></p>
+          </header>
+          <ul class="onboarding-points" id="onboarding-points"></ul>
+          <div class="onboarding-note"><span aria-hidden="true">i</span><p><strong>本步要点</strong><span id="onboarding-note"></span></p></div>
+          <nav class="onboarding-dots" id="onboarding-dots" aria-label="引导步骤"></nav>
+          <footer>
+            <button class="button button-quiet" id="onboarding-skip" type="button">稍后再看</button>
+            <div>
+              <button class="button button-quiet" id="onboarding-prev" type="button">上一步</button>
+              <button class="button button-primary" id="onboarding-next" type="button">下一步</button>
+            </div>
+          </footer>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog class="modal" id="history-modal" aria-labelledby="history-title">
       <div class="modal-shell">
-        <header><div><p class="eyebrow">IMMUTABLE HISTORY</p><h2>记忆修订历史</h2></div><button class="modal-close" type="button" aria-label="关闭">×</button></header>
+        <header><div><p class="eyebrow">IMMUTABLE HISTORY</p><h2 id="history-title">记忆修订历史</h2></div><button class="modal-close" type="button" aria-label="关闭记忆修订历史">×</button></header>
         <div class="modal-body" id="history-content"></div>
       </div>
     </dialog>
 
-    <dialog class="modal" id="correction-modal">
+    <dialog class="modal" id="correction-modal" aria-labelledby="correction-title" aria-describedby="correction-description">
       <form class="modal-shell" id="correction-form">
-        <header><div><p class="eyebrow">APPEND A REVISION</p><h2>修正这条记忆</h2></div><button class="modal-close" type="button" aria-label="关闭">×</button></header>
+        <header><div><p class="eyebrow">APPEND A REVISION</p><h2 id="correction-title">修正这条记忆</h2></div><button class="modal-close" type="button" aria-label="关闭记忆修正">×</button></header>
         <div class="modal-body">
           <input name="record_id" type="hidden" />
-          <p class="modal-intro">修正会创建新的不可变版本，原有内容仍保留在历史中。</p>
+          <input name="expected_revision_id" type="hidden" />
+          <p class="modal-intro" id="correction-description">修正会创建新的不可变版本，原有内容仍保留在历史中。</p>
           <label class="field"><span>新的偏好值 <b>*</b></span><input name="value" required /></label>
           <label class="field"><span>修正证据 <b>*</b></span><textarea name="evidence_text" rows="3" placeholder="输入用户明确表达的修正内容" required></textarea></label>
           <label class="field"><span>修正原因 <b>*</b></span><input name="reason" value="user correction" required /></label>

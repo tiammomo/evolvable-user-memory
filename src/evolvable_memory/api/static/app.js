@@ -11,7 +11,13 @@ const state = {
   counts: { writes: 0, recalls: 0, outcomes: 0, results: 0 },
   lastTrace: null,
   activities: [],
-  journey: { write: false, recall: false, outcome: false },
+  journey: { write: false, view: false, recall: false, outcome: false },
+  scopeGeneration: 0,
+  scopeControllers: new Set(),
+  requestChannels: new Map(),
+  idempotencyOperations: new Map(),
+  healthController: null,
+  storage: "unknown",
 };
 
 const viewCopy = {
@@ -23,12 +29,85 @@ const viewCopy = {
 };
 
 const scoreLabels = {
-  semantic: "语义",
+  semantic: "词法匹配",
   context: "上下文",
   belief: "信念",
   utility: "效用",
   recency: "时效",
 };
+
+const ONBOARDING_STORAGE_KEY = "emf.onboarding.v1";
+const ONBOARDING_DISMISSED_KEY = "emf.onboarding.dismissed";
+const API_TIMEOUT_MS = 12000;
+const HEALTH_TIMEOUT_MS = 3500;
+const DIALOG_FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+const onboardingSteps = [
+  {
+    eyebrow: "01 · SCOPE",
+    title: "先确认数据属于谁",
+    description: "每次操作都必须明确租户和用户。默认的 demo / alice 适合本地体验，也能帮助你直观看到隔离边界。",
+    points: [
+      "tenant_id 隔离不同租户的数据。",
+      "subject_id 标识租户内的具体用户。",
+      "切换作用域后，列表、修订历史和召回都会重新读取。",
+    ],
+    note: "页面中的 Scope 只是开发合同；生产环境必须从可信认证上下文派生。",
+  },
+  {
+    eyebrow: "02 · EVIDENCE",
+    title: "从原始证据写入记忆",
+    description: "记忆不是直接修改的一段文本。系统先保存用户原始表达，再形成带上下文和置信度的不可变修订。",
+    points: [
+      "稳定的记忆键描述要记住哪类事实。",
+      "原始证据保持不变，后续修正不会覆盖它。",
+      "上下文让同一偏好在不同场景中共存。",
+    ],
+    note: "第一次体验可以载入“晚间低因咖啡”示例，不需要自己设计字段。",
+  },
+  {
+    eyebrow: "03 · BELIEF",
+    title: "查看当前信念，而非改写历史",
+    description: "“当前记忆”展示每条偏好的最新修订，同时保留完整版本链、证据数量和置信度。",
+    points: [
+      "刷新或打开列表是只读操作。",
+      "修正会追加新 Revision，旧版本仍可追溯。",
+      "租户或用户不匹配时无法读取其他作用域的数据。",
+    ],
+    note: "读取得再多，也不会让一条记忆自动变得更可信。",
+  },
+  {
+    eyebrow: "04 · TRACE",
+    title: "在当前语境中召回",
+    description: "系统综合词法相关性、上下文、信念、效用与时效性排序，并为每次召回保存独立 Trace。",
+    points: [
+      "查询描述当前需要解决的问题。",
+      "上下文用于匹配记忆成立的场景。",
+      "评分分量解释结果为什么排在这里。",
+    ],
+    note: "召回只生成可审计投影和 Trace，不会改变信念或效用。",
+  },
+  {
+    eyebrow: "05 · OUTCOME",
+    title: "用真实结果完成学习闭环",
+    description: "对召回结果提交“有帮助”或“无帮助”，Outcome 会引用刚才的 Trace，并更新该上下文中的效用。",
+    points: [
+      "反馈必须引用确实包含该 Revision 的 Trace。",
+      "重复提交由幂等键保护，不会重复累计。",
+      "效用来自可归因结果，而不是读取次数。",
+    ],
+    note: "点击下方按钮会载入示例，带你从第二步开始实际操作。",
+  },
+];
+
+let onboardingStepIndex = 0;
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -43,6 +122,26 @@ function createElement(tag, className, text) {
 function newId(prefix) {
   const randomPart = globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2);
   return `${prefix}:${Date.now()}:${randomPart}`;
+}
+
+function stableSerialize(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableSerialize(item)}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function idempotencyKeyFor(operation, prefix, payload) {
+  const fingerprint = stableSerialize(payload);
+  const previous = state.idempotencyOperations.get(operation);
+  if (previous?.fingerprint === fingerprint) return previous.key;
+  const key = newId(prefix);
+  state.idempotencyOperations.set(operation, { fingerprint, key });
+  return key;
 }
 
 function shortId(value) {
@@ -83,36 +182,97 @@ class ApiError extends Error {
   }
 }
 
-async function api(path, options = {}) {
-  const request = {
-    ...options,
-    headers: { "content-type": "application/json", ...(options.headers || {}) },
-  };
-  const response = await fetch(`${API_BASE}${path}`, request);
-  const contentType = response.headers.get("content-type") || "";
-  const body = contentType.includes("application/json") ? await response.json() : await response.text();
-  if (!response.ok) {
-    let message = `请求失败（HTTP ${response.status}）`;
-    if (typeof body === "object" && body) {
-      if (typeof body.detail === "string") message = body.detail;
-      if (Array.isArray(body.detail)) {
-        message = body.detail.map((item) => item.msg || "参数校验失败").join("；");
-      }
-    }
-    throw new ApiError(message, response.status);
+class ScopeChangedError extends Error {
+  constructor() {
+    super("作用域已切换，请求已取消");
+    this.name = "ScopeChangedError";
   }
-  return body;
+}
+
+function isRequestCancelled(error) {
+  return error?.name === "AbortError" || error instanceof ScopeChangedError;
+}
+
+async function api(path, options = {}) {
+  const {
+    timeoutMs = API_TIMEOUT_MS,
+    signal: parentSignal,
+    ...fetchOptions
+  } = options;
+  const controller = new AbortController();
+  let timedOut = false;
+  const forwardAbort = () => controller.abort();
+  if (parentSignal?.aborted) controller.abort();
+  else parentSignal?.addEventListener("abort", forwardAbort, { once: true });
+  const timeout = globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const request = {
+    ...fetchOptions,
+    headers: { "content-type": "application/json", ...(fetchOptions.headers || {}) },
+    signal: controller.signal,
+  };
+  try {
+    const response = await fetch(`${API_BASE}${path}`, request);
+    const contentType = response.headers.get("content-type") || "";
+    const body = contentType.includes("application/json") ? await response.json() : await response.text();
+    if (!response.ok) {
+      let message = `请求失败（HTTP ${response.status}）`;
+      if (typeof body === "object" && body) {
+        if (typeof body.detail === "string") message = body.detail;
+        if (Array.isArray(body.detail)) {
+          message = body.detail.map((item) => item.msg || "参数校验失败").join("；");
+        }
+      }
+      throw new ApiError(message, response.status);
+    }
+    return body;
+  } catch (error) {
+    if (timedOut) throw new ApiError("请求超时，请确认 API 已启动后重试。", 408);
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", forwardAbort);
+  }
+}
+
+async function scopedApi(path, options = {}, channel = "") {
+  const generation = state.scopeGeneration;
+  const controller = new AbortController();
+  if (channel) state.requestChannels.get(channel)?.abort();
+  if (channel) state.requestChannels.set(channel, controller);
+  state.scopeControllers.add(controller);
+  try {
+    const result = await api(path, { ...options, signal: controller.signal });
+    if (generation !== state.scopeGeneration) throw new ScopeChangedError();
+    return result;
+  } finally {
+    state.scopeControllers.delete(controller);
+    if (channel && state.requestChannels.get(channel) === controller) {
+      state.requestChannels.delete(channel);
+    }
+  }
+}
+
+function cancelScopedRequests() {
+  state.scopeGeneration += 1;
+  for (const controller of state.scopeControllers) controller.abort();
+  state.scopeControllers.clear();
+  state.requestChannels.clear();
 }
 
 function setLoading(button, loading) {
   if (!button) return;
   button.disabled = loading;
   button.classList.toggle("is-loading", loading);
+  button.setAttribute("aria-busy", String(loading));
 }
 
 function toast(title, message, type = "success") {
   const region = $("#toast-region");
   const item = createElement("div", `toast${type === "error" ? " is-error" : ""}`);
+  item.setAttribute("role", type === "error" ? "alert" : "status");
   const mark = createElement("span", "toast-mark", type === "error" ? "!" : "✓");
   const copy = createElement("div");
   copy.append(createElement("strong", "", title), createElement("p", "", message));
@@ -123,6 +283,74 @@ function toast(title, message, type = "success") {
   item.append(mark, copy, close);
   region.append(item);
   window.setTimeout(() => item.remove(), 5200);
+}
+
+function renderOnboardingStep() {
+  const step = onboardingSteps[onboardingStepIndex];
+  const position = onboardingStepIndex + 1;
+  $("#onboarding-count").textContent = `第 ${position} 步，共 ${onboardingSteps.length} 步`;
+  $("#onboarding-eyebrow").textContent = step.eyebrow;
+  $("#onboarding-title").textContent = step.title;
+  $("#onboarding-description").textContent = step.description;
+  $("#onboarding-note").textContent = step.note;
+  $("#onboarding-visual-number").textContent = String(position).padStart(2, "0");
+
+  const points = $("#onboarding-points");
+  points.replaceChildren(...step.points.map((point) => createElement("li", "", point)));
+
+  const dots = $("#onboarding-dots");
+  dots.replaceChildren();
+  onboardingSteps.forEach((item, index) => {
+    const dot = createElement("button", index === onboardingStepIndex ? "is-active" : index < onboardingStepIndex ? "is-done" : "");
+    dot.type = "button";
+    dot.setAttribute("aria-label", `转到第 ${index + 1} 步：${item.title}`);
+    if (index === onboardingStepIndex) dot.setAttribute("aria-current", "step");
+    dot.addEventListener("click", () => {
+      onboardingStepIndex = index;
+      renderOnboardingStep();
+    });
+    dots.append(dot);
+  });
+
+  $("#onboarding-prev").disabled = onboardingStepIndex === 0;
+  $("#onboarding-next").textContent = onboardingStepIndex === onboardingSteps.length - 1 ? "载入示例并开始" : "下一步";
+}
+
+function showOnboarding(force = false) {
+  if (
+    !force
+    && (
+      localStorage.getItem(ONBOARDING_STORAGE_KEY) === "complete"
+      || sessionStorage.getItem(ONBOARDING_DISMISSED_KEY) === "true"
+    )
+  ) return;
+  onboardingStepIndex = 0;
+  renderOnboardingStep();
+  const dialog = $("#onboarding-dialog");
+  if (!dialog.open) dialog.showModal();
+}
+
+function dismissOnboarding() {
+  sessionStorage.setItem(ONBOARDING_DISMISSED_KEY, "true");
+  const dialog = $("#onboarding-dialog");
+  if (dialog.open) dialog.close();
+}
+
+function completeOnboarding() {
+  localStorage.setItem(ONBOARDING_STORAGE_KEY, "complete");
+  sessionStorage.removeItem(ONBOARDING_DISMISSED_KEY);
+  const dialog = $("#onboarding-dialog");
+  if (dialog.open) dialog.close();
+}
+
+function advanceOnboarding() {
+  if (onboardingStepIndex < onboardingSteps.length - 1) {
+    onboardingStepIndex += 1;
+    renderOnboardingStep();
+    return;
+  }
+  completeOnboarding();
+  loadExample();
 }
 
 function updateStats() {
@@ -140,16 +368,47 @@ function updateJourney() {
   $("#journey-scope").classList.add("is-done");
   $("#journey-scope small").textContent = `${state.scope.tenantId} / ${state.scope.subjectId}`;
   $("#journey-write").classList.toggle("is-done", state.journey.write);
+  $("#journey-view").classList.toggle("is-done", state.journey.view);
   $("#journey-recall").classList.toggle("is-done", state.journey.recall);
   $("#journey-outcome").classList.toggle("is-done", state.journey.outcome);
+
+  const completed = 1 + [state.journey.write, state.journey.view, state.journey.recall, state.journey.outcome].filter(Boolean).length;
+  const isComplete = completed === 5;
+  $("#journey-progress").textContent = `已完成 ${completed} / 5`;
+  $(".quickstart-panel").classList.toggle("is-complete", isComplete);
+  $("#quickstart-title").textContent = isComplete ? "恭喜，首条记忆闭环已完成" : "第一次使用？完成这五步";
+
+  const action = $("#start-example");
+  if (!state.journey.write) action.textContent = "载入示例并开始";
+  else if (!state.journey.view) action.textContent = "下一步：查看记忆";
+  else if (!state.journey.recall) action.textContent = "下一步：执行召回";
+  else if (!state.journey.outcome) action.textContent = "下一步：提交反馈";
+  else action.textContent = "重新查看新手引导";
 }
 
 function addActivity(kind, title, detail) {
   const symbols = { write: "+", recall: "↗", outcome: "✓", correction: "↻" };
   state.activities.unshift({ kind, title, detail, time: new Date() });
   state.activities = state.activities.slice(0, 8);
+  renderActivities(symbols);
+}
+
+function renderActivities(symbols = { write: "+", recall: "↗", outcome: "✓", correction: "↻" }) {
   const list = $("#activity-list");
   list.replaceChildren();
+  if (!state.activities.length) {
+    const empty = createElement("div", "empty-activity");
+    const mark = createElement("span");
+    mark.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4l2-5 4 10 2-5h4" /></svg>';
+    const copy = createElement("div");
+    copy.append(
+      createElement("strong", "", "等待第一条活动"),
+      createElement("p", "", "写入、召回与反馈会显示在这里。"),
+    );
+    empty.append(mark, copy);
+    list.append(empty);
+    return;
+  }
   for (const activity of state.activities) {
     const row = createElement("div", "activity-item");
     row.append(createElement("span", "", symbols[activity.kind] || "·"));
@@ -164,12 +423,24 @@ function addActivity(kind, title, detail) {
 function goToView(name) {
   if (!viewCopy[name]) return;
   $$(".view").forEach((view) => view.classList.toggle("is-active", view.id === `view-${name}`));
-  $$(".nav-item").forEach((item) => item.classList.toggle("is-active", item.dataset.view === name));
+  $$(".nav-item").forEach((item) => {
+    const isActive = item.dataset.view === name;
+    item.classList.toggle("is-active", isActive);
+    if (isActive) item.setAttribute("aria-current", "page");
+    else item.removeAttribute("aria-current");
+  });
   $("#page-title").textContent = viewCopy[name][0];
   $("#page-eyebrow").textContent = viewCopy[name][1];
   closeMobileMenu();
-  window.scrollTo({ top: 0, behavior: "smooth" });
-  if (name === "memories") loadMemories();
+  const behavior = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  window.scrollTo({ top: 0, behavior });
+  if (name === "memories") {
+    if (state.journey.write) {
+      state.journey.view = true;
+      updateJourney();
+    }
+    loadMemories();
+  }
 }
 
 function openMobileMenu() {
@@ -227,6 +498,51 @@ function resetCaptureContext() {
   addContextRow("capture-context", "time_of_day", "evening");
 }
 
+function prepareRecallExample(announce = true) {
+  goToView("recall");
+  const input = $("#recall-form input[name='query']");
+  input.value = "晚上应该准备什么饮料？";
+  input.focus();
+  if (announce) toast("召回示例已准备", "保持晚间上下文，点击“开始召回”生成一条可审计 Trace。");
+}
+
+function focusOutcomeAction() {
+  goToView("recall");
+  const outcomeButton = $("[data-outcome-button]:not(:disabled)", $("#recall-results"));
+  if (!outcomeButton) {
+    prepareRecallExample(false);
+    toast("先执行一次召回", "召回结果出现后，选择“有帮助”或“无帮助”完成闭环。");
+    return;
+  }
+  const behavior = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  outcomeButton.scrollIntoView({ behavior, block: "center" });
+  outcomeButton.focus({ preventScroll: true });
+  toast("最后一步", "根据真实使用结果选择“有帮助”或“无帮助”。");
+}
+
+function runJourneyAction(action) {
+  if (action === "scope") {
+    $("#tenant-id").focus();
+    toast("确认当前作用域", "首次体验保留 demo / alice 即可；修改后请点击“应用”。");
+  } else if (action === "write") {
+    loadExample();
+  } else if (action === "view") {
+    goToView("memories");
+  } else if (action === "recall") {
+    prepareRecallExample();
+  } else if (action === "outcome") {
+    focusOutcomeAction();
+  }
+}
+
+function continueJourney() {
+  if (!state.journey.write) runJourneyAction("write");
+  else if (!state.journey.view) runJourneyAction("view");
+  else if (!state.journey.recall) runJourneyAction("recall");
+  else if (!state.journey.outcome) runJourneyAction("outcome");
+  else showOnboarding(true);
+}
+
 function loadExample() {
   goToView("capture");
   const form = $("#memory-form");
@@ -261,7 +577,10 @@ function renderCaptureResult(data) {
     row.append(createElement("span", "", label), code);
     ids.append(row);
   }
-  panel.replaceChildren(mark, title, copy, ids);
+  const next = createElement("button", "button button-dark result-next-action", "下一步：查看当前记忆");
+  next.type = "button";
+  next.addEventListener("click", () => goToView("memories"));
+  panel.replaceChildren(mark, title, copy, ids, next);
 }
 
 async function submitMemory(event) {
@@ -273,17 +592,24 @@ async function submitMemory(event) {
     setLoading(submit, true);
     const key = String(data.get("key") || "").trim();
     const value = String(data.get("value") || "").trim();
-    const payload = {
+    const operationPayload = {
       ...getScope(),
       source: String(data.get("source") || "").trim(),
-      idempotency_key: newId("web:preference"),
       key,
       value,
       context: readContext("capture-context"),
       evidence_text: String(data.get("evidence_text") || "").trim(),
       confidence: Number(data.get("confidence")),
     };
-    const result = await api("/v1/preferences", { method: "POST", body: JSON.stringify(payload) });
+    const payload = {
+      ...operationPayload,
+      idempotency_key: idempotencyKeyFor("preference", "web:preference", operationPayload),
+    };
+    const result = await scopedApi(
+      "/v1/preferences",
+      { method: "POST", body: JSON.stringify(payload) },
+      "preference-write",
+    );
     state.counts.writes += result.idempotent_replay ? 0 : 1;
     state.journey.write = true;
     updateStats();
@@ -293,9 +619,10 @@ async function submitMemory(event) {
     toast("记忆已保存", `已创建 Revision #${result.sequence} · ${shortId(result.revision_id)}`);
     loadMemories(true);
   } catch (error) {
+    if (isRequestCancelled(error)) return;
     toast("写入失败", describeError(error), "error");
   } finally {
-    setLoading(submit, false);
+    if (!state.requestChannels.has("preference-write")) setLoading(submit, false);
   }
 }
 
@@ -369,18 +696,25 @@ function renderMemoryLibrary(items) {
 
 async function loadMemories(silent = false) {
   const refresh = $("#refresh-memories");
-  const originalLabel = refresh.textContent;
+  const library = $("#memory-library");
   refresh.disabled = true;
+  refresh.setAttribute("aria-busy", "true");
+  library.setAttribute("aria-busy", "true");
   refresh.textContent = "读取中…";
   const params = new URLSearchParams({ tenant_id: state.scope.tenantId, subject_id: state.scope.subjectId });
   try {
-    const items = await api(`/v1/preferences?${params}`, { method: "GET", headers: {} });
+    const items = await scopedApi(
+      `/v1/preferences?${params}`,
+      { method: "GET", headers: {} },
+      "memories",
+    );
     state.journey.write = items.length > 0;
+    if (items.length > 0 && $("#view-memories").classList.contains("is-active")) state.journey.view = true;
     updateJourney();
     renderMemoryLibrary(items);
   } catch (error) {
+    if (isRequestCancelled(error)) return;
     if (!silent) toast("读取记忆失败", describeError(error), "error");
-    const library = $("#memory-library");
     const errorState = createElement("div", "empty-results");
     errorState.append(
       createElement("h3", "", "暂时无法读取记忆"),
@@ -388,8 +722,12 @@ async function loadMemories(silent = false) {
     );
     library.replaceChildren(errorState);
   } finally {
-    refresh.disabled = false;
-    refresh.textContent = originalLabel;
+    if (!state.requestChannels.has("memories")) {
+      refresh.disabled = false;
+      refresh.setAttribute("aria-busy", "false");
+      library.setAttribute("aria-busy", "false");
+      refresh.textContent = "刷新列表";
+    }
   }
 }
 
@@ -463,6 +801,9 @@ function renderRecallItem(item, traceId, index) {
 
 function renderRecall(data) {
   state.lastTrace = data;
+  const guidance = $("#recall-guidance");
+  guidance.className = "next-step-banner is-hidden";
+  guidance.textContent = "";
   const meta = $("#recall-meta");
   meta.classList.remove("is-hidden");
   const summary = createElement("div");
@@ -482,23 +823,31 @@ function renderRecall(data) {
     return;
   }
   data.items.forEach((item, index) => results.append(renderRecallItem(item, data.trace_id, index)));
+  guidance.className = "next-step-banner";
+  guidance.textContent = "下一步：根据真实使用结果选择“有帮助”或“无帮助”。只有这类引用当前 Trace 的反馈才会更新上下文效用。";
 }
 
 async function submitRecall(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const submit = $("button[type='submit']", form);
+  const results = $("#recall-results");
   const data = new FormData(form);
   const query = String(data.get("query") || "").trim();
   try {
     setLoading(submit, true);
+    results.setAttribute("aria-busy", "true");
     const payload = {
       ...getScope(),
       query,
       context: readContext("recall-context"),
       limit: Number(data.get("limit")),
     };
-    const result = await api("/v1/recall", { method: "POST", body: JSON.stringify(payload) });
+    const result = await scopedApi(
+      "/v1/recall",
+      { method: "POST", body: JSON.stringify(payload) },
+      "recall",
+    );
     state.counts.recalls += 1;
     state.counts.results = result.items.length;
     state.journey.recall = true;
@@ -507,28 +856,40 @@ async function submitRecall(event) {
     renderRecall(result);
     addActivity("recall", "执行上下文召回", `“${query}” · ${result.items.length} 条结果`);
   } catch (error) {
+    if (isRequestCancelled(error)) return;
     toast("召回失败", describeError(error), "error");
   } finally {
-    setLoading(submit, false);
+    if (!state.requestChannels.has("recall")) {
+      setLoading(submit, false);
+      results.setAttribute("aria-busy", "false");
+    }
   }
 }
 
 async function recordOutcome(item, traceId, kind, card) {
   const buttons = $$("[data-outcome-button]", card);
-  buttons.forEach((button) => { button.disabled = true; });
+  buttons.forEach((button) => {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  });
   try {
-    const result = await api("/v1/outcomes", {
+    const operationPayload = {
+      ...getScope(),
+      trace_id: traceId,
+      revision_id: item.revision_id,
+      kind,
+      weight: 1,
+      note: "submitted from memory console",
+    };
+    const operation = `outcome:${traceId}:${item.revision_id}`;
+    const payload = {
+      ...operationPayload,
+      idempotency_key: idempotencyKeyFor(operation, "web:outcome", operationPayload),
+    };
+    const result = await scopedApi("/v1/outcomes", {
       method: "POST",
-      body: JSON.stringify({
-        ...getScope(),
-        trace_id: traceId,
-        revision_id: item.revision_id,
-        kind,
-        idempotency_key: newId("web:outcome"),
-        weight: 1,
-        note: "submitted from memory console",
-      }),
-    });
+      body: JSON.stringify(payload),
+    }, operation);
     state.counts.outcomes += result.idempotent_replay ? 0 : 1;
     state.journey.outcome = true;
     updateStats();
@@ -537,16 +898,48 @@ async function recordOutcome(item, traceId, kind, card) {
     $(".utility-update", scorePanel)?.remove();
     scorePanel.append(createElement("div", "utility-update", `上下文效用已更新为 ${result.utility.mean.toFixed(3)}（样本权重 ${result.utility.sample_weight.toFixed(1)}）`));
     const feedback = kind === "helpful" ? "有帮助" : "无帮助";
+    const selected = kind === "helpful" ? $(".positive", card) : $(".negative", card);
+    selected.classList.add("is-selected");
+    selected.textContent = `${feedback} ✓`;
+    buttons.forEach((button) => button.setAttribute("aria-busy", "false"));
+    const guidance = $("#recall-guidance");
+    guidance.className = "next-step-banner is-complete";
+    guidance.textContent = "反馈闭环已完成：这次 Outcome 已与召回 Trace 建立归因，并更新当前上下文中的效用。";
     addActivity("outcome", "记录可归因结果", `${item.key} · ${feedback}`);
     toast("反馈已记录", `效用均值更新为 ${result.utility.mean.toFixed(3)}`);
   } catch (error) {
-    buttons.forEach((button) => { button.disabled = false; });
+    if (isRequestCancelled(error)) return;
+    buttons.forEach((button) => {
+      button.disabled = false;
+      button.setAttribute("aria-busy", "false");
+    });
     toast("反馈失败", describeError(error), "error");
   }
 }
 
 function showDialog(dialog) {
   if (!dialog.open) dialog.showModal();
+}
+
+function trapDialogFocus(dialog, event) {
+  if (event.key !== "Tab" || !dialog.open) return;
+  const focusable = $$(DIALOG_FOCUSABLE_SELECTOR, dialog).filter(
+    (element) => element.getClientRects().length > 0,
+  );
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  if (event.shiftKey && (active === first || !dialog.contains(active))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 async function openHistory(recordId) {
@@ -556,7 +949,11 @@ async function openHistory(recordId) {
   showDialog(modal);
   const params = new URLSearchParams({ tenant_id: state.scope.tenantId, subject_id: state.scope.subjectId });
   try {
-    const revisions = await api(`/v1/preferences/${encodeURIComponent(recordId)}/revisions?${params}`);
+    const revisions = await scopedApi(
+      `/v1/preferences/${encodeURIComponent(recordId)}/revisions?${params}`,
+      { method: "GET", headers: {} },
+      "history",
+    );
     const timeline = createElement("div", "history-timeline");
     for (const revision of revisions) {
       const item = createElement("article", "history-item");
@@ -575,14 +972,17 @@ async function openHistory(recordId) {
     }
     content.replaceChildren(timeline);
   } catch (error) {
+    if (isRequestCancelled(error)) return;
     content.replaceChildren(createElement("div", "history-loading", `读取失败：${describeError(error)}`));
   }
 }
 
 function openCorrection(item) {
   const form = $("#correction-form");
+  state.idempotencyOperations.delete(`correction:${item.record_id}`);
   form.reset();
   form.elements.record_id.value = item.record_id;
+  form.elements.expected_revision_id.value = item.revision_id;
   form.elements.value.value = item.value;
   showDialog($("#correction-modal"));
   window.setTimeout(() => form.elements.value.select(), 0);
@@ -596,18 +996,23 @@ async function submitCorrection(event) {
   const recordId = String(data.get("record_id") || "");
   try {
     setLoading(submit, true);
-    const payload = {
+    const operationPayload = {
       ...getScope(),
       source: String(data.get("source") || "").trim(),
-      idempotency_key: newId("web:correction"),
       value: String(data.get("value") || "").trim(),
       evidence_text: String(data.get("evidence_text") || "").trim(),
       reason: String(data.get("reason") || "").trim(),
+      expected_revision_id: String(data.get("expected_revision_id") || ""),
     };
-    const result = await api(`/v1/preferences/${encodeURIComponent(recordId)}/corrections`, {
+    const operation = `correction:${recordId}`;
+    const payload = {
+      ...operationPayload,
+      idempotency_key: idempotencyKeyFor(operation, "web:correction", operationPayload),
+    };
+    const result = await scopedApi(`/v1/preferences/${encodeURIComponent(recordId)}/corrections`, {
       method: "POST",
       body: JSON.stringify(payload),
-    });
+    }, operation);
     state.counts.writes += result.idempotent_replay ? 0 : 1;
     state.journey.write = true;
     updateStats();
@@ -617,10 +1022,73 @@ async function submitCorrection(event) {
     toast("修订已追加", `当前版本为 #${result.sequence}，重新召回即可查看。`);
     loadMemories(true);
   } catch (error) {
+    if (isRequestCancelled(error)) return;
     toast("修正失败", describeError(error), "error");
   } finally {
-    setLoading(submit, false);
+    if (!state.requestChannels.has(`correction:${recordId}`)) setLoading(submit, false);
   }
+}
+
+function renderInitialRecallState() {
+  const meta = $("#recall-meta");
+  meta.className = "recall-meta is-hidden";
+  meta.replaceChildren();
+  const guidance = $("#recall-guidance");
+  guidance.className = "next-step-banner is-hidden";
+  guidance.textContent = "";
+  const results = $("#recall-results");
+  results.setAttribute("aria-busy", "false");
+  const empty = createElement("div", "empty-results");
+  const rings = createElement("div", "empty-rings");
+  rings.innerHTML = '<svg viewBox="0 0 48 48" aria-hidden="true"><circle cx="21" cy="21" r="10" /><path d="m29 29 8 8" /></svg>';
+  empty.append(
+    rings,
+    createElement("h3", "", "输入一个问题，开始检索记忆"),
+    createElement("p", "", "系统会综合词法相关性、上下文、信念、效用与时效性进行排序。"),
+  );
+  results.replaceChildren(empty);
+}
+
+function resetScopedViewState() {
+  state.counts = { writes: 0, recalls: 0, outcomes: 0, results: 0 };
+  state.lastTrace = null;
+  state.activities = [];
+  state.journey = { write: false, view: false, recall: false, outcome: false };
+  state.idempotencyOperations.clear();
+
+  for (const dialog of [$("#history-modal"), $("#correction-modal")]) {
+    if (dialog.open) dialog.close();
+  }
+  $("#history-content").replaceChildren();
+  $("#correction-form").reset();
+
+  const memoryForm = $("#memory-form");
+  memoryForm.reset();
+  resetCaptureContext();
+  $("#confidence-value").textContent = memoryForm.elements.confidence.value;
+  const captureResult = $("#capture-result");
+  captureResult.classList.add("is-hidden");
+  captureResult.replaceChildren();
+
+  const recallForm = $("#recall-form");
+  recallForm.reset();
+  $("#recall-context").replaceChildren();
+  addContextRow("recall-context", "time_of_day", "evening");
+  renderInitialRecallState();
+  renderMemoryLibrary([]);
+  $("#memory-library").setAttribute("aria-busy", "false");
+  renderActivities();
+  $("#toast-region").replaceChildren();
+
+  setLoading($("button[type='submit']", memoryForm), false);
+  setLoading($("button[type='submit']", recallForm), false);
+  setLoading($("button[type='submit']", $("#correction-form")), false);
+  const refresh = $("#refresh-memories");
+  refresh.disabled = false;
+  refresh.setAttribute("aria-busy", "false");
+  refresh.textContent = "刷新列表";
+  updateStats();
+  updateJourney();
 }
 
 function applyScope() {
@@ -630,30 +1098,69 @@ function applyScope() {
     toast("无法应用作用域", "租户和用户均不能为空。", "error");
     return;
   }
+  if (tenantId === state.scope.tenantId && subjectId === state.scope.subjectId) {
+    loadMemories();
+    toast("作用域未变化", `仍在使用 ${tenantId} / ${subjectId}，已刷新当前记忆。`);
+    return;
+  }
+  cancelScopedRequests();
   state.scope = { tenantId, subjectId };
-  state.journey = { write: false, recall: false, outcome: false };
   localStorage.setItem("emf.tenantId", tenantId);
   localStorage.setItem("emf.subjectId", subjectId);
-  updateStats();
-  updateJourney();
+  resetScopedViewState();
   loadMemories(true);
-  toast("作用域已切换", `${tenantId} / ${subjectId}`);
+  toast("作用域已切换", `${tenantId} / ${subjectId}；旧作用域的页面状态与请求已清除。`);
 }
 
 async function checkHealth() {
   const dot = $("#status-dot");
   const label = $("#status-label");
   const detail = $("#status-detail");
+  const retry = $("#retry-health");
+  state.healthController?.abort();
+  const controller = new AbortController();
+  state.healthController = controller;
+  dot.className = "status-dot";
+  label.textContent = "正在连接";
+  detail.textContent = "检查 API 状态…";
+  retry.disabled = true;
+  retry.setAttribute("aria-busy", "true");
   try {
-    const health = await api("/health", { method: "GET", headers: {} });
+    const health = await api("/health", {
+      method: "GET",
+      headers: {},
+      signal: controller.signal,
+      timeoutMs: HEALTH_TIMEOUT_MS,
+    });
+    if (state.healthController !== controller) return;
     dot.className = "status-dot is-online";
     label.textContent = "API 在线";
-    detail.textContent = `v${health.version} · In-memory store`;
+    updateStorageDisplay(health.storage);
+    detail.textContent = `v${health.version} · ${health.storage === "postgres" ? "PostgreSQL" : "进程内存"}`;
   } catch (error) {
+    if (isRequestCancelled(error)) return;
     dot.className = "status-dot is-offline";
     label.textContent = "API 离线";
     detail.textContent = describeError(error);
+  } finally {
+    if (state.healthController === controller) {
+      state.healthController = null;
+      retry.disabled = false;
+      retry.setAttribute("aria-busy", "false");
+    }
   }
+}
+
+function updateStorageDisplay(storage) {
+  state.storage = storage;
+  const persistent = storage === "postgres";
+  $("#storage-title").textContent = persistent ? "PostgreSQL 权威存储" : "后端进程内存";
+  $("#storage-description").textContent = persistent
+    ? "记忆、修订、Trace 与 Outcome 持久化到 PostgreSQL；容器或进程重启后仍会保留。"
+    : "当前不会写入浏览器、文件或数据库；重启后端后全部权威记忆都会清空。";
+  $("#session-storage-note").textContent = persistent
+    ? "当前使用 PostgreSQL，后端重启后数据保留"
+    : "当前使用进程内存，后端重启后数据清空";
 }
 
 function bindEvents() {
@@ -663,8 +1170,29 @@ function bindEvents() {
   $("#mobile-menu").addEventListener("click", openMobileMenu);
   $("#mobile-scrim").addEventListener("click", closeMobileMenu);
   $("#save-scope").addEventListener("click", applyScope);
-  $("#start-example").addEventListener("click", loadExample);
+  for (const input of [$("#tenant-id"), $("#subject-id")]) {
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") applyScope();
+    });
+  }
+  $("#retry-health").addEventListener("click", checkHealth);
+  $("#start-example").addEventListener("click", continueJourney);
   $("#load-example").addEventListener("click", loadExample);
+  $("#continue-to-recall").addEventListener("click", () => prepareRecallExample());
+  $$("[data-journey-action]").forEach((button) => button.addEventListener("click", () => runJourneyAction(button.dataset.journeyAction)));
+  $("#open-onboarding").addEventListener("click", () => showOnboarding(true));
+  $("#onboarding-close").addEventListener("click", dismissOnboarding);
+  $("#onboarding-skip").addEventListener("click", dismissOnboarding);
+  $("#onboarding-prev").addEventListener("click", () => {
+    if (onboardingStepIndex > 0) onboardingStepIndex -= 1;
+    renderOnboardingStep();
+  });
+  $("#onboarding-next").addEventListener("click", advanceOnboarding);
+  $("#onboarding-dialog").addEventListener("close", () => {
+    if (localStorage.getItem(ONBOARDING_STORAGE_KEY) !== "complete") {
+      sessionStorage.setItem(ONBOARDING_DISMISSED_KEY, "true");
+    }
+  });
   $("#refresh-memories").addEventListener("click", () => loadMemories());
   $("#memory-form").addEventListener("submit", submitMemory);
   $("#memory-form").addEventListener("reset", () => {
@@ -683,9 +1211,12 @@ function bindEvents() {
   }));
   $("#correction-form").addEventListener("submit", submitCorrection);
   $$(".modal-close").forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
-  $$("dialog").forEach((dialog) => dialog.addEventListener("click", (event) => {
-    if (event.target === dialog) dialog.close();
-  }));
+  $$("dialog").forEach((dialog) => {
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+    dialog.addEventListener("keydown", (event) => trapDialogFocus(dialog, event));
+  });
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closeMobileMenu();
   });
@@ -704,6 +1235,8 @@ function initialize() {
   bindEvents();
   checkHealth();
   loadMemories(true);
+  const tourMode = new URLSearchParams(window.location.search).get("tour");
+  if (tourMode !== "0") window.setTimeout(() => showOnboarding(tourMode === "1"), 420);
 }
 
 initialize();

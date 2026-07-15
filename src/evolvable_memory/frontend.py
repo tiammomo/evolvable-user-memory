@@ -13,8 +13,28 @@ _STATIC_DIRECTORY = Path(__file__).parent / "api" / "static"
 class FrontendRequestHandler(SimpleHTTPRequestHandler):
     def end_headers(self) -> None:
         self.send_header("Cache-Control", "no-store")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; base-uri 'none'; "
+            "connect-src 'self' http://127.0.0.1:* http://localhost:*; "
+            "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+            "img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self'",
+        )
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         super().end_headers()
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        """Log response metadata without a caller-controlled path or query string."""
+        self.log_message(
+            "frontend_request method=%s status=%s size=%s",
+            self.command,
+            code,
+            size,
+        )
 
 
 def run() -> None:
