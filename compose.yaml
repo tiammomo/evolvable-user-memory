@@ -1,0 +1,105 @@
+name: evolvable-user-memory
+
+# Local-development credentials only. Do not reuse them outside this isolated
+# Compose network. PostgreSQL is not published to the host.
+
+x-database-url: &database-url postgresql://emf:emf-local-only@postgres:5432/evolvable_memory
+
+x-app: &app
+  build:
+    context: .
+  image: evolvable-user-memory:local
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: evolvable_memory
+      POSTGRES_USER: emf
+      POSTGRES_PASSWORD: emf-local-only
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["evolvable-memory-migrate"]
+    environment:
+      EMF_STORE: postgres
+      EMF_DATABASE_URL: *database-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    <<: *app
+    environment:
+      EMF_ENVIRONMENT: development
+      EMF_HOST: 0.0.0.0
+      EMF_PORT: "38089"
+      EMF_LOG_LEVEL: INFO
+      EMF_STORE: postgres
+      EMF_DATABASE_URL: *database-url
+      EMF_DATABASE_POOL_MIN_SIZE: "1"
+      EMF_DATABASE_POOL_MAX_SIZE: "10"
+    ports:
+      - "127.0.0.1:38089:38089"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:38089/readyz', timeout=2).read()
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  frontend:
+    <<: *app
+    command: ["evolvable-memory-frontend"]
+    environment:
+      EMF_FRONTEND_HOST: 0.0.0.0
+      EMF_FRONTEND_PORT: "33009"
+    ports:
+      - "127.0.0.1:33009:33009"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:33009/', timeout=2).read()
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

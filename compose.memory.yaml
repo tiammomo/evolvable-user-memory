@@ -1,0 +1,66 @@
+name: evolvable-user-memory-memory
+
+# Explicit ephemeral alternative to the default PostgreSQL Compose stack.
+# Use: docker compose -f compose.memory.yaml up --build -d
+
+x-app: &app
+  build:
+    context: .
+  image: evolvable-user-memory:local
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+
+services:
+  backend:
+    <<: *app
+    environment:
+      EMF_ENVIRONMENT: development
+      EMF_HOST: 0.0.0.0
+      EMF_PORT: "38089"
+      EMF_LOG_LEVEL: INFO
+      EMF_STORE: memory
+    ports:
+      - "127.0.0.1:38089:38089"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:38089/readyz', timeout=2).read()
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  frontend:
+    <<: *app
+    command: ["evolvable-memory-frontend"]
+    environment:
+      EMF_FRONTEND_HOST: 0.0.0.0
+      EMF_FRONTEND_PORT: "33009"
+    ports:
+      - "127.0.0.1:33009:33009"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:33009/', timeout=2).read()
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
