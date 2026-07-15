@@ -1,0 +1,233 @@
+{
+  "schema_version": 1,
+  "name": "builtin-smoke-v1",
+  "version": "1.0.0",
+  "recall_k": 5,
+  "cases": [
+    {
+      "type": "write",
+      "id": "extraction-write",
+      "scope": {"tenant_id": "eval-extraction", "subject_id": "alice"},
+      "source": "synthetic-user",
+      "idempotency_key": "extraction/1",
+      "key": "diet.preference",
+      "value": "vegetarian",
+      "context": {},
+      "evidence_text": "I follow a vegetarian diet",
+      "confidence": 0.9,
+      "occurred_at": "2026-01-01T00:00:00Z",
+      "expected": {"sequence": 1, "idempotent_replay": false}
+    },
+    {
+      "type": "recall",
+      "id": "extraction-recall",
+      "scope": {"tenant_id": "eval-extraction", "subject_id": "alice"},
+      "query": "vegetarian diet preference",
+      "context": {},
+      "limit": 5,
+      "expected": {
+        "relevant": [{"case_id": "extraction-write"}],
+        "forbidden": [],
+        "abstain": false
+      }
+    },
+    {
+      "type": "write",
+      "id": "context-morning-write",
+      "scope": {"tenant_id": "eval-context", "subject_id": "alice"},
+      "source": "synthetic-user",
+      "idempotency_key": "context/1",
+      "key": "drink.preference",
+      "value": "espresso",
+      "context": {"time_of_day": "morning"},
+      "evidence_text": "I drink espresso in the morning",
+      "confidence": 0.9,
+      "occurred_at": "2026-01-02T00:00:00Z",
+      "expected": {"sequence": 1, "idempotent_replay": false}
+    },
+    {
+      "type": "write",
+      "id": "context-evening-write",
+      "scope": {"tenant_id": "eval-context", "subject_id": "alice"},
+      "source": "synthetic-user",
+      "idempotency_key": "context/2",
+      "key": "drink.preference",
+      "value": "herbal tea",
+      "context": {"time_of_day": "evening"},
+      "evidence_text": "I drink herbal tea in the evening",
+      "confidence": 0.9,
+      "occurred_at": "2026-01-02T01:00:00Z",
+      "expected": {"sequence": 1, "idempotent_replay": false}
+    },
+    {
+      "type": "recall",
+      "id": "context-ranking-recall",
+      "scope": {"tenant_id": "eval-context", "subject_id": "alice"},
+      "query": "morning drink preference espresso tea",
+      "context": {"time_of_day": "morning"},
+      "limit": 5,
+      "expected": {
+        "relevant": [{"case_id": "context-morning-write"}],
+        "forbidden": [],
+        "abstain": false
+      }
+    },
+    {
+      "type": "recall",
+      "id": "context-vocabulary-bridge-recall",
+      "scope": {"tenant_id": "eval-context", "subject_id": "alice"},
+      "query": "早上应该准备什么饮料",
+      "context": {"time_of_day": "morning"},
+      "limit": 5,
+      "expected": {
+        "relevant": [{"case_id": "context-morning-write"}],
+        "forbidden": [],
+        "abstain": false
+      }
+    },
+    {
+      "type": "recall",
+      "id": "unrelated-query-abstention",
+      "scope": {"tenant_id": "eval-context", "subject_id": "alice"},
+      "query": "preferred code editor theme",
+      "context": {},
+      "limit": 5,
+      "expected": {"relevant": [], "forbidden": [], "abstain": true}
+    },
+    {
+      "type": "write",
+      "id": "update-write",
+      "scope": {"tenant_id": "eval-update", "subject_id": "alice"},
+      "source": "synthetic-user",
+      "idempotency_key": "update/1",
+      "key": "travel.destination",
+      "value": "Berlin",
+      "context": {"trip": "spring"},
+      "evidence_text": "My spring destination is Berlin",
+      "confidence": 0.9,
+      "occurred_at": "2026-02-01T00:00:00Z",
+      "expected": {"sequence": 1, "idempotent_replay": false}
+    },
+    {
+      "type": "write",
+      "id": "update-write-replay",
+      "scope": {"tenant_id": "eval-update", "subject_id": "alice"},
+      "source": "synthetic-user",
+      "idempotency_key": "update/1",
+      "key": "travel.destination",
+      "value": "Berlin",
+      "context": {"trip": "spring"},
+      "evidence_text": "My spring destination is Berlin",
+      "confidence": 0.9,
+      "occurred_at": "2026-02-01T00:00:00Z",
+      "expected": {"sequence": 1, "idempotent_replay": true}
+    },
+    {
+      "type": "correction",
+      "id": "update-correction",
+      "target": {"case_id": "update-write"},
+      "scope": {"tenant_id": "eval-update", "subject_id": "alice"},
+      "source": "synthetic-user-correction",
+      "idempotency_key": "update/2",
+      "value": "Kyoto",
+      "evidence_text": "I changed my spring destination to Kyoto",
+      "reason": "explicit synthetic correction",
+      "occurred_at": "2026-02-02T00:00:00Z",
+      "expected": {"sequence": 2, "idempotent_replay": false}
+    },
+    {
+      "type": "correction",
+      "id": "update-correction-replay",
+      "target": {"case_id": "update-write"},
+      "scope": {"tenant_id": "eval-update", "subject_id": "alice"},
+      "source": "synthetic-user-correction",
+      "idempotency_key": "update/2",
+      "value": "Kyoto",
+      "evidence_text": "I changed my spring destination to Kyoto",
+      "reason": "explicit synthetic correction",
+      "occurred_at": "2026-02-02T00:00:00Z",
+      "expected": {"sequence": 2, "idempotent_replay": true}
+    },
+    {
+      "type": "recall",
+      "id": "updated-head-recall",
+      "scope": {"tenant_id": "eval-update", "subject_id": "alice"},
+      "query": "spring travel destination Kyoto Berlin",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "expected": {
+        "relevant": [{"case_id": "update-correction"}],
+        "forbidden": [{"case_id": "update-write"}],
+        "abstain": false
+      }
+    },
+    {
+      "type": "recall",
+      "id": "pre-update-valid-time-recall",
+      "scope": {"tenant_id": "eval-update", "subject_id": "alice"},
+      "query": "spring travel destination Kyoto Berlin",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-02-01T12:00:00Z",
+      "expected": {
+        "relevant": [{"case_id": "update-write"}],
+        "forbidden": [{"case_id": "update-correction"}],
+        "abstain": false
+      }
+    },
+    {
+      "type": "write",
+      "id": "tenant-secret-write",
+      "scope": {"tenant_id": "eval-tenant-a", "subject_id": "alice"},
+      "source": "synthetic-user",
+      "idempotency_key": "tenant-isolation/1",
+      "key": "private.preference",
+      "value": "alpha only",
+      "context": {},
+      "evidence_text": "This preference belongs only to tenant A",
+      "confidence": 0.9,
+      "occurred_at": "2026-03-01T00:00:00Z",
+      "expected": {"sequence": 1, "idempotent_replay": false}
+    },
+    {
+      "type": "recall",
+      "id": "tenant-isolation-recall",
+      "scope": {"tenant_id": "eval-tenant-b", "subject_id": "alice"},
+      "query": "private preference alpha only",
+      "context": {},
+      "limit": 5,
+      "expected": {
+        "relevant": [],
+        "forbidden": [{"case_id": "tenant-secret-write"}],
+        "abstain": true
+      }
+    },
+    {
+      "type": "write",
+      "id": "subject-secret-write",
+      "scope": {"tenant_id": "eval-subject", "subject_id": "alice"},
+      "source": "synthetic-user",
+      "idempotency_key": "subject-isolation/1",
+      "key": "private.preference",
+      "value": "alice only",
+      "context": {},
+      "evidence_text": "This preference belongs only to Alice",
+      "confidence": 0.9,
+      "occurred_at": "2026-03-02T00:00:00Z",
+      "expected": {"sequence": 1, "idempotent_replay": false}
+    },
+    {
+      "type": "recall",
+      "id": "subject-isolation-recall",
+      "scope": {"tenant_id": "eval-subject", "subject_id": "bob"},
+      "query": "private preference alice only",
+      "context": {},
+      "limit": 5,
+      "expected": {
+        "relevant": [],
+        "forbidden": [{"case_id": "subject-secret-write"}],
+        "abstain": true
+      }
+    }
+  ]
+}

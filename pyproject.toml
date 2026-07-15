@@ -42,6 +42,7 @@ dev = [
 
 [project.scripts]
 evolvable-memory = "evolvable_memory.main:run"
+evolvable-memory-eval = "evolvable_memory.evaluation.cli:run"
 evolvable-memory-frontend = "evolvable_memory.frontend:run"
 evolvable-memory-migrate = "evolvable_memory.migrate:run"
 
