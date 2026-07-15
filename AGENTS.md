@@ -25,6 +25,7 @@ The five conceptual planes are evidence, belief, experience, projection, and evo
 - `uv run ruff check .`: lint all code.
 - `uv run ruff format --check .`: verify formatting.
 - `uv run mypy`: run strict type checking.
+- `uv run evolvable-memory-eval run --dataset builtin:smoke-v1`: run deterministic retrieval and invariant gates.
 - `uv run evolvable-memory`: start the development API.
 
 ## Style and Tests
@@ -36,4 +37,3 @@ Place tests under `tests/` with names `test_*.py`. Every behavior change must co
 ## Security
 
 Never accept tenant or subject scope only from untrusted payloads in a production adapter; the initial API exposes them solely as a development contract. Do not log raw evidence by default. Do not make privacy, access-control, retention, suppression, or deletion policies self-modifying.
-

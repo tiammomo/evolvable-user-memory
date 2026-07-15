@@ -8,7 +8,7 @@
 >
 > 已提供完整可运行的偏好记忆闭环、Web 工作台、OpenAPI、进程内存与 PostgreSQL 适配器。原生快速开始默认使用内存，后端重启后数据会清空；默认 Compose 使用 PostgreSQL。API 已具备本地开发身份与 JWT 授权基线，但完整权限治理、删除证明和生产运维仍未完成，请勿直接暴露到公网或写入真实敏感数据。
 
-[快速开始](#快速开始) · [容器运行](docs/deployment.md) · [首次体验](#完成第一条记忆闭环) · [API](#api-一览) · [架构](docs/architecture.md) · [路线图](ROADMAP.md) · [完整文档](docs/index.md)
+[快速开始](#快速开始) · [容器运行](docs/deployment.md) · [首次体验](#完成第一条记忆闭环) · [评测门禁](#运行内置评测门禁) · [API](#api-一览) · [架构](docs/architecture.md) · [路线图](ROADMAP.md) · [完整文档](docs/index.md)
 
 ## 为什么需要这样的记忆系统
 
@@ -39,10 +39,12 @@
 - 支持本地开发身份与 RFC 9068 风格 JWT access token；生产环境禁止使用开发身份启动。
 - 为相同记忆追加不可变修订，不原地覆盖历史。
 - 列出指定租户与用户当前有效的偏好记忆。
-- 按词法相关性、上下文、信念、效用和时效进行可解释召回。
-- 为每次召回保存策略版本、候选、评分拆解和 `trace_id`。
+- 通过可选 `valid_at` / `known_at` 在业务有效时间与系统知识时间上重建 Scope 内历史状态；省略时两轴使用同一次服务端时钟读数。
+- 按词法相关性、上下文、信念、截至 `known_at` 已记录的 Outcome 效用，以及相对 `valid_at` 的时效进行可解释召回。
+- 为每次召回冻结双时间边界、策略版本、命中修订的有效/记录时间、评分拆解和 `trace_id`。
 - 只接受能归因到对应 Trace 的 Outcome，并更新上下文效用。
 - 生成有界策略提案，并验证演化实验的合法状态转换。
+- 提供隔离运行的 synthetic smoke 评测，对 Recall@k、MRR、更新、拒答、forbidden/Scope 隔离和执行失败应用硬门禁。
 - 提供 PostgreSQL 权威存储、版本化迁移、数据库约束和显式内存模式。
 - PostgreSQL 会为 Observation 摄入、Revision 变更和 Outcome 记录在同一事务追加不含原始证据正文的 outbox 事件。
 - 前端根据后端状态动态展示当前存储，并在 Scope 切换时取消旧请求、隔离旧响应。
@@ -67,6 +69,8 @@ OutcomeEvent → UtilityEstimate   经验：真实结果是否有帮助
 ```
 
 修正不会覆盖旧版本，而是追加新的 `MemoryRevision` 并保留完整版本链。
+
+双时间召回回答的是“在业务时点 `valid_at`，并且只使用系统截至 `known_at` 已经记录的信息，哪些记忆可见”。它使用请求执行时的不可变 `StrategySnapshot` 评分，因此属于 **historical state projection（历史状态投影）**，不是对过去策略、投影实现和运行环境的完整历史重放。
 
 ## 快速开始
 
@@ -172,7 +176,7 @@ uv run python examples/first_memory.py
 | `GET` | `/v1/preferences` | 列出当前有效偏好 | 否 |
 | `POST` | `/v1/preferences/{record_id}/corrections` | 追加偏好修订 | 是 |
 | `GET` | `/v1/preferences/{record_id}/revisions` | 读取不可变历史 | 否 |
-| `POST` | `/v1/recall` | 执行召回并产生 Trace | 仅追加 Trace |
+| `POST` | `/v1/recall` | 执行当前或双时间历史状态召回并产生 Trace | 仅追加 Trace |
 | `POST` | `/v1/outcomes` | 提交可归因结果并更新效用 | 是 |
 
 完整请求、响应、幂等规则、Outcome 类型和错误码见 [API 使用指南](docs/api-guide.md)。
@@ -188,8 +192,9 @@ api / adapters  →  application  →  domain
 ```text
 src/evolvable_memory/
 ├── domain/          # 纯 Python 领域值、状态转换和硬约束
-├── application/     # 用例编排、权限执行点，以及存储/身份/授权端口
+├── application/     # 用例编排、权限/评测合同，以及存储/身份/授权端口
 ├── adapters/        # 存储、角色策略与伪名化授权审计适配器
+├── evaluation/      # 评测 CLI、严格数据加载器和内置 synthetic 数据集
 ├── api/             # FastAPI、JWT 身份边界、Pydantic Schema 和 CORS
 │   └── static/      # 原生 HTML/CSS/JavaScript 前端
 ├── config.py        # 后端与前端环境配置
@@ -218,7 +223,21 @@ uv build
 
 项目启用严格类型检查和 85% 测试覆盖率门禁。每个行为变化都应覆盖业务规则、Scope 隔离、幂等行为和错误路径；召回相关测试还必须证明读取不会修改信念或效用。
 
-GitHub Actions 会在 Python 3.12–3.14 上执行测试，在 3.12 上额外运行 PostgreSQL 适配器分支覆盖与 Chromium 前端 E2E，并验证发行包、Compose 配置和容器构建。
+GitHub Actions 会在 Python 3.12–3.14 上执行测试，在 3.12 上额外运行 PostgreSQL 适配器分支覆盖、Chromium 前端 E2E 和内置评测门禁，并验证发行包、wheel 内评测资源、Compose 配置和容器构建。
+
+## 运行内置评测门禁
+
+无需启动前后端或数据库：
+
+```bash
+uv run evolvable-memory-eval list
+uv run evolvable-memory-eval validate --dataset builtin:smoke-v1
+uv run evolvable-memory-eval run --dataset builtin:smoke-v1
+```
+
+`run` 使用全新进程内状态执行项目自有的 synthetic smoke，并在 Recall@k/MRR、更新、拒答、forbidden/Scope 隔离或执行完整性不满足硬门禁时返回非零。它不会连接 PostgreSQL，报告也不输出 evidence 或 Memory value。
+
+这是一项 retrieval/invariant 回归门禁，不是 LongMemEval、LoCoMo 或 SOTA 证明，也不代表端到端答案质量或生产就绪。指标解释、失败排查和安全边界见[记忆评测指南](docs/evaluation.md)。
 
 ## 配置
 
@@ -254,6 +273,9 @@ GitHub Actions 会在 Python 3.12–3.14 上执行测试，在 3.12 上额外运
 
 - 原生快速开始的内存模式不持久化，后端重启即清空；PostgreSQL 是默认 Compose 的权威存储，但其故障恢复和生产运维仍处于开发预览。
 - 当前检索器是简单词法检索，不是 embedding 或图检索。
+- 双时间召回会按 `valid_at` / `known_at` 重建 Revision 和 Outcome 可见性，但仍使用执行时的 `StrategySnapshot`；它不是完整历史策略 replay。
+- `0003_bitemporal_recall` 会为旧 Outcome 近似回填系统记录时间。旧 Schema 没有保存真实摄入时点，因此迁移结果只能用于 best-effort 历史边界，不能当作精确历史审计事实。
+- 内置 `smoke-v1` 只证明当前提交通过该 synthetic 契约，不能外推为 LongMemEval、LoCoMo、SOTA 或真实业务质量。
 - 开发模式仍把 `tenant_id` 和 `subject_id` 作为本地目标 Scope；JWT 模式只接受 token 中同一条 `memory_access` grant 明确覆盖的目标。
 - 已实现类型化授权、内置角色、purpose 限制和 JWT 校验基线；尚未实现成员/角色管理 API、撤销控制、临时授权、RLS、同意/保留/抑制/删除执行与证明，以及独立生产审计存储。
 - transactional outbox 的同事务写入已经实现；异步消费者、发布重放、投影游标和投影重建尚未实现。
@@ -269,10 +291,11 @@ GitHub Actions 会在 Python 3.12–3.14 上执行测试，在 3.12 上额外运
 | [文档首页](docs/index.md) | 所有人 | 按角色选择阅读路径 |
 | [快速开始](docs/getting-started.md) | 第一次使用者 | 从零启动并完成首条闭环 |
 | [前端工作台指南](docs/frontend-guide.md) | 产品与前端使用者 | 页面、状态和 API 映射 |
-| [API 使用指南](docs/api-guide.md) | API 集成者 | 契约、幂等、归因和错误码 |
+| [API 使用指南](docs/api-guide.md) | API 集成者 | 契约、双时间召回、幂等、归因和错误码 |
 | [身份与权限设计](docs/authorization.md) | 平台、安全与集成者 | JWT、角色、动作、purpose、审计和生产门禁 |
 | [架构说明](docs/architecture.md) | 开发者与架构师 | 分层、五平面、状态和不变量 |
 | [开发指南](docs/development.md) | 贡献者 | 添加能力、测试和扩展方式 |
+| [记忆评测指南](docs/evaluation.md) | 开发者与策略评审者 | synthetic smoke、指标、硬门禁和结果边界 |
 | [部署与运行指南](docs/deployment.md) | 新人与运维者 | uv、Docker Compose、健康检查和生产缺口 |
 | [隐私生命周期设计](docs/privacy-lifecycle.md) | 产品、安全与数据治理者 | 同意、抑制、保留、删除与证明的设计验收标准 |
 | [威胁模型](docs/threat-model.md) | 安全与平台开发者 | 资产、信任边界、威胁场景和生产安全门槛 |

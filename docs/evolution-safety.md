@@ -26,6 +26,7 @@
 - 审计完整性
 - 证据归因要求
 - Outcome 幂等规则
+- 固定 relevance admission 与评测硬门禁
 - 晋升与回滚门禁
 
 这些约束位于演化动作空间之外。平均召回质量提升不能抵消任何隐私、授权或隔离回归。
@@ -46,7 +47,16 @@
 晋升不可变策略快照
 ```
 
-当前版本只实现提案边界和合法实验状态转换，尚未实现回放数据集、影子路由、灰度编排或控制面。
+当前版本已经提供 `builtin:smoke-v1` synthetic retrieval/invariant 评测，但它只是一道提交前 smoke 门禁。候选/基线对比、获授权的代表性离线数据集、影子路由、灰度编排和控制面仍未实现。
+
+在讨论候选策略前至少运行：
+
+```bash
+uv run evolvable-memory-eval validate --dataset builtin:smoke-v1
+uv run evolvable-memory-eval run --dataset builtin:smoke-v1
+```
+
+任何 forbidden/Scope 隔离命中、错误拒答或执行失败都必须阻止后续阶段；平均 Recall@k 或 MRR 提升不能抵消硬门禁失败。smoke 通过也不能跳过后续代表性离线回放、影子、灰度和回滚验证。详细指标与声明边界见[记忆评测指南](evaluation.md)。
 
 ## 必须同时观察的指标
 
@@ -79,6 +89,7 @@
 诊断不能：
 
 - 改变 Scope 过滤条件。
+- 绕过固定 relevance admission；候选必须有词法命中，或两侧都有显式且正向匹配的上下文。
 - 跳过最低分阈值的绝对边界。
 - 放宽 Outcome Trace 归因。
 - 改写历史或证据。
@@ -86,6 +97,8 @@
 ## 生产实现检查清单
 
 - 候选和基线都使用不可变 ID 与版本。
+- `builtin:smoke-v1` 的 Recall@k、MRR、更新、拒答、forbidden/隔离和执行硬门禁全部通过。
+- smoke 结果只标记为 synthetic retrieval/invariant，不宣传成 LongMemEval、LoCoMo 或 SOTA 结果。
 - 每个实验阶段转换都持久化并可审计。
 - 离线数据集包含 tenant 隔离和危险召回反例。
 - 影子结果不会影响真实用户或 Utility。

@@ -56,6 +56,9 @@ task-9:outcome:1
 - 所有领域时间必须带时区，并会规范化为 UTC。
 - 请求省略 `occurred_at` 时，API 使用当前 UTC 时间。
 - 如果上游知道事实实际发生时间，应显式传入 RFC 3339 时间。
+- `occurred_at` 表示业务事件何时发生；Revision 和 Outcome 另有由服务端产生的 `recorded_at`，表示系统何时获知并持久化它。
+- Recall 的 `valid_at` 表示要查询的业务有效时点，`known_at` 表示系统知识截止时点。两者都省略或只省略其中一个时，缺省轴使用同一次服务端时钟读数，而不是分别读取可能不同的“当前时间”。
+- `valid_at` 可以位于未来，用于检查已知的计划生效修订；显式 `known_at` 不能晚于请求执行时点，因为系统不能读取尚未获知的状态。
 
 ### 错误
 
@@ -198,22 +201,56 @@ curl -X POST http://127.0.0.1:38089/v1/recall \
   }'
 ```
 
+上面的普通请求省略双时间字段，服务端会从同一次时钟读数解析 `valid_at` 和 `known_at`。需要查询历史状态时可显式指定任一或两个轴：
+
+```bash
+curl -X POST http://127.0.0.1:38089/v1/recall \
+  -H 'content-type: application/json' \
+  -d '{
+    "tenant_id": "demo",
+    "subject_id": "alice",
+    "query": "当时晚上应该准备什么饮料",
+    "context": {"time_of_day": "evening"},
+    "limit": 5,
+    "valid_at": "2026-06-01T20:00:00+08:00",
+    "known_at": "2026-06-02T00:00:00Z"
+  }'
+```
+
+双时间筛选按每条 `MemoryRecord` 独立执行：
+
+1. 只考虑 `created_at <= known_at` 的 Record；
+2. 只考虑 `recorded_at <= known_at` 且 `valid_from <= valid_at` 的 Revision；
+3. 在合格 Revision 中按系统记录时间、修订序号和 ID 稳定选择当时已知的最新版本；
+4. Utility 只聚合 `recorded_at <= known_at` 且与请求上下文匹配的 Outcome；
+5. Recency 以 `valid_at` 与证据时间的距离计算，而不是以请求执行时间计算。
+
+因此，迟到但追溯生效的修正只有在其 `recorded_at` 到达 `known_at` 后才可见；已经记录的未来生效修订则要等 `valid_at` 到达其 `valid_from` 后才可见。两个字段必须包含 UTC offset；缺失 offset 或格式错误返回 `422`，未来 `known_at` 返回 `400 DomainError`。两轴互相独立，`valid_at` 可以晚于 `known_at`。
+
 每次请求都会产生 RecallTrace，即使没有结果。响应包括：
 
 - `trace_id`：Outcome 归因必须引用。
 - `policy_id` / `policy_version`：本次召回使用的策略快照。
-- `items`：排序后的当前有效修订。
+- `valid_at` / `known_at`：服务端最终使用并冻结到 Trace 的双时间边界；即使请求省略也会返回解析后的 UTC 时间。
+- `created_at`：本次 Trace 的系统创建时间，`known_at` 不会晚于它。
+- `items`：排序后的双时间可见修订；每项的 `revision_valid_from` / `revision_recorded_at` 会与值、上下文和分数一起冻结到 Trace item。
 - `breakdown`：每条结果的五个评分分量。
 
 | 分量 | 当前含义 |
 | --- | --- |
 | `semantic` | 查询与 `key + value` 的词法相似度 |
 | `context` | 保存上下文与请求上下文的匹配程度 |
-| `belief` | 当前修订的信念置信度 |
-| `utility` | 当前上下文中的 Outcome 效用均值 |
-| `recency` | 按策略半衰期计算的证据新鲜度 |
+| `belief` | 该双时间快照中修订的信念置信度 |
+| `utility` | 当前上下文中、截至 `known_at` 已记录 Outcome 的效用均值 |
+| `recency` | 相对 `valid_at`、按策略半衰期计算的证据新鲜度 |
 
 召回只保存 Trace，不会修改 BeliefState 或 UtilityEstimate。
+
+> **能力边界**
+>
+> `valid_at` / `known_at` 重建的是 Revision 与 Outcome 的历史可见状态。召回评分仍使用请求执行时的不可变 `StrategySnapshot`，而不是自动寻找过去运行时使用过的策略、投影实现或索引版本。因此该接口提供的是 historical state projection，不是完整历史策略 replay。Trace 中的 `policy_id` / `policy_version` 明确记录本次实际使用的执行时策略。
+
+PostgreSQL `0003_bitemporal_recall` 会为旧 Trace 回填边界与 item 修订时间。旧 Outcome 原 Schema 没有保存系统摄入时点，迁移只能用 `min(occurred_at, migration time)` 近似 `recorded_at`；涉及迁移前 Outcome 的历史 Utility 是 best-effort 结果，不能作为精确的历史知识审计。
 
 ### `POST /v1/outcomes`
 
@@ -236,6 +273,8 @@ curl -X POST http://127.0.0.1:38089/v1/outcomes \
 
 `revision_id` 不在对应 Trace 中时返回 `422 AttributionError`。
 
+请求中的 `occurred_at` 表示结果在业务上发生的时间；服务端另行记录不可由调用方指定的 `recorded_at`。双时间召回使用 `recorded_at` 判断系统当时是否已经知道这条 Outcome，避免把迟到上报的旧业务事件泄漏到更早的知识快照。
+
 Outcome 种类：
 
 | kind | 作为成功样本 | 典型用途 |
@@ -256,7 +295,7 @@ Outcome 种类：
 | `201` | 写入、修正或 Outcome 成功；幂等重放仍返回 201 |
 | `401` | JWT 模式缺少 token，或 token 类型/签名/issuer/audience/expiry/claim 无效 |
 | `403` | 身份可信，但 action 或 purpose 未授权 |
-| `400` | 一般领域规则失败 |
+| `400` | 一般领域规则失败，例如 Recall 的 `known_at` 晚于服务端当前时间 |
 | `404` | 资源在当前 Scope 中不存在，或 token 不覆盖目标 tenant/subject |
 | `409` | 幂等内容冲突或并发状态冲突 |
 | `413` | 请求体超过 `EMF_MAX_REQUEST_BODY_BYTES` |
@@ -272,3 +311,4 @@ Outcome 种类：
 4. 生产调用必须使用 JWT 模式；把 tenant/subject 当作目标选择器，不要把它们当作授权证明。
 5. 对 `409` 区分安全重试和业务内容冲突，不要盲目换键重试。
 6. 对 `404` 保持 Scope 无关的错误文案，避免跨租户枚举。
+7. 需要可复现的历史状态时同时保存请求与响应中的 `valid_at`、`known_at`、`policy_id` 和 `policy_version`；不要把 historical state projection 表述为完整历史策略 replay。

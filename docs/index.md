@@ -20,17 +20,27 @@
 3. [架构说明](architecture.md)
 4. 交互式文档：后端启动后打开 <http://127.0.0.1:38089/docs>
 
-重点理解作用域、幂等键、`RecallTrace` 归因和错误码。
+重点理解作用域、幂等键、`valid_at` / `known_at` 双时间、`RecallTrace` 归因和错误码。
 
 ### 项目开发者
 
 1. [开发指南](development.md)
 2. [架构说明](architecture.md)
-3. [演化安全模型](evolution-safety.md)
-4. [贡献指南](../CONTRIBUTING.md)
-5. [路线图](../ROADMAP.md)
+3. [记忆评测指南](evaluation.md)
+4. [演化安全模型](evolution-safety.md)
+5. [贡献指南](../CONTRIBUTING.md)
+6. [路线图](../ROADMAP.md)
 
 重点保持 `api/adapters → application → domain` 的依赖方向和五个平面的语义边界。
+
+### 评测与策略开发者
+
+1. [记忆评测指南](evaluation.md)
+2. [演化安全模型](evolution-safety.md)
+3. [架构说明](architecture.md)中的固定 relevance admission
+4. [路线图](../ROADMAP.md)中的混合检索与受控演化
+
+先用 `builtin:smoke-v1` 检查 retrieval/invariant 回归，再讨论候选策略。该 synthetic smoke 不是论文 benchmark 或策略晋升的充分证据。
 
 ### 部署与安全维护者
 
@@ -52,8 +62,10 @@
 | 当前记忆列表 | 已实现 | 前端“当前记忆”或 `GET /v1/preferences` |
 | 不可变修订 | 已实现 | 修正弹窗或 corrections API |
 | 词法与上下文召回 | 已实现 | 前端“记忆召回”或 `POST /v1/recall` |
+| 双时间历史状态投影 | 已实现；不是完整历史策略 replay | `POST /v1/recall` 的 `valid_at` / `known_at` |
 | Outcome 效用学习 | 已实现 | 召回结果反馈或 `POST /v1/outcomes` |
 | 有界策略提案 | 领域模型已实现 | `domain/evolution.py` |
+| synthetic retrieval/invariant 评测 | 已实现（最小 smoke） | [记忆评测指南](evaluation.md) |
 | PostgreSQL 持久化与迁移 | 已实现（开发预览） | [部署指南](deployment.md) |
 | 数据库 Scope/幂等/修订/归因约束 | 已实现（仍需故障与并发加固） | [架构说明](architecture.md) |
 | 同事务 outbox 写入 | 已实现；消费者未实现 | [部署指南](deployment.md) |
@@ -75,7 +87,11 @@
 | Candidate | 从证据提出、尚未成为持久信念的解释 |
 | MemoryRecord | 一条记忆的稳定身份 |
 | MemoryRevision | 该记忆在某个时间点的不可变版本 |
-| RecallTrace | 某次召回的查询、策略版本、候选和评分记录 |
-| OutcomeEvent | 引用 RecallTrace 的真实业务结果 |
+| valid time | 由 `valid_from` / `valid_at` 表示的业务有效时间轴 |
+| known time | 由 `recorded_at` / `known_at` 表示的系统知识时间轴 |
+| RecallTrace | 某次召回的双时间边界、策略版本、候选和评分记录 |
+| OutcomeEvent | 引用 RecallTrace 的真实业务结果；区分业务发生时间与系统记录时间 |
 | UtilityEstimate | 某修订在某上下文中的结果效用估计 |
 | StrategySnapshot | 不可变、可回滚的检索策略参数快照 |
+| historical state projection | 按双时间重建 Revision/Outcome 状态，再用执行时 StrategySnapshot 召回；不等于完整历史策略重放 |
+| Hard gate | 不能被平均质量分抵消的通过条件；失败时评测命令返回非零 |

@@ -73,7 +73,12 @@ api / adapters  →  application  →  domain
 
 `MemoryRecord` 提供稳定身份，身份由 Scope、记忆键和上下文共同确定。
 
-`MemoryRevision` 表示不可变版本。修正或新证据会追加修订，并通过 `supersedes_revision_id` 连接旧版本。
+`MemoryRevision` 表示不可变版本。修正或新证据会追加修订，并通过 `supersedes_revision_id` 连接旧版本。每个修订同时保存两个时间轴：
+
+- `valid_from`：该信念在业务世界中从何时开始成立；
+- `recorded_at`：系统从何时开始知道并持久化该修订。
+
+`active_revision_id` 仍是写入并发控制和最新事务头指针，但历史状态查询不能只读取它。双时间投影必须从不可变修订链按业务有效时间与系统知识时间重新选择。
 
 `BeliefState` 跟踪：
 
@@ -91,11 +96,13 @@ api / adapters  →  application  →  domain
 
 - Scope、查询和上下文
 - 策略 ID 与版本
+- 已解析的 `valid_at` 与 `known_at`
 - 返回修订和排名
+- 每个命中修订的 `revision_valid_from` 与 `revision_recorded_at`
 - 综合得分与评分分量
 - 创建时间
 
-`OutcomeEvent` 必须引用同 Scope 的 Trace，并引用该 Trace 中实际出现的 revision。
+`OutcomeEvent` 必须引用同 Scope 的 Trace，并引用该 Trace 中实际出现的 revision。它区分调用方提供的业务 `occurred_at` 与服务端生成的系统 `recorded_at`；历史 Utility 只使用在 `known_at` 之前已经记录的 Outcome。
 
 `UtilityEstimate` 以 `(revision_id, context_fingerprint)` 为键，使用带先验的成功/失败权重更新均值。
 
@@ -109,7 +116,7 @@ api / adapters  →  application  →  domain
 - 不能静默创造新的 Revision。
 - 必须有源修订号或游标，才能衡量投影延迟。
 
-当前版本没有独立投影存储，而是扫描 Scope 内活动修订并计算词法分数。这是可替换实现，不是目标架构的权威数据模型。
+当前版本没有独立投影存储，而是从 Scope 内权威修订链重建双时间可见快照，再计算词法分数。这是可替换实现，不是目标架构的权威数据模型。
 
 ### Evolution：演化平面
 
@@ -152,12 +159,38 @@ old revision remains in history
 
 ### 当前列表
 
-列表只读取每条 MemoryRecord 的活动修订，按 key、上下文指纹和 ID 稳定排序。它不生成 Trace，也不学习效用。
+列表从同一次服务端时钟读数解析 `valid_at = known_at = now`，只展示此刻有效且此刻已知的 Revision，并按 key、上下文指纹和 ID 稳定排序。因此已记录但未来才生效的修订不会提前出现。列表不生成 Trace，也不学习效用。
+
+### 双时间状态选择
+
+Recall 的两个可选轴含义不同：
+
+- `valid_at` 回答“事实在什么业务时点有效”；
+- `known_at` 回答“系统截至什么时点已经知道这些 Revision 与 Outcome”。
+
+application 只读取一次时钟；任一省略轴都使用该同一时点。显式 `known_at` 晚于执行时点会失败，因为系统不能重建尚未发生的知识状态；`valid_at` 可以位于未来，以查询已经记录的计划生效信念。两轴不要求前后顺序。
+
+每条 Record 的选择流程为：
+
+```text
+record.created_at <= known_at
+  ↓
+revision.recorded_at <= known_at
+  AND revision.valid_from <= valid_at
+  ↓
+latest (recorded_at, sequence, id)
+```
+
+按系统记录时间而不是只按 `valid_from` 选择，能保证一条迟到记录、但追溯到更早业务时间的修正，在系统知道它之后仍可替代旧信念。若没有合格 Revision，该 Record 在该历史状态中不可见。
 
 ### 召回
 
 ```text
-Scope filter + active revision filter
+Scope filter + bitemporal Revision selection
+  ↓
+Outcome.recorded_at <= known_at utility aggregation
+  ↓
+fixed relevance admission
   ↓
 semantic + context + belief + utility + recency
   ↓ weighted score and threshold
@@ -165,6 +198,8 @@ sorted RecalledItem list
   ↓
 append RecallTrace
 ```
+
+固定 relevance admission 先于加权评分：候选必须有词法命中，或者保存与请求两侧都提供了显式上下文且上下文为正向匹配。信念、效用和时效分量本身不能把无关候选变成相关结果。这条安全底线不属于 `StrategySnapshot` 的可演化权重，策略调优不能降低或绕过它。
 
 默认权重：
 
@@ -177,6 +212,10 @@ append RecallTrace
 | recency | 0.05 |
 
 默认最低分是 0.20，时效半衰期是 180 天。
+
+Recency 的参考时点是 `valid_at`，而不是请求执行时刻；Utility 只聚合 `recorded_at <= known_at` 且 Trace 上下文匹配的 Outcome。Trace 冻结最终双时间边界和每个 item 的修订时间，因此后续修正不会改写这次召回实际返回的内容。
+
+本次评分使用请求执行时配置的不可变 `StrategySnapshot`，其 `policy_id` / `policy_version` 被写入 Trace。当前没有按 `known_at` 还原旧策略、投影代码、索引版本或运行环境，因此这里实现的是 historical state projection，不是完整历史策略 replay。
 
 ### Outcome
 
@@ -197,7 +236,9 @@ append OutcomeEvent → update contextual UtilityEstimate
 - Observation、EvidenceSpan、Revision、Trace 和 Outcome 只追加。
 - 一条 MemoryRecord 最多只有一个活动修订。
 - 修正保留旧修订并显式记录替代关系。
-- 只有活动修订可被召回。
+- 只有同时满足 Scope、`valid_from <= valid_at` 与 `recorded_at <= known_at` 的 Revision 才可进入对应历史状态；每条 Record 最多选择一个版本。
+- 历史 Utility 不得使用 `recorded_at > known_at` 的 Outcome，Recency 必须相对 `valid_at` 计算。
+- Trace 的 `known_at` 不得晚于 `created_at`，Trace item 的修订时间必须满足本次双时间边界。
 - 列表和召回不改变信念或效用。
 - Outcome 不能更新未出现在对应 Trace 中的修订。
 - 幂等键只在 Scope 内有意义。
@@ -234,9 +275,13 @@ JWT identity adapter
 
 当前 PostgreSQL 适配器把 Observation、Revision、Trace 和 Outcome 作为权威状态。Observation 摄入、Revision 创建/追加和 Outcome 记录会在各自权威事务内写入不包含原始证据正文的 outbox 事件。版本化迁移由 `evolvable-memory-migrate` 执行。
 
+`0003_bitemporal_recall` 为 Trace 增加双时间边界、为 Trace item 增加命中修订时间快照，并为 Outcome 增加系统 `recorded_at`。迁移会从权威 Revision 回填旧 item 时间，并尽量保持旧 Trace 已冻结结果仍满足新边界。旧 Outcome 在原 Schema 中没有真实摄入时间，因此只能以 `min(occurred_at, migration time)` best-effort 回填 `recorded_at`；迁移前 Outcome 的历史 Utility 不能被解释为精确的系统知识审计。
+
 这里的“outbox 已实现”仅指事件行与权威变更原子落库；当前没有消费者、发布确认、受控重放或投影游标，因此不能把 outbox 表中的未发布行视为已经送达下游。
 
 向量和图存储未来只能消费投影事件。当前数据库约束与适配器事务共同保证：
+
+`0002_scope_integrity` 把 Candidate、修订链、Trace item 和策略版本的跨表引用绑定到一致的 record、Scope 或不可变策略身份；`0003_bitemporal_recall` 进一步把 Trace item 冻结的修订时间绑定到同一权威 Revision，并约束 `known_at <= created_at`。
 
 - Scope 内观察幂等键唯一。
 - Scope 内 Outcome 幂等键唯一。
@@ -244,6 +289,7 @@ JWT identity adapter
 - 活动 revision 外键必须指向同一 record 和 Scope，因此每条 record 只有一个活动指针。
 - Candidate、修订链与 Trace item 的 revision 必须同时匹配 record 和 Scope。
 - RecallTrace 的策略 ID 与版本必须引用同一个不可变 StrategySnapshot。
+- RecallTrace 的双时间边界和 item 修订时间通过数据库非空、检查、唯一键与复合外键保持一致。
 - Outcome 的 Trace 与 revision 归因完整性。
 
 隐私生命周期的目标状态与删除证明验收标准见[隐私生命周期设计](privacy-lifecycle.md)，生产信任边界与攻击场景见[威胁模型](threat-model.md)。二者都是设计基线，不代表当前已有对应执行能力。
@@ -254,7 +300,8 @@ JWT identity adapter
 - 删除证明、保留与抑制策略
 - 异步 outbox 消费者、投影游标与重放控制
 - embedding、图和摘要检索器
-- 离线回放数据集、影子路由与灰度控制面
+- 代表性离线回放数据集、影子路由与灰度控制面
+- 按历史 StrategySnapshot、投影版本与运行环境执行的完整历史策略 replay
 - 生产监控、审计存储和 SLO
 
 这些能力是路线图，不应从当前领域类型的存在推断为已经可用。
