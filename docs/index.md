@@ -8,7 +8,8 @@
 
 1. [快速开始](getting-started.md)
 2. [前端工作台指南](frontend-guide.md)
-3. [故障排查](troubleshooting.md)
+3. [部署与运行指南](deployment.md)（使用 Docker 时）
+4. [故障排查](troubleshooting.md)
 
 完成后，你应该能够写入一条偏好、召回它、提交真实结果并追加修订。
 
@@ -26,8 +27,20 @@
 2. [架构说明](architecture.md)
 3. [演化安全模型](evolution-safety.md)
 4. [贡献指南](../CONTRIBUTING.md)
+5. [路线图](../ROADMAP.md)
 
 重点保持 `api/adapters → application → domain` 的依赖方向和五个平面的语义边界。
+
+### 部署与安全维护者
+
+1. [部署与运行指南](deployment.md)
+2. [安全政策](../SECURITY.md)
+3. [威胁模型](threat-model.md)
+4. [隐私生命周期设计](privacy-lifecycle.md)
+5. [架构说明](architecture.md)中的 Scope 与持久化边界
+6. [路线图](../ROADMAP.md)
+
+当前容器仅用于本机开发评估。PostgreSQL 权威存储、迁移、数据库约束和同事务 outbox 写入已经实现；生产化前仍必须补齐可信身份、隐私生命周期执行、outbox 消费/投影、故障恢复和可观测性 SLO。
 
 ## 当前版本地图
 
@@ -39,10 +52,15 @@
 | 词法与上下文召回 | 已实现 | 前端“记忆召回”或 `POST /v1/recall` |
 | Outcome 效用学习 | 已实现 | 召回结果反馈或 `POST /v1/outcomes` |
 | 有界策略提案 | 领域模型已实现 | `domain/evolution.py` |
-| PostgreSQL 持久化 | 未实现 | 路线图 |
-| embedding / graph 投影 | 未实现 | 路线图 |
+| PostgreSQL 持久化与迁移 | 已实现（开发预览） | [部署指南](deployment.md) |
+| 数据库 Scope/幂等/修订/归因约束 | 已实现（仍需故障与并发加固） | [架构说明](architecture.md) |
+| 同事务 outbox 写入 | 已实现；消费者未实现 | [部署指南](deployment.md) |
+| 前端动态存储提示与 Scope 旧响应隔离 | 已实现 | [前端工作台指南](frontend-guide.md) |
+| embedding / graph 投影 | 未实现 | [路线图](../ROADMAP.md) |
+| outbox 消费、重放与投影游标 | 未实现 | [路线图](../ROADMAP.md) |
 | 认证、授权和生产隔离 | 未实现 | 必须由生产适配器提供 |
-| 删除证明与保留策略 | 未实现 | 路线图 |
+| 同意、保留、抑制、删除与证明 | 仅有设计，未实现 | [隐私生命周期设计](privacy-lifecycle.md) |
+| 生产监控、告警与 SLO | 未实现 | [路线图](../ROADMAP.md) |
 
 ## 术语速查
 

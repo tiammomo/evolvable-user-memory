@@ -47,11 +47,34 @@ task-9:outcome:1
 ```json
 {
   "error": "ConflictError",
-  "detail": "idempotency key was reused for a different preference"
+  "detail": "idempotency key was reused for a different preference request"
 }
 ```
 
 Pydantic 请求校验错误使用 FastAPI 标准的 `422` 结构。
+
+### 请求关联、大小限制与安全响应
+
+每个 HTTP 响应都会包含 `X-Request-ID`：
+
+- 调用方可以传入由字母、数字、点、下划线、冒号或连字符组成的 1–64 位 ID；
+- 请求头缺失或不合法时，服务端生成新的随机 ID；
+- 浏览器前端可以通过 CORS 读取该响应头；
+- 领域错误和服务端错误的 JSON 也包含同一个 `request_id`，便于排查。
+
+服务端只记录 JSON 结构化访问元数据，包括 request ID、HTTP 方法、路由模板、状态码、耗时和已读取字节数。日志不会记录请求 body、query string、tenant/subject 参数或原始证据。项目启动入口已关闭 Uvicorn 自带的 request-line access log；使用自定义 Uvicorn/Gunicorn 启动方式时也必须禁用其默认访问日志，避免 query string 被其他日志格式记录。
+
+请求体默认最多 `1 MiB`，由 `EMF_MAX_REQUEST_BODY_BYTES` 调整。服务会先检查 `Content-Length`，同时对没有该头或声明不可信的实际请求流累计计数；超过限制统一返回：
+
+```json
+{
+  "error": "RequestBodyTooLargeError",
+  "detail": "Request body exceeds the configured limit of 1048576 bytes.",
+  "request_id": "8e68e20353c54f658edc3bf49e0de55c"
+}
+```
+
+未处理异常只返回通用 `500 InternalServerError`，不会向调用方或应用日志写入异常消息、请求正文或原始证据。响应同时带有 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 和受限 `Permissions-Policy`。这些是应用层基线，不能替代 TLS、可信认证、反向代理限制或浏览器端 CSP。
 
 ## 端点
 
@@ -61,7 +84,15 @@ Pydantic 请求校验错误使用 FastAPI 标准的 `422` 结构。
 
 ### `GET /health`
 
-只做轻量存活检查，不验证外部依赖。当前内存版本没有数据库依赖。
+返回服务状态、版本和当前存储类型，便于工作台与人工诊断；不验证外部依赖。它不能替代编排器的就绪探针。
+
+### `GET /livez`
+
+只检查 API 进程是否仍可响应，不访问当前存储。成功时返回 `200` 和 `{"status":"ok"}`。
+
+### `GET /readyz`
+
+检查当前存储是否可用。内存模式在应用正常运行时返回 `200`；PostgreSQL 模式会检查数据库连接。依赖不可用时返回 `503` 和 `not_ready`，适合作为容器或编排器的就绪探针。
 
 ### `POST /v1/preferences`
 
@@ -120,11 +151,13 @@ curl -X POST http://127.0.0.1:38089/v1/preferences/RECORD_ID/corrections \
     "idempotency_key": "turn-43:correction-1",
     "value": "herbal tea",
     "evidence_text": "其实晚上我改喝花草茶",
-    "reason": "user corrected an outdated preference"
+    "reason": "user corrected an outdated preference",
+    "expected_revision_id": "CURRENT_REVISION_ID"
   }'
 ```
 
 修正不会覆盖旧修订，而是通过 `supersedes_revision_id` 形成版本链。
+`expected_revision_id` 可选；新客户端应传入页面读取到的当前修订 ID。若其已被其他写入替代，服务返回 `409`，避免旧页面静默覆盖新修订。为了兼容旧客户端，省略该字段时仍沿用原有行为。
 
 ### `GET /v1/preferences/{record_id}/revisions`
 
@@ -207,7 +240,10 @@ Outcome 种类：
 | `400` | 一般领域规则失败 |
 | `404` | 资源在当前 Scope 中不存在 |
 | `409` | 幂等内容冲突或并发状态冲突 |
+| `413` | 请求体超过 `EMF_MAX_REQUEST_BODY_BYTES` |
 | `422` | 请求结构校验失败，或 Outcome 无法归因 |
+| `500` | 未处理服务端错误；响应只暴露安全通用信息和 request ID |
+| `503` | `/readyz` 检测到当前存储不可用 |
 
 ## 集成建议
 

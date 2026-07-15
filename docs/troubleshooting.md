@@ -55,7 +55,7 @@ EMF_FRONTEND_PORT=34000 uv run evolvable-memory-frontend
 如果修改端口，当前版本还需要同步调整：
 
 - `index.html` 中的 `api-port`。
-- `api/app.py` 中允许的 CORS 来源。
+- 后端环境变量 `EMF_PUBLIC_API_URL` 和 `EMF_CORS_ORIGINS`；其中 CORS Origin 必须是完整的前端协议、主机与端口。
 
 默认端口能避免这项额外配置，推荐新人保持默认值。
 
@@ -113,7 +113,7 @@ curl 'http://127.0.0.1:38089/v1/preferences?tenant_id=demo&subject_id=alice'
 
 ## 后端重启后数据消失
 
-这是 `0.1.0` 的预期行为。`EMF_STORE` 当前只支持 `memory`，所有数据都在后端进程中。
+这是 `EMF_STORE=memory` 的预期行为，所有权威数据都在后端进程中。需要跨重启保留时，使用默认 PostgreSQL Compose；或设置 `EMF_STORE=postgres`、`EMF_DATABASE_URL`，先运行 `uv run evolvable-memory-migrate` 再启动后端。详见 [部署指南](deployment.md)。
 
 需要重新体验时，可以点击前端“使用示例开始”，或运行：
 
@@ -130,6 +130,6 @@ uv sync
 uv run python -c 'import evolvable_memory; print(evolvable_memory.__file__)'
 ```
 
-## 测试出现 httpx2 弃用警告
+## TestClient 提示缺少 `httpx2`
 
-当前 FastAPI TestClient 兼容层会发出 Starlette 弃用警告，但不影响测试结果。升级测试客户端依赖前，应先确认 FastAPI、Starlette 与 httpx2 的版本兼容性。
+当前 Starlette TestClient 使用 `httpx2`，浏览器 E2E 的就绪探测仍使用 `httpx`；两者都已固定在开发依赖与 `uv.lock` 中。先运行 `uv sync --locked`。如果提示仍存在，确认命令使用的是项目 `.venv`，不要在全局 Python 环境单独安装或混用版本。

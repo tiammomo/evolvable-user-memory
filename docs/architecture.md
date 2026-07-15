@@ -24,12 +24,12 @@ FastAPI backend :38089
   ▼
 MemoryApplication
   │
-  ├── MemoryStore port ──> InMemoryMemoryStore
+  ├── MemoryStore port ──> InMemoryMemoryStore / PostgresMemoryStore
   ├── Clock port ────────> SystemClock
   └── IdGenerator port ──> Uuid4Generator
 ```
 
-前端和后端是两个独立开发进程。前端不保存权威记忆状态；后端当前使用线程安全进程内存。
+前端和后端是两个独立进程。前端不保存权威记忆状态；原生快速开始默认使用线程安全进程内存，默认 Compose 使用 PostgreSQL 权威存储。
 
 ## 3. 代码依赖
 
@@ -215,24 +215,29 @@ append OutcomeEvent → update contextual UtilityEstimate
 
 不能仅依靠前端隐藏字段或请求体约定实现隔离。
 
-## 8. 持久化路线图
+## 8. 持久化实现与后续加固
 
-生产适配器建议使用 PostgreSQL 作为 Observation、Revision、Trace 和 Outcome 的权威存储，并在同一事务写 outbox。
+当前 PostgreSQL 适配器把 Observation、Revision、Trace 和 Outcome 作为权威状态。Observation 摄入、Revision 创建/追加和 Outcome 记录会在各自权威事务内写入不包含原始证据正文的 outbox 事件。版本化迁移由 `evolvable-memory-migrate` 执行。
 
-向量和图存储只消费投影事件。数据库约束至少需要保证：
+这里的“outbox 已实现”仅指事件行与权威变更原子落库；当前没有消费者、发布确认、受控重放或投影游标，因此不能把 outbox 表中的未发布行视为已经送达下游。
+
+向量和图存储未来只能消费投影事件。当前数据库约束与适配器事务共同保证：
 
 - Scope 内观察幂等键唯一。
 - Scope 内 Outcome 幂等键唯一。
-- record 内 revision sequence 唯一且连续。
-- 单活动修订语义。
+- record 内 revision sequence 唯一；追加事务锁定 record 并只接受下一个连续序号。
+- 活动 revision 外键必须指向同一 record 和 Scope，因此每条 record 只有一个活动指针。
+- Candidate、修订链与 Trace item 的 revision 必须同时匹配 record 和 Scope。
+- RecallTrace 的策略 ID 与版本必须引用同一个不可变 StrategySnapshot。
 - Outcome 的 Trace 与 revision 归因完整性。
+
+隐私生命周期的目标状态与删除证明验收标准见[隐私生命周期设计](privacy-lifecycle.md)，生产信任边界与攻击场景见[威胁模型](threat-model.md)。二者都是设计基线，不代表当前已有对应执行能力。
 
 ## 9. 有意未实现
 
 - 认证、授权与生产身份注入
-- PostgreSQL 或其他持久化适配器
 - 删除证明、保留与抑制策略
-- 异步 outbox 与投影消费者
+- 异步 outbox 消费者、投影游标与重放控制
 - embedding、图和摘要检索器
 - 离线回放数据集、影子路由与灰度控制面
 - 生产监控、审计存储和 SLO

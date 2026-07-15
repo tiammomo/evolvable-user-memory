@@ -76,7 +76,9 @@ api / adapters  →  application  →  domain
 | `tests/test_api.py` | HTTP 状态、Schema、错误映射、CORS、OpenAPI |
 | `tests/test_evolution.py` | 策略边界和实验状态机 |
 | `tests/test_frontend.py` | 静态服务、入口和安全响应头 |
+| `tests/test_frontend_e2e.py` | 真实浏览器主流程、响应式布局、键盘和 Scope 迟到响应 |
 | `tests/test_config.py` | 默认值、环境覆盖和非法配置 |
+| `tests/test_postgres_integration.py` | PostgreSQL 持久化、重启恢复、约束语义和 outbox 写入 |
 
 ## 质量门禁
 
@@ -92,16 +94,18 @@ uv build
 
 覆盖率门禁当前为 85%，但不要用无意义测试追求数字；优先覆盖不变量和边界。
 
-## 持久化扩展建议
+## 持久化现状与扩展要求
 
-生产方向应以 PostgreSQL 作为权威事件和修订存储：
+当前 PostgreSQL 适配器已经作为默认 Compose 的权威事件和修订存储，并具备版本化迁移、Scope/幂等/修订/Trace 归因数据库约束。Observation 摄入、Revision 变更和 Outcome 记录会与对应 outbox 事件在同一事务写入。内存适配器仍用于快速开发和确定性测试。
 
-1. 以 `(tenant_id, subject_id)` 作为主要分区或索引前缀。
-2. 对观察幂等键、Outcome 幂等键和修订序号建立唯一约束。
-3. 用约束保证每条记录至多一个活动修订。
-4. 在同一事务写入权威状态和 outbox。
-5. 由投影消费者更新向量、图或摘要索引。
-6. 用源修订号与投影游标衡量延迟并支持确定性重建。
+新增持久化能力时继续遵守：
+
+1. 以 `(tenant_id, subject_id)` 作为查询、唯一键与索引的 Scope 前缀。
+2. 同时在应用层和数据库层拒绝跨 Scope、幂等冲突、非法修订与错误 Trace 归因。
+3. 权威状态与 outbox 必须在同一事务提交；outbox payload 不得包含原始证据正文。
+4. 当前尚无 outbox 消费者。未来消费者必须支持租约/重试、幂等发布、可观测失败和受控重放。
+5. 向量、图或摘要消费者只能更新可丢弃投影，不能反向创建权威 Revision。
+6. 用源修订号与投影游标衡量延迟，并验证从权威状态确定性重建。
 
 不要让向量数据库成为 MemoryRevision 的唯一存储。
 
@@ -121,3 +125,5 @@ uv build
 - 不从不可信请求体决定生产 Scope。
 - 不允许演化引擎修改访问控制、删除、保留、抑制或审计规则。
 - 添加删除能力时，需要同时处理权威状态、投影、缓存、Trace 保留与删除证明。
+
+隐私相关改动必须先对照[隐私生命周期设计](privacy-lifecycle.md)的失败关闭和验收标准；身份、隔离、outbox 或投影相关改动必须同时复核[威胁模型](threat-model.md)。这两份文档描述目标设计，不代表对应生产能力已经实现。
