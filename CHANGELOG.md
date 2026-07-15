@@ -16,6 +16,9 @@
 - 请求 ID、实际请求流大小限制、仅元数据访问日志，以及 API/前端安全响应头。
 - 部署指南、安全政策、分阶段路线图、隐私生命周期设计与威胁模型。
 - 首次使用概念引导和可点击五步闭环。
+- 本地开发身份与 RFC 9068 风格 JWT 身份适配器，包含非对称算法、issuer、audience、expiry 和 API scope 校验。
+- 按 action、tenant、subject 和 purpose 默认拒绝的 application 权限执行点、内置最小权限角色，以及 HMAC 伪名化 allow/deny 审计。
+- 身份与权限设计文档、生产配置门禁和 JWT/角色/Scope/purpose 负向测试。
 
 ### Changed
 

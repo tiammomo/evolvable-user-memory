@@ -16,8 +16,9 @@
 ### API 集成者
 
 1. [API 使用指南](api-guide.md)
-2. [架构说明](architecture.md)
-3. 交互式文档：后端启动后打开 <http://127.0.0.1:38089/docs>
+2. [身份与权限设计](authorization.md)
+3. [架构说明](architecture.md)
+4. 交互式文档：后端启动后打开 <http://127.0.0.1:38089/docs>
 
 重点理解作用域、幂等键、`RecallTrace` 归因和错误码。
 
@@ -35,12 +36,13 @@
 
 1. [部署与运行指南](deployment.md)
 2. [安全政策](../SECURITY.md)
-3. [威胁模型](threat-model.md)
-4. [隐私生命周期设计](privacy-lifecycle.md)
-5. [架构说明](architecture.md)中的 Scope 与持久化边界
-6. [路线图](../ROADMAP.md)
+3. [身份与权限设计](authorization.md)
+4. [威胁模型](threat-model.md)
+5. [隐私生命周期设计](privacy-lifecycle.md)
+6. [架构说明](architecture.md)中的 Scope 与持久化边界
+7. [路线图](../ROADMAP.md)
 
-当前容器仅用于本机开发评估。PostgreSQL 权威存储、迁移、数据库约束和同事务 outbox 写入已经实现；生产化前仍必须补齐可信身份、隐私生命周期执行、outbox 消费/投影、故障恢复和可观测性 SLO。
+当前容器仅用于本机开发评估。PostgreSQL 权威存储、迁移、数据库约束、同事务 outbox 和 JWT 授权基线已经实现；生产化前仍必须补齐权限治理控制面、数据库 RLS、隐私生命周期执行、outbox 消费/投影、故障恢复和可观测性 SLO。
 
 ## 当前版本地图
 
@@ -58,7 +60,8 @@
 | 前端动态存储提示与 Scope 旧响应隔离 | 已实现 | [前端工作台指南](frontend-guide.md) |
 | embedding / graph 投影 | 未实现 | [路线图](../ROADMAP.md) |
 | outbox 消费、重放与投影游标 | 未实现 | [路线图](../ROADMAP.md) |
-| 认证、授权和生产隔离 | 未实现 | 必须由生产适配器提供 |
+| JWT 身份与 application 授权执行点 | 已实现（治理基线） | [身份与权限设计](authorization.md) |
+| 角色管理、撤销、临时授权和数据库 RLS | 未实现 | [身份与权限设计](authorization.md) |
 | 同意、保留、抑制、删除与证明 | 仅有设计，未实现 | [隐私生命周期设计](privacy-lifecycle.md) |
 | 生产监控、告警与 SLO | 未实现 | [路线图](../ROADMAP.md) |
 

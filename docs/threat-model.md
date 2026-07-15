@@ -2,7 +2,7 @@
 
 > **状态：设计与安全验收基线，不是生产安全声明。**
 >
-> 当前版本是本机开发预览：没有可信认证/授权、隐私生命周期执行、outbox 消费者、独立投影或生产 SLO。本文记录现有控制、已知缺口和未来上线门槛；“建议控制”均尚不能视为已交付。
+> 当前版本是开发预览：已经具备 JWT 身份、类型化授权和伪名化授权审计基线，但没有完整权限治理控制面、隐私生命周期执行、outbox 消费者、独立投影或生产 SLO。本文记录现有控制、已知缺口和未来上线门槛；未被测试和运行证据覆盖的建议不能视为已交付。
 
 ## 1. 范围与假设
 
@@ -11,7 +11,7 @@
 当前安全假设仅适用于本机评估：
 
 - 前后端默认绑定 `127.0.0.1`，PostgreSQL 不发布到宿主；
-- 调用方传入的 `tenant_id` / `subject_id` 是不可信开发合同；
+- 调用方传入的 `tenant_id` / `subject_id` 始终是不可信目标选择器；开发模式由本地身份放行，JWT 模式必须由可信 grant 覆盖；
 - 开发用数据库凭据和 Compose 配置不是生产秘密管理方案；
 - 使用真实敏感数据或把 API 暴露到公网超出当前支持范围。
 
@@ -43,10 +43,13 @@
 
 ```text
 不可信浏览器 / API client
-        │  payload Scope 当前不可信；未来需要认证、授权、限流
+        │  payload Scope 不可信；Bearer token 也必须完整验证
         ▼
 FastAPI 传输边界
-        │  schema 映射
+        │  JWT identity adapter + schema 映射
+        ▼
+Application authorization PEP
+        │  action + tenant + subject + purpose；默认拒绝并审计
         ▼
 Application + Domain
         │  typed ports；Scope 与归因规则
@@ -73,6 +76,9 @@ PostgreSQL authority + outbox
 这些控制已经存在，但不足以构成生产安全：
 
 - 所有有状态 application 操作显式携带 tenant/subject Scope；查询与错误行为避免直接暴露其他 Scope 资源。
+- JWT 模式验证 access token 的类型、签名、issuer、audience、expiry 和 API scope；生产/预发布配置本地身份时拒绝启动。
+- 受保护用例统一通过 application 权限执行点，按 action、tenant、subject 与 purpose 默认拒绝；tenant 管理角色不自动获得记忆读取权。
+- allow/deny 授权决策记录 policy version、request ID 和 HMAC 伪名化主体/Scope/资源引用，不记录 token 或记忆正文。
 - PostgreSQL 使用复合外键/唯一约束落实 Scope、幂等键、修订身份和 Outcome 对 Trace item 的归因。
 - 内存与 PostgreSQL 适配器对同一 Scope 内“相同键、不同内容”返回冲突，不静默覆盖。
 - Revision 通过当前应用路径只追加，列表/召回不会更新 Belief 或 Utility。
@@ -86,19 +92,19 @@ PostgreSQL authority + outbox
 
 | ID | 场景与影响 | 当前控制 | 生产前仍需的控制与验收 |
 | --- | --- | --- | --- |
-| T1 | 客户端伪造 tenant/subject，读取或写入他人记忆 | 仅有开发 Scope 合同和查询过滤 | 认证、授权、服务端 Scope 注入；payload Scope 被忽略/拒绝；跨 Scope 黑盒测试 |
-| T2 | 猜测 record、revision、trace ID 进行 IDOR 或枚举 | Scope 条件、复合外键、统一 NotFound | 授权策略、审计、可选数据库行级/角色隔离；时序与错误正文不可泄漏存在性 |
+| T1 | 客户端伪造 tenant/subject，读取或写入他人记忆 | JWT grant 与 action/Scope/purpose 检查；开发身份仅限非生产；查询过滤 | IdP 成员生命周期、撤销/临时授权、权限管理控制面与数据库 RLS |
+| T2 | 猜测 record、revision、trace ID 进行 IDOR 或枚举 | Scope 条件、授权 conceal、复合外键、统一 NotFound 和审计 | 数据库 RLS、批量/时序侧信道测试与异常枚举告警 |
 | T3 | 重放写入或复用幂等键静默改变业务内容 | Scope 内唯一键与内容冲突 | 限流、重放窗口/业务事件归属；并发和故障恢复测试保证只发生一次副作用 |
 | T4 | Scope 切换后旧响应覆盖新用户页面 | 取消请求、generation 检查、清理状态 | 真实浏览器并发回归；服务端授权仍是最终边界，不能依赖 UI 隔离 |
 | T5 | 原始证据通过日志、outbox、错误或监控泄漏 | 应用默认不记录正文；outbox 不含正文 | 全链路日志/追踪脱敏测试、字段级访问、静态/动态泄漏扫描和事件响应流程 |
 | T6 | SQL/Schema/自由文本注入或超大输入耗尽资源 | Pydantic 边界与参数化数据库调用 | 速率/配额、请求/查询超时、连接池隔离、模糊测试和容量上限 |
-| T7 | 伪造 Trace 或 revision 提交 Outcome，污染 Utility | 应用归因检查与数据库 Trace-item 复合外键 | 可信调用身份、事件来源签名/授权、异常率监控和跨 Scope 并发测试 |
+| T7 | 伪造 Trace 或 revision 提交 Outcome，污染 Utility | JWT 身份、`experience.outcome_write`、应用归因检查与数据库 Trace-item 复合外键 | actor/decision 持久溯源、委托链、异常率监控和跨 Scope 并发测试 |
 | T8 | outbox 丢失、重复、乱序或恶意重放 | 仅有同事务写入和 unpublished 索引 | 幂等消费者、租约、重试/死信、发布确认、每聚合顺序、受权重放和积压告警 |
 | T9 | 投影跨 Scope 泄漏、陈旧结果或删除后复活 | 独立投影尚未实现 | Scope 键、源 revision/游标、删除屏障、确定性重建与投影延迟降级测试 |
 | T10 | 在线数据已删，但 Trace、Outcome、缓存、投影或备份仍可还原 | 未实现隐私生命周期 | 按[隐私生命周期设计](privacy-lifecycle.md)实现清单、抑制、编排、恢复屏障与证明 |
 | T11 | 演化策略放宽授权、隐私或审计规则 | 领域动作空间排除治理规则并限制权重变化 | 控制面权限分离、签名策略注册表、离线/影子/灰度门禁和紧急回滚 |
 | T12 | 数据库凭据、备份、迁移或运维控制面被滥用 | 本机网络与非 root 容器 | 秘密管理、TLS、最小数据库角色、短期凭据、双人审批、不可篡改审计与恢复演练 |
-| T13 | 浏览器认证引入 CSRF、错误 CORS 或会话固定 | 当前无生产认证；开发 CORS 有限 | 明确令牌/会话模型、CSRF 防护、精确 Origin、Cookie 安全属性和登出/撤销测试 |
+| T13 | 浏览器认证引入 token 泄漏、CSRF、错误 CORS 或会话固定 | API Bearer 校验、精确开发 CORS、安全响应头 | 生产 BFF/会话模型、PKCE、CSRF、防泄漏、登出/撤销和增强认证测试 |
 | T14 | 依赖、镜像或构建产物被投毒 | 锁文件与 CI 构建检查 | 依赖/镜像扫描、SBOM、来源证明、签名发布、保护分支和漏洞响应门禁 |
 | T15 | 数据库或消费者故障长期不可见，服务仍接流量 | PostgreSQL `/readyz` 检查 | 分层 SLI/SLO、告警、熔断/背压、故障注入；就绪不等于端到端正确性 |
 
@@ -108,7 +114,8 @@ PostgreSQL authority + outbox
 
 ### 身份与隔离
 
-- [ ] 每个 API 动作有认证主体、授权动作、资源范围和服务端派生 Scope。
+- [x] 当前记忆 API 动作有认证主体、授权动作、资源范围、purpose 和可信 grant 覆盖。
+- [ ] IdP 成员/角色管理、撤销、临时授权、增强认证和策略变更流程形成运行证据。
 - [ ] 同租户跨 subject、跨租户、未知 ID、批量枚举和时序侧信道测试通过。
 - [ ] 数据库应用角色无迁移、超级用户、备份或任意跨 Scope 调试权限。
 

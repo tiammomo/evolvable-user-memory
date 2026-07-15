@@ -15,7 +15,24 @@
 }
 ```
 
-当前 API 为开发合同，因此 Scope 来自请求参数。生产适配器不能信任客户端自行声明的 Scope，必须从经过认证和授权的服务器端上下文中注入。
+`development` 模式使用显式本地身份，因此请求 Scope 适合本机体验。`jwt` 模式把这些字段视为目标资源选择器；只有经过验证的 access token 中同一条 `memory_access` grant 同时覆盖 action、tenant、subject 和 purpose 时才会执行。修改 payload 不能扩大 token 的权限。
+
+### 身份、动作与 purpose
+
+`/v1/*` 端点全部经过 application 权限执行点；`/`、`/health`、`/livez`、`/readyz` 和 OpenAPI 用于发现与探针，当前保持公开且不返回记忆数据。
+
+JWT 模式调用示例：
+
+```bash
+curl -H 'Authorization: Bearer ACCESS_TOKEN' \
+  'https://api.example/v1/preferences?tenant_id=tenant-a&subject_id=alice&purpose=personalization'
+```
+
+token 必须通过类型、签名、issuer、audience、expiry 和 API scope 校验，并包含受信任的
+`memory_access`。各端点所需动作、内置角色和 claim 结构见[身份与权限设计](authorization.md)。
+
+请求体与受保护 GET 查询支持 `purpose`，默认值为 `personalization`。purpose 必须被执行该
+action 的同一条 grant 允许；不能把只获准个性化的数据改用于 `model-training`。
 
 ### 幂等键
 
@@ -62,7 +79,7 @@ Pydantic 请求校验错误使用 FastAPI 标准的 `422` 结构。
 - 浏览器前端可以通过 CORS 读取该响应头；
 - 领域错误和服务端错误的 JSON 也包含同一个 `request_id`，便于排查。
 
-服务端只记录 JSON 结构化访问元数据，包括 request ID、HTTP 方法、路由模板、状态码、耗时和已读取字节数。日志不会记录请求 body、query string、tenant/subject 参数或原始证据。项目启动入口已关闭 Uvicorn 自带的 request-line access log；使用自定义 Uvicorn/Gunicorn 启动方式时也必须禁用其默认访问日志，避免 query string 被其他日志格式记录。
+服务端只记录 JSON 结构化访问元数据，包括 request ID、HTTP 方法、路由模板、状态码、耗时和已读取字节数。日志不会记录请求 body、query string、tenant/subject 参数或原始证据。每次到达权限执行点的 allow/deny 还会写入独立的授权日志，其中 principal、client、tenant、subject 和 resource 都是 HMAC 伪名引用，不包含 token 或记忆正文。项目启动入口已关闭 Uvicorn 自带的 request-line access log；使用自定义 Uvicorn/Gunicorn 启动方式时也必须禁用其默认访问日志，避免 query string 被其他日志格式记录。
 
 请求体默认最多 `1 MiB`，由 `EMF_MAX_REQUEST_BODY_BYTES` 调整。服务会先检查 `Content-Length`，同时对没有该头或声明不可信的实际请求流累计计数；超过限制统一返回：
 
@@ -80,11 +97,11 @@ Pydantic 请求校验错误使用 FastAPI 标准的 `422` 结构。
 
 ### `GET /`
 
-返回版本、存储类型、前端入口、文档入口和生产就绪状态。首次连接服务时建议先调用。
+返回版本、存储类型、身份模式、Scope 来源、前端入口、文档入口和生产就绪状态。首次连接服务时建议先调用。
 
 ### `GET /health`
 
-返回服务状态、版本和当前存储类型，便于工作台与人工诊断；不验证外部依赖。它不能替代编排器的就绪探针。
+返回服务状态、版本、当前存储类型、身份模式和 Scope 来源，便于工作台与人工诊断；不验证外部依赖。它不能替代编排器的就绪探针，也不会暴露角色或 token 内容。
 
 ### `GET /livez`
 
@@ -237,8 +254,10 @@ Outcome 种类：
 | --- | --- |
 | `200` | 查询、列表或召回成功 |
 | `201` | 写入、修正或 Outcome 成功；幂等重放仍返回 201 |
+| `401` | JWT 模式缺少 token，或 token 类型/签名/issuer/audience/expiry/claim 无效 |
+| `403` | 身份可信，但 action 或 purpose 未授权 |
 | `400` | 一般领域规则失败 |
-| `404` | 资源在当前 Scope 中不存在 |
+| `404` | 资源在当前 Scope 中不存在，或 token 不覆盖目标 tenant/subject |
 | `409` | 幂等内容冲突或并发状态冲突 |
 | `413` | 请求体超过 `EMF_MAX_REQUEST_BODY_BYTES` |
 | `422` | 请求结构校验失败，或 Outcome 无法归因 |
@@ -250,6 +269,6 @@ Outcome 种类：
 1. 在业务入口生成并持久化幂等键，不要每次 HTTP 重试都生成新键。
 2. 保存 `trace_id` 与最终使用的 `revision_id`，任务完成后再提交 Outcome。
 3. 不要把召回次数当成成功指标。
-4. 在生产适配器中从认证上下文注入 Scope。
+4. 生产调用必须使用 JWT 模式；把 tenant/subject 当作目标选择器，不要把它们当作授权证明。
 5. 对 `409` 区分安全重试和业务内容冲突，不要盲目换键重试。
 6. 对 `404` 保持 Scope 无关的错误文案，避免跨租户枚举。

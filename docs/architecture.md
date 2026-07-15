@@ -205,15 +205,30 @@ append OutcomeEvent → update contextual UtilityEstimate
 
 ## 7. Scope 与安全
 
-当前 API 为开发体验把 `tenant_id` 和 `subject_id` 放在请求中。生产架构必须：
+API 保留 `tenant_id` 和 `subject_id` 作为目标资源选择器。`development` 模式使用显式本地身份；`jwt` 模式先验证 access token，再要求同一条可信 `AccessGrant` 同时覆盖 action、tenant、subject 和 purpose。当前执行链为：
+
+```text
+JWT identity adapter
+  → ActorContext
+  → AuthorizedMemoryApplication（统一 PEP）
+  → AuthorizationPort（默认拒绝 PDP）
+  → MemoryApplication
+  → Domain / MemoryStore
+```
+
+权限实现遵循：
 
 1. 在认证适配器中验证调用身份。
 2. 在授权层解析允许访问的 tenant 和 subject。
-3. 由服务端把可信 Scope 注入 application command。
+3. 只有授权 grant 覆盖的目标才能形成 application 调用的可信 Scope。
 4. 在数据库唯一键、索引和查询条件中重复落实 Scope。
 5. 保持跨 Scope 的 NotFound 行为一致，避免资源枚举。
+6. action 按 Evidence、Belief、Experience、Projection、Evolution 与外部 Governance 平面拆分。
+7. 所有 allow/deny 记录 policy version 和伪名化审计引用。
 
 不能仅依靠前端隐藏字段或请求体约定实现隔离。
+
+当前角色绑定来自 JWT `memory_access` claim，尚未提供角色管理 API、撤销/临时授权、数据库 RLS 或独立审计存储。完整动作、角色与 token 合同见[身份与权限设计](authorization.md)。
 
 ## 8. 持久化实现与后续加固
 
@@ -235,7 +250,7 @@ append OutcomeEvent → update contextual UtilityEstimate
 
 ## 9. 有意未实现
 
-- 认证、授权与生产身份注入
+- 成员/角色治理控制面、撤销/临时授权与数据库 RLS
 - 删除证明、保留与抑制策略
 - 异步 outbox 消费者、投影游标与重放控制
 - embedding、图和摘要检索器

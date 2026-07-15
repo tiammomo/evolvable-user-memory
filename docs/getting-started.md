@@ -56,7 +56,7 @@ curl http://127.0.0.1:38089/health
 期望响应：
 
 ```json
-{"status":"ok","version":"0.1.0","storage":"memory"}
+{"status":"ok","version":"0.1.0","storage":"memory","auth_mode":"development","scope_source":"request"}
 ```
 
 还可以访问：
@@ -82,7 +82,7 @@ curl http://127.0.0.1:38089/health
 
 页面右上角的 `tenant / subject` 是开发环境数据隔离边界。首次体验保留 `demo / alice` 即可。
 
-> 这是开发合同，不是生产身份认证。生产环境必须从可信认证上下文派生 Scope。
+> 当前使用被明确限制在非生产环境的开发身份。JWT 模式会把这里的值作为目标选择器，并要求可信 token grant 同时允许 action、tenant、subject 和 purpose；前端输入本身不是授权证明。
 
 ### 写入偏好
 

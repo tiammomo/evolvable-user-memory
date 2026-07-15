@@ -2,7 +2,7 @@
 
 本指南覆盖本机开发、Docker Compose 评估和未来生产部署前的检查项。
 
-> 当前 `0.1.x` 已提供 PostgreSQL 适配器，但仍把 Scope 暴露为开发合同，尚无生产认证、隐私治理和完整运维基线。以下容器配置用于本机演示和集成验证，不是生产部署模板。不要暴露到公网或写入真实敏感数据。
+> 当前 `0.1.x` 已提供 PostgreSQL 适配器，以及 JWT 身份和 application 授权基线；请求中的 Scope 在 JWT 模式下只是目标选择器，必须由可信 grant 覆盖。项目仍缺完整权限治理、隐私治理和生产运维基线。以下容器配置用于本机演示和集成验证，不是生产部署模板。不要暴露到公网或写入真实敏感数据。
 
 ## 选择运行方式
 
@@ -12,7 +12,7 @@
 | 默认 Docker Compose | 新人快速体验、PostgreSQL 集成验证 | 保存在命名 volume |
 | 内存模式 Compose | 快速临时测试 | 后端重启即清空 |
 | 单独 Docker 容器 | 镜像和入口检查 | 容器或进程重启即清空 |
-| 生产部署 | 当前不支持 | 缺少可信身份、隐私治理与运维基线 |
+| 生产部署 | 当前不支持 | JWT 基线已具备，仍缺权限治理/RLS、隐私治理与运维基线 |
 
 ## 使用 Docker Compose
 
@@ -57,7 +57,7 @@ curl -I http://127.0.0.1:33009/
 健康接口会说明当前存储，依赖就绪接口会真实检查存储连接：
 
 ```json
-{"status":"ok","version":"0.1.0","storage":"postgres"}
+{"status":"ok","version":"0.1.0","storage":"postgres","auth_mode":"development","scope_source":"request"}
 {"status":"ready","storage":"postgres"}
 ```
 
@@ -138,7 +138,7 @@ docker run --rm --name emf-frontend \
 
 | 变量 | 容器值 | 说明 |
 | --- | --- | --- |
-| `EMF_ENVIRONMENT` | `development` | 当前运行环境标签 |
+| `EMF_ENVIRONMENT` | `development` | `development`、`test`、`staging` 或 `production` |
 | `EMF_HOST` | `0.0.0.0` | 仅在容器内监听；宿主仍绑定到 `127.0.0.1` |
 | `EMF_PORT` | `38089` | 后端容器端口 |
 | `EMF_LOG_LEVEL` | `INFO` | Uvicorn 日志等级 |
@@ -147,6 +147,13 @@ docker run --rm --name emf-frontend \
 | `EMF_DATABASE_POOL_MIN_SIZE` | `1` | 最小连接池大小 |
 | `EMF_DATABASE_POOL_MAX_SIZE` | `10` | 最大连接池大小 |
 | `EMF_MAX_REQUEST_BODY_BYTES` | `1048576` | 应用层请求体上限；同时检查声明长度和实际流量 |
+| `EMF_AUTH_MODE` | `development` | Compose 本机身份；生产必须改为 `jwt` |
+| `EMF_AUTH_JWT_ISSUER` | 空 | JWT issuer；`jwt` 模式必填 |
+| `EMF_AUTH_JWT_AUDIENCE` | 空 | API audience；`jwt` 模式必填 |
+| `EMF_AUTH_JWT_JWKS_URL` | 空 | IdP JWKS URL；`jwt` 模式必填 |
+| `EMF_AUTH_JWT_ALGORITHMS` | `RS256` | 逗号分隔的非对称签名算法 |
+| `EMF_AUTH_REQUIRED_SCOPE` | `memory` | token 必须包含的 OAuth scope |
+| `EMF_AUTH_AUDIT_HMAC_KEY` | 空 | 授权审计引用密钥；`jwt` 模式至少 32 字符 |
 | `EMF_FRONTEND_URL` | `http://127.0.0.1:33009` | 服务发现返回的前端入口 |
 | `EMF_PUBLIC_API_URL` | `http://127.0.0.1:38089` | 服务发现和文档链接使用的外部 API 地址 |
 | `EMF_CORS_ORIGINS` | 两个本机前端 Origin | 逗号分隔的精确允许来源 |
@@ -156,6 +163,28 @@ docker run --rm --name emf-frontend \
 应用不会自动加载 `.env`。Compose 已显式声明所需变量；原生运行时可参考项目根目录 `.env.example` 手动导出。
 
 生产反向代理也应配置请求体上限，且不得高于业务明确允许的值。应用层限制仍需保留，因为 `Content-Length` 可以缺失或不可信；代理限制不能替代服务对实际 ASGI 请求流的累计检查。
+
+## 生产身份与授权
+
+默认 Compose 显式使用 `EMF_AUTH_MODE=development`，只适合本机体验。设置
+开发身份只允许 `EMF_ENVIRONMENT=development` 或 `test`。其他环境如果仍使用开发身份，后端会拒绝启动；未知环境名称同样拒绝启动，避免拼写错误绕过生产门禁。
+
+JWT 模式最小配置：
+
+```bash
+export EMF_ENVIRONMENT=production
+export EMF_AUTH_MODE=jwt
+export EMF_AUTH_JWT_ISSUER='https://identity.example'
+export EMF_AUTH_JWT_AUDIENCE='evolvable-memory-api'
+export EMF_AUTH_JWT_JWKS_URL='https://identity.example/.well-known/jwks.json'
+export EMF_AUTH_JWT_ALGORITHMS='RS256'
+export EMF_AUTH_REQUIRED_SCOPE='memory'
+export EMF_AUTH_AUDIT_HMAC_KEY='load-this-from-a-secret-manager'
+```
+
+不要把审计 HMAC 密钥写入镜像、Compose 文件或 Git。JWT `memory_access` grant、角色、purpose、
+错误语义和仍未完成的生产门禁见[身份与权限设计](authorization.md)。JWT 模式可验证调用身份和
+当前 API 授权，但不会自动提供 IdP 成员治理、撤销、浏览器登录、RLS、双人审批或隐私生命周期。
 
 ## PostgreSQL 与迁移
 
@@ -190,7 +219,7 @@ uv run evolvable-memory
 当前版本缺少以下生产前置条件：
 
 1. PostgreSQL 迁移门禁、备份和恢复演练；
-2. 认证、授权与服务端可信 Scope 注入；
+2. IdP 角色治理、撤销/临时授权、增强认证、数据库 RLS 与独立授权审计存储；
 3. 同意、保留、抑制、删除和投影清理证明；
 4. 生产 CORS、TLS、反向代理、秘密管理与网络策略；
 5. 持久审计、指标、追踪、告警和 SLO；

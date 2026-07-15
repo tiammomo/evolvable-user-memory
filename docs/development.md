@@ -55,7 +55,8 @@ api / adapters  →  application  →  domain
 5. 在 `adapters/in_memory.py` 实现端口并落实一致性检查。
 6. 在 `api/schemas.py` 定义请求、响应、字段说明和示例。
 7. 在 `api/app.py` 增加薄路由。
-8. 根据需要在前端增加入口，并更新 API 与使用文档。
+8. 在 `application/security.py` 为端点定义精确 action，并通过 `AuthorizedMemoryApplication` 接入统一权限执行点。
+9. 根据需要在前端增加入口，并更新 API、权限与使用文档。
 
 ## 测试要求
 
@@ -63,6 +64,7 @@ api / adapters  →  application  →  domain
 
 - 业务规则的正常路径。
 - tenant / subject 隔离。
+- 允许角色、拒绝角色、错误 purpose 与授权审计。
 - 幂等重放与幂等内容冲突。
 - 缺失资源、非法状态或非法归因的错误路径。
 - 修订历史是否保留。
@@ -74,6 +76,7 @@ api / adapters  →  application  →  domain
 | --- | --- |
 | `tests/test_memory_application.py` | 用例语义、隔离、幂等、归因 |
 | `tests/test_api.py` | HTTP 状态、Schema、错误映射、CORS、OpenAPI |
+| `tests/test_authorization.py` | JWT claim、角色/action、Scope、purpose、失败关闭与伪名审计 |
 | `tests/test_evolution.py` | 策略边界和实验状态机 |
 | `tests/test_frontend.py` | 静态服务、入口和安全响应头 |
 | `tests/test_frontend_e2e.py` | 真实浏览器主流程、响应式布局、键盘和 Scope 迟到响应 |
@@ -122,8 +125,9 @@ uv build
 ## 安全边界
 
 - 不默认记录原始证据日志。
-- 不从不可信请求体决定生产 Scope。
+- 不从不可信请求体决定生产 Scope；JWT 目标必须被同一条 grant 覆盖。
+- tenant 管理员不自动继承记忆读取权限；原始 Evidence 使用独立高敏动作。
 - 不允许演化引擎修改访问控制、删除、保留、抑制或审计规则。
 - 添加删除能力时，需要同时处理权威状态、投影、缓存、Trace 保留与删除证明。
 
-隐私相关改动必须先对照[隐私生命周期设计](privacy-lifecycle.md)的失败关闭和验收标准；身份、隔离、outbox 或投影相关改动必须同时复核[威胁模型](threat-model.md)。这两份文档描述目标设计，不代表对应生产能力已经实现。
+身份和动作变更必须对照[身份与权限设计](authorization.md)；隐私相关改动必须先对照[隐私生命周期设计](privacy-lifecycle.md)的失败关闭和验收标准；身份、隔离、outbox 或投影相关改动必须同时复核[威胁模型](threat-model.md)。

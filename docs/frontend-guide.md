@@ -69,6 +69,10 @@
 
 ## Scope 切换
 
+当前静态工作台面向 `development` 身份模式，右上角 Scope 可编辑。JWT 生产模式需要由部署方
+提供登录/BFF 或安全 token 注入方式；项目不会把 access token 写入 `localStorage`。即使前端
+选择了 tenant/subject，后端仍会用可信 grant 检查 action、Scope 和 purpose，UI 不是权限边界。
+
 右上角输入租户和用户后，点击“应用”。前端会：
 
 1. 把 Scope 保存到浏览器 `localStorage`。
