@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -34,17 +34,20 @@ def preference(
     context: ContextSignature = EVENING,
     idempotency_key: str = "turn-1:preference-1",
     confidence: float = 0.8,
+    source: str = "conversation",
+    evidence_text: str | None = None,
+    occurred_at: datetime = NOW,
 ) -> RememberPreference:
     return RememberPreference(
         scope=scope,
-        source="conversation",
+        source=source,
         idempotency_key=idempotency_key,
         key=key,
         value=value,
         context=context,
-        evidence_text=f"I prefer {value}",
+        evidence_text=evidence_text or f"I prefer {value}",
         confidence=confidence,
-        occurred_at=NOW,
+        occurred_at=occurred_at,
     )
 
 
@@ -65,6 +68,48 @@ def test_idempotency_key_cannot_hide_different_input(harness: Harness) -> None:
 
     with pytest.raises(ConflictError, match="different preference"):
         harness.app.remember_preference(preference(value="tea"))
+
+
+@pytest.mark.parametrize(
+    ("source", "evidence_text", "confidence"),
+    [
+        ("import", "I prefer decaf coffee", 0.8),
+        ("conversation", "Decaf is my evening choice", 0.8),
+        ("conversation", "I prefer decaf coffee", 0.9),
+    ],
+)
+def test_idempotency_compares_the_complete_preference_request(
+    harness: Harness,
+    source: str,
+    evidence_text: str,
+    confidence: float,
+) -> None:
+    harness.app.remember_preference(preference())
+
+    with pytest.raises(ConflictError, match="different preference request"):
+        harness.app.remember_preference(
+            preference(
+                source=source,
+                evidence_text=evidence_text,
+                confidence=confidence,
+            )
+        )
+
+
+def test_text_normalization_keeps_idempotent_retries_stable(harness: Harness) -> None:
+    first = harness.app.remember_preference(
+        preference(
+            source=" conversation ",
+            idempotency_key=" turn-1:preference-1 ",
+            key=" drink.preference ",
+            value=" decaf coffee ",
+            evidence_text=" I prefer decaf coffee ",
+        )
+    )
+    replay = harness.app.remember_preference(preference())
+
+    assert replay.idempotent_replay is True
+    assert replay.revision_id == first.revision_id
 
 
 def test_contextual_preferences_coexist(harness: Harness) -> None:
@@ -137,10 +182,93 @@ def test_correction_preserves_history_and_recall_uses_new_head(harness: Harness)
     assert [item.revision_id for item in trace.items] == [corrected.revision_id]
 
 
+def test_correction_rejects_a_stale_expected_revision_but_allows_its_retry(
+    harness: Harness,
+) -> None:
+    original = harness.app.remember_preference(preference())
+    first_correction = CorrectPreference(
+        scope=ALICE,
+        record_id=original.record_id,
+        source="explicit-user-correction",
+        idempotency_key="turn-2:correction",
+        value="herbal tea",
+        evidence_text="I now prefer herbal tea",
+        reason="preference changed",
+        occurred_at=NOW,
+        expected_revision_id=original.revision_id,
+    )
+
+    corrected = harness.app.correct_preference(first_correction)
+    replay = harness.app.correct_preference(first_correction)
+
+    assert replay.idempotent_replay is True
+    assert replay.revision_id == corrected.revision_id
+
+    with pytest.raises(ConflictError, match="different preference request"):
+        harness.app.correct_preference(
+            CorrectPreference(
+                scope=ALICE,
+                record_id=original.record_id,
+                source="explicit-user-correction",
+                idempotency_key="turn-2:correction",
+                value="herbal tea",
+                evidence_text="I now prefer herbal tea",
+                reason="a different reason",
+                occurred_at=NOW,
+                expected_revision_id=original.revision_id,
+            )
+        )
+
+    with pytest.raises(ConflictError, match="expected revision is no longer active"):
+        harness.app.correct_preference(
+            CorrectPreference(
+                scope=ALICE,
+                record_id=original.record_id,
+                source="stale-page",
+                idempotency_key="turn-3:stale-correction",
+                value="water",
+                evidence_text="A stale page submitted water",
+                reason="stale edit",
+                occurred_at=NOW,
+                expected_revision_id=original.revision_id,
+            )
+        )
+
+    assert len(harness.app.history(ALICE, original.record_id)) == 2
+    assert harness.store.observation_count == 2
+
+
+def test_same_source_does_not_inflate_diversity_or_move_evidence_time_back(
+    harness: Harness,
+) -> None:
+    memory = harness.app.remember_preference(preference(source="conversation"))
+    harness.app.remember_preference(
+        preference(
+            source="conversation",
+            idempotency_key="turn-2:same-source",
+            occurred_at=NOW - timedelta(days=30),
+        )
+    )
+    harness.app.remember_preference(
+        preference(
+            source="profile-import",
+            idempotency_key="turn-3:new-source",
+            occurred_at=NOW - timedelta(days=10),
+        )
+    )
+
+    latest = harness.app.history(ALICE, memory.record_id)[-1]
+    assert latest.belief.source_diversity == 2
+    assert latest.belief.source_keys == ("conversation", "profile-import")
+    assert latest.belief.last_evidence_at == NOW
+
+
 def test_scope_isolation_applies_to_read_correction_and_history(harness: Harness) -> None:
     memory = harness.app.remember_preference(preference())
     other_scope = Scope("tenant-b", "alice")
 
+    assert harness.store.candidate_for_observation(ALICE, memory.observation_id) is not None
+    assert harness.store.candidate_for_observation(other_scope, memory.observation_id) is None
     trace = harness.app.recall(RecallMemory(scope=other_scope, query="drink", context=EVENING))
     assert trace.items == ()
 
@@ -203,13 +331,13 @@ def test_preference_listing_is_current_ordered_and_scope_local(harness: Harness)
 def test_recall_does_not_reinforce_belief_or_utility(harness: Harness) -> None:
     memory = harness.app.remember_preference(preference())
     before_history = harness.app.history(ALICE, memory.record_id)
-    before_utility = harness.store.utility_for(memory.revision_id, EVENING)
+    before_utility = harness.store.utility_for(ALICE, memory.revision_id, EVENING)
 
     for _ in range(3):
         harness.app.recall(RecallMemory(scope=ALICE, query="decaf coffee", context=EVENING))
 
     after_history = harness.app.history(ALICE, memory.record_id)
-    after_utility = harness.store.utility_for(memory.revision_id, EVENING)
+    after_utility = harness.store.utility_for(ALICE, memory.revision_id, EVENING)
     assert after_history == before_history
     assert after_utility == before_utility
     assert before_utility.mean == 0.5
@@ -236,6 +364,51 @@ def test_attributable_outcome_updates_contextual_utility_once(harness: Harness) 
     assert first.utility.mean == pytest.approx(2 / 3)
     assert replay.utility == first.utility
     assert harness.store.outcome_count == 1
+
+
+def test_outcome_idempotency_normalizes_text_and_rejects_a_changed_note(
+    harness: Harness,
+) -> None:
+    memory = harness.app.remember_preference(preference())
+    trace = harness.app.recall(RecallMemory(scope=ALICE, query="decaf coffee", context=EVENING))
+    first = harness.app.record_outcome(
+        RecordOutcome(
+            scope=ALICE,
+            trace_id=trace.id,
+            revision_id=memory.revision_id,
+            kind=OutcomeKind.HELPFUL,
+            idempotency_key=" outcome-1 ",
+            occurred_at=NOW,
+            note=" accepted ",
+        )
+    )
+    replay = harness.app.record_outcome(
+        RecordOutcome(
+            scope=ALICE,
+            trace_id=trace.id,
+            revision_id=memory.revision_id,
+            kind=OutcomeKind.HELPFUL,
+            idempotency_key="outcome-1",
+            occurred_at=NOW + timedelta(seconds=1),
+            note="accepted",
+        )
+    )
+
+    assert first.idempotent_replay is False
+    assert replay.idempotent_replay is True
+
+    with pytest.raises(ConflictError, match="different data"):
+        harness.app.record_outcome(
+            RecordOutcome(
+                scope=ALICE,
+                trace_id=trace.id,
+                revision_id=memory.revision_id,
+                kind=OutcomeKind.HELPFUL,
+                idempotency_key="outcome-1",
+                occurred_at=NOW,
+                note="rejected later",
+            )
+        )
 
 
 def test_outcome_requires_trace_membership_and_scope(harness: Harness) -> None:
@@ -283,4 +456,12 @@ def test_negative_outcome_reduces_only_matching_context_utility(harness: Harness
 
     morning = ContextSignature.from_mapping({"time_of_day": "morning"})
     assert outcome.utility.mean == 0.25
-    assert harness.store.utility_for(memory.revision_id, morning).mean == 0.5
+    assert harness.store.utility_for(ALICE, memory.revision_id, morning).mean == 0.5
+    assert (
+        harness.store.utility_for(
+            Scope("tenant-b", "alice"),
+            memory.revision_id,
+            EVENING,
+        ).mean
+        == 0.5
+    )

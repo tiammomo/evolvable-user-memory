@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from evolvable_memory.application.commands import OutcomeResult, PreferenceResult
 from evolvable_memory.domain.experience import OutcomeKind, RecallTrace, UtilityEstimate
@@ -13,26 +13,88 @@ from evolvable_memory.domain.memory import MemoryRevision, MemorySnapshot
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 OutcomeWeight = Annotated[float, Field(gt=0.0, le=10.0)]
 
+MAX_SCOPE_ID_LENGTH = 128
+MAX_SOURCE_LENGTH = 128
+MAX_IDEMPOTENCY_KEY_LENGTH = 256
+MAX_MEMORY_KEY_LENGTH = 256
+MAX_MEMORY_VALUE_LENGTH = 4_096
+MAX_EVIDENCE_TEXT_LENGTH = 16_384
+MAX_CONTEXT_FACETS = 32
+MAX_CONTEXT_KEY_LENGTH = 128
+MAX_CONTEXT_VALUE_LENGTH = 512
+MAX_REASON_LENGTH = 2_048
+MAX_QUERY_LENGTH = 4_096
+MAX_NOTE_LENGTH = 4_096
+
+ScopeId = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_SCOPE_ID_LENGTH),
+]
+SourceText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_SOURCE_LENGTH),
+]
+IdempotencyKey = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_IDEMPOTENCY_KEY_LENGTH,
+    ),
+]
+MemoryKey = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_MEMORY_KEY_LENGTH),
+]
+MemoryValue = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_MEMORY_VALUE_LENGTH),
+]
+EvidenceText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_EVIDENCE_TEXT_LENGTH),
+]
+ContextKey = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=MAX_CONTEXT_KEY_LENGTH),
+]
+ContextValue = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=MAX_CONTEXT_VALUE_LENGTH),
+]
+ContextMap = Annotated[dict[ContextKey, ContextValue], Field(max_length=MAX_CONTEXT_FACETS)]
+ReasonText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_REASON_LENGTH),
+]
+QueryText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_QUERY_LENGTH),
+]
+NoteText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=MAX_NOTE_LENGTH),
+]
+
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
 class PreferenceWriteRequest(ApiModel):
-    tenant_id: str = Field(min_length=1, description="开发环境租户作用域。")
-    subject_id: str = Field(min_length=1, description="租户内的用户或主体标识。")
-    source: str = Field(min_length=1, description="证据来源, 例如 conversation。")
-    idempotency_key: str = Field(
-        min_length=1,
+    tenant_id: ScopeId = Field(description="开发环境租户作用域。")
+    subject_id: ScopeId = Field(description="租户内的用户或主体标识。")
+    source: SourceText = Field(description="证据来源, 例如 conversation。")
+    idempotency_key: IdempotencyKey = Field(
         description="作用域内唯一的幂等键; 重试必须复用, 新的事实必须更换。",
     )
-    key: str = Field(min_length=1, description="稳定的记忆键, 建议使用点分命名。")
-    value: str = Field(min_length=1, description="根据证据得出的当前偏好值。")
-    context: dict[str, str] = Field(
+    key: MemoryKey = Field(description="稳定的记忆键, 建议使用点分命名。")
+    value: MemoryValue = Field(description="根据证据得出的当前偏好值。")
+    context: ContextMap = Field(
         default_factory=dict,
         description="偏好成立的上下文维度; 键和值都参与匹配。",
     )
-    evidence_text: str = Field(min_length=1, description="用户或来源的原始证据文本。")
+    evidence_text: EvidenceText = Field(description="用户或来源的原始证据文本。")
     confidence: Confidence = 0.80
     occurred_at: datetime | None = Field(
         default=None,
@@ -58,14 +120,18 @@ class PreferenceWriteRequest(ApiModel):
 
 
 class PreferenceCorrectionRequest(ApiModel):
-    tenant_id: str = Field(min_length=1)
-    subject_id: str = Field(min_length=1)
-    source: str = Field(min_length=1)
-    idempotency_key: str = Field(min_length=1)
-    value: str = Field(min_length=1)
-    evidence_text: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    source: SourceText
+    idempotency_key: IdempotencyKey
+    value: MemoryValue
+    evidence_text: EvidenceText
+    reason: ReasonText
     occurred_at: datetime | None = None
+    expected_revision_id: UUID | None = Field(
+        default=None,
+        description="可选的乐观并发条件; 当前修订不匹配时返回 409。",
+    )
 
     model_config = ConfigDict(
         extra="forbid",
@@ -134,10 +200,10 @@ class PreferenceSummaryResponse(ApiModel):
 
 
 class RecallRequest(ApiModel):
-    tenant_id: str = Field(min_length=1)
-    subject_id: str = Field(min_length=1)
-    query: str = Field(min_length=1)
-    context: dict[str, str] = Field(default_factory=dict)
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    query: QueryText
+    context: ContextMap = Field(default_factory=dict)
     limit: int = Field(default=10, ge=1, le=100)
 
     model_config = ConfigDict(
@@ -212,15 +278,15 @@ class RecallResponse(ApiModel):
 
 
 class OutcomeWriteRequest(ApiModel):
-    tenant_id: str = Field(min_length=1)
-    subject_id: str = Field(min_length=1)
+    tenant_id: ScopeId
+    subject_id: ScopeId
     trace_id: UUID
     revision_id: UUID
     kind: OutcomeKind
-    idempotency_key: str = Field(min_length=1)
+    idempotency_key: IdempotencyKey
     occurred_at: datetime | None = None
     weight: OutcomeWeight = 1.0
-    note: str | None = None
+    note: NoteText | None = None
 
     model_config = ConfigDict(
         extra="forbid",
@@ -306,6 +372,7 @@ class RevisionResponse(ApiModel):
 class ErrorResponse(ApiModel):
     error: str
     detail: str
+    request_id: str | None = None
 
 
 class ServiceInfoResponse(ApiModel):

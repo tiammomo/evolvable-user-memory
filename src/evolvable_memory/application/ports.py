@@ -7,6 +7,7 @@ from uuid import UUID
 
 from evolvable_memory.domain.common import ContextSignature, Scope
 from evolvable_memory.domain.evidence import Candidate, EvidenceSpan, Observation
+from evolvable_memory.domain.evolution import StrategySnapshot
 from evolvable_memory.domain.experience import (
     OutcomeEvent,
     RecallTrace,
@@ -29,7 +30,13 @@ class IdGenerator(Protocol):
 
 
 class MemoryStore(Protocol):
+    def close(self) -> None: ...
+
+    def is_ready(self) -> bool: ...
+
     def transaction(self) -> AbstractContextManager[None]: ...
+
+    def save_strategy(self, strategy: StrategySnapshot) -> None: ...
 
     def observation_by_idempotency(
         self, scope: Scope, idempotency_key: str
@@ -42,7 +49,11 @@ class MemoryStore(Protocol):
         candidate: Candidate,
     ) -> None: ...
 
-    def candidate_for_observation(self, observation_id: UUID) -> Candidate | None: ...
+    def candidate_for_observation(
+        self,
+        scope: Scope,
+        observation_id: UUID,
+    ) -> Candidate | None: ...
 
     def update_candidate(self, candidate: Candidate) -> None: ...
 
@@ -80,6 +91,7 @@ class MemoryStore(Protocol):
 
     def utility_for(
         self,
+        scope: Scope,
         revision_id: UUID,
         context: ContextSignature,
     ) -> UtilityEstimate: ...

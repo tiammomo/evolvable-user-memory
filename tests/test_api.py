@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import json
+import logging
+from collections.abc import Iterator
+
+import pytest
 from fastapi.testclient import TestClient
 
 from conftest import Harness
 from evolvable_memory.api.app import create_app
+from evolvable_memory.api.schemas import (
+    MAX_CONTEXT_FACETS,
+    MAX_CONTEXT_KEY_LENGTH,
+    MAX_CONTEXT_VALUE_LENGTH,
+    MAX_MEMORY_VALUE_LENGTH,
+    MAX_NOTE_LENGTH,
+    MAX_QUERY_LENGTH,
+)
+from evolvable_memory.config import Settings
 
 
 def test_http_vertical_slice(harness: Harness) -> None:
@@ -106,12 +120,89 @@ def test_http_maps_domain_errors_and_validates_payload(harness: Harness) -> None
 
     assert missing.status_code == 404
     assert missing.json()["error"] == "NotFoundError"
+    assert missing.json()["request_id"] == missing.headers["x-request-id"]
     assert invalid.status_code == 422
+
+
+def test_http_rejects_oversized_text_and_context_inputs(harness: Harness) -> None:
+    client = TestClient(create_app(harness.app))
+    preference_payload = {
+        "tenant_id": "tenant-a",
+        "subject_id": "alice",
+        "source": "conversation",
+        "idempotency_key": "bounded-input",
+        "key": "drink.preference",
+        "value": "decaf coffee",
+        "context": {"time_of_day": "evening"},
+        "evidence_text": "I prefer decaf coffee",
+        "confidence": 0.8,
+    }
+
+    oversized_value = client.post(
+        "/v1/preferences",
+        json={**preference_payload, "value": "x" * (MAX_MEMORY_VALUE_LENGTH + 1)},
+    )
+    too_many_facets = client.post(
+        "/v1/preferences",
+        json={
+            **preference_payload,
+            "context": {f"facet-{index}": "value" for index in range(MAX_CONTEXT_FACETS + 1)},
+        },
+    )
+    oversized_context_key = client.post(
+        "/v1/preferences",
+        json={
+            **preference_payload,
+            "context": {"k" * (MAX_CONTEXT_KEY_LENGTH + 1): "value"},
+        },
+    )
+    oversized_context_value = client.post(
+        "/v1/preferences",
+        json={
+            **preference_payload,
+            "context": {"facet": "v" * (MAX_CONTEXT_VALUE_LENGTH + 1)},
+        },
+    )
+    oversized_query = client.post(
+        "/v1/recall",
+        json={
+            "tenant_id": "tenant-a",
+            "subject_id": "alice",
+            "query": "q" * (MAX_QUERY_LENGTH + 1),
+        },
+    )
+    oversized_note = client.post(
+        "/v1/outcomes",
+        json={
+            "tenant_id": "tenant-a",
+            "subject_id": "alice",
+            "trace_id": "00000000-0000-0000-0000-000000000001",
+            "revision_id": "00000000-0000-0000-0000-000000000002",
+            "kind": "helpful",
+            "idempotency_key": "oversized-note",
+            "note": "n" * (MAX_NOTE_LENGTH + 1),
+        },
+    )
+
+    assert {
+        oversized_value.status_code,
+        too_many_facets.status_code,
+        oversized_context_key.status_code,
+        oversized_context_value.status_code,
+        oversized_query.status_code,
+        oversized_note.status_code,
+    } == {422}
 
 
 def test_health(harness: Harness) -> None:
     client = TestClient(create_app(harness.app))
-    assert client.get("/health").json() == {"status": "ok", "version": "0.1.0"}
+    assert client.get("/health").json() == {
+        "status": "ok",
+        "version": "0.1.0",
+        "storage": "memory",
+    }
+    assert client.get("/livez").json() == {"status": "ok"}
+    assert client.get("/readyz").json() == {"status": "ready", "storage": "memory"}
 
 
 def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harness) -> None:
@@ -127,6 +218,8 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
     assert schema["paths"]["/v1/recall"]["post"]["summary"] == "执行上下文记忆召回"
     outcome_schema = schema["components"]["schemas"]["OutcomeWriteRequest"]
     assert outcome_schema["example"]["kind"] == "helpful"
+    correction_schema = schema["components"]["schemas"]["PreferenceCorrectionRequest"]
+    assert "expected_revision_id" in correction_schema["properties"]
 
 
 def test_frontend_origin_is_allowed_by_cors(harness: Harness) -> None:
@@ -137,8 +230,12 @@ def test_frontend_origin_is_allowed_by_cors(harness: Harness) -> None:
         headers={
             "Origin": "http://127.0.0.1:33009",
             "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "content-type",
+            "Access-Control-Request-Headers": "content-type,x-request-id",
         },
+    )
+    allowed = client.get(
+        "/health",
+        headers={"Origin": "http://127.0.0.1:33009"},
     )
     disallowed = client.get(
         "/health",
@@ -147,4 +244,146 @@ def test_frontend_origin_is_allowed_by_cors(harness: Harness) -> None:
 
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == "http://127.0.0.1:33009"
+    assert "x-request-id" in preflight.headers["access-control-allow-headers"].lower()
+    assert allowed.headers["access-control-expose-headers"].lower() == "x-request-id"
     assert "access-control-allow-origin" not in disallowed.headers
+
+
+def test_request_ids_security_headers_and_metadata_only_access_logs(
+    harness: Harness,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = TestClient(create_app(harness.app))
+    request_id = "caller.request-42"
+    secret_evidence = "raw-evidence-must-not-appear-in-logs"
+
+    with caplog.at_level(logging.INFO, logger="evolvable_memory.access"):
+        response = client.post(
+            "/v1/preferences?query-secret=must-not-appear",
+            headers={"X-Request-ID": request_id},
+            json={
+                "tenant_id": "tenant-a",
+                "subject_id": "alice",
+                "source": "conversation",
+                "idempotency_key": "request-metadata-test",
+                "key": "logging.preference",
+                "value": "quiet",
+                "context": {},
+                "evidence_text": secret_evidence,
+                "confidence": 0.8,
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.headers["x-request-id"] == request_id
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["permissions-policy"] == "camera=(), microphone=(), geolocation=()"
+
+    access_records = [
+        record for record in caplog.records if record.name == "evolvable_memory.access"
+    ]
+    assert access_records
+    access_log = json.loads(access_records[-1].getMessage())
+    assert access_log["event"] == "http_request"
+    assert access_log["request_id"] == request_id
+    assert access_log["method"] == "POST"
+    assert access_log["route"] == "/v1/preferences"
+    assert access_log["status_code"] == 201
+    assert "query" not in access_log
+    assert secret_evidence not in access_records[-1].getMessage()
+    assert "query-secret" not in access_records[-1].getMessage()
+
+    generated = client.get("/health", headers={"X-Request-ID": "not valid spaces"})
+    generated_id = generated.headers["x-request-id"]
+    assert generated_id != "not valid spaces"
+    assert len(generated_id) == 32
+    assert generated_id.isalnum()
+
+
+def test_request_body_limit_checks_content_length_and_streamed_bytes(
+    harness: Harness,
+) -> None:
+    settings = Settings(max_request_body_bytes=128)
+    client = TestClient(create_app(harness.app, settings=settings))
+
+    normal = client.post(
+        "/v1/recall",
+        headers={"X-Request-ID": "normal-body"},
+        json={"tenant_id": "t", "subject_id": "s", "query": "q"},
+    )
+    declared_too_large = client.post(
+        "/v1/recall",
+        headers={
+            "Content-Length": "129",
+            "Content-Type": "application/json",
+            "X-Request-ID": "declared-too-large",
+        },
+        content=b"{}",
+    )
+
+    def oversized_chunks() -> Iterator[bytes]:
+        yield b'{"tenant_id":"t","subject_id":"s","query":"'
+        yield b"x" * 100
+        yield b'"}'
+
+    streamed_too_large = client.post(
+        "/v1/recall",
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-ID": "streamed-too-large",
+        },
+        content=oversized_chunks(),
+    )
+
+    assert normal.status_code == 200
+    for response, request_id in (
+        (declared_too_large, "declared-too-large"),
+        (streamed_too_large, "streamed-too-large"),
+    ):
+        assert response.status_code == 413
+        assert response.headers["x-request-id"] == request_id
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.json() == {
+            "error": "RequestBodyTooLargeError",
+            "detail": "Request body exceeds the configured limit of 128 bytes.",
+            "request_id": request_id,
+        }
+
+
+def test_unhandled_errors_return_safe_correlated_responses_and_logs(
+    harness: Harness,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    application = create_app(harness.app)
+    leaked_detail = "raw-evidence-must-never-escape"
+
+    @application.get("/_test/unhandled")
+    def unhandled() -> None:
+        raise RuntimeError(leaked_detail)
+
+    client = TestClient(application)
+    with caplog.at_level(logging.INFO):
+        response = client.get(
+            "/_test/unhandled?private-query=do-not-log",
+            headers={"X-Request-ID": "failed-request"},
+        )
+
+    assert response.status_code == 500
+    assert response.headers["x-request-id"] == "failed-request"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.json() == {
+        "error": "InternalServerError",
+        "detail": "An unexpected server error occurred.",
+        "request_id": "failed-request",
+    }
+    runtime_logs = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("evolvable_memory.")
+    )
+    assert leaked_detail not in runtime_logs
+    assert "private-query" not in runtime_logs
+    assert '"exception_type":"RuntimeError"' in runtime_logs

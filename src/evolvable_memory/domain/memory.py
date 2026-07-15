@@ -37,6 +37,7 @@ class BeliefState:
     contradiction_count: int
     source_diversity: int
     last_evidence_at: datetime
+    source_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.confidence <= 1.0:
@@ -46,17 +47,42 @@ class BeliefState:
         object.__setattr__(
             self, "last_evidence_at", require_utc(self.last_evidence_at, "last_evidence_at")
         )
+        canonical_sources = tuple(
+            sorted({require_text(source, "belief source") for source in self.source_keys})
+        )
+        if canonical_sources and self.source_diversity != len(canonical_sources):
+            raise DomainError("source_diversity must match the number of known sources")
+        object.__setattr__(self, "source_keys", canonical_sources)
 
-    def reinforced(self, evidence_confidence: float, at: datetime) -> BeliefState:
+    def reinforced(
+        self,
+        evidence_confidence: float,
+        at: datetime,
+        *,
+        source: str | None = None,
+    ) -> BeliefState:
         if not 0.0 <= evidence_confidence <= 1.0:
             raise DomainError("evidence confidence must be between 0 and 1")
+        evidence_at = require_utc(at, "evidence_at")
         combined = 1.0 - ((1.0 - self.confidence) * (1.0 - evidence_confidence))
+        sources = set(self.source_keys)
+        if source is not None:
+            sources.add(require_text(source, "belief source"))
+        canonical_sources = tuple(sorted(sources))
+        # Legacy states may only carry the aggregate count. In that case, retain the
+        # count rather than guessing that an untracked source is new.
+        source_diversity = (
+            len(canonical_sources)
+            if self.source_keys
+            else max(self.source_diversity, len(canonical_sources))
+        )
         return BeliefState(
             confidence=min(0.995, combined),
             support_count=self.support_count + 1,
             contradiction_count=self.contradiction_count,
-            source_diversity=self.source_diversity + 1,
-            last_evidence_at=at,
+            source_diversity=source_diversity,
+            last_evidence_at=max(self.last_evidence_at, evidence_at),
+            source_keys=canonical_sources if self.source_keys else (),
         )
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -8,7 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from evolvable_memory.adapters.in_memory import InMemoryMemoryStore
+from evolvable_memory.adapters.postgres import PostgresMemoryStore
 from evolvable_memory.adapters.system import SystemClock, Uuid4Generator
+from evolvable_memory.api.middleware import ApiRuntimeMiddleware, RequestBodyTooLargeError
 from evolvable_memory.api.schemas import (
     ErrorResponse,
     OutcomeResponse,
@@ -28,7 +32,9 @@ from evolvable_memory.application.commands import (
     RecordOutcome,
     RememberPreference,
 )
+from evolvable_memory.application.ports import MemoryStore
 from evolvable_memory.application.service import MemoryApplication
+from evolvable_memory.config import Settings
 from evolvable_memory.domain.common import (
     AttributionError,
     ConflictError,
@@ -58,29 +64,63 @@ _OPENAPI_TAGS = [
 ]
 
 
-def create_app(application: MemoryApplication | None = None) -> FastAPI:
-    service = application or MemoryApplication(
-        store=InMemoryMemoryStore(),
-        clock=SystemClock(),
-        ids=Uuid4Generator(),
-    )
+def create_app(
+    application: MemoryApplication | None = None,
+    settings: Settings | None = None,
+) -> FastAPI:
+    runtime = settings or Settings.from_environment()
+    owns_application = application is None
+    service = application or _build_application(runtime)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        yield
+        if owns_application:
+            service.close()
+
     app = FastAPI(
         title="Evolvable User Memory",
         version="0.1.0",
         description=(
             "一套证据驱动、结果感知的上下文记忆服务。\n\n"
             "推荐体验顺序: **写入偏好 → 查看当前记忆 → 召回 → 提交结果 → 修正并查看历史**。\n\n"
-            "当前版本使用进程内存, 仅用于开发和语义验证; 重启会清空数据。"
+            + (
+                "当前运行于进程内存模式, 仅用于开发和语义验证; 重启会清空数据。"
+                if runtime.store == "memory"
+                else "当前使用 PostgreSQL 权威存储; 仍需生产认证和隐私治理后才能接入真实数据。"
+            )
         ),
         openapi_tags=_OPENAPI_TAGS,
+        lifespan=lifespan,
     )
     app.state.memory_application = service
+    app.state.settings = runtime
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://127.0.0.1:33009", "http://localhost:33009"],
+        allow_origins=list(runtime.cors_origins),
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type"],
+        allow_headers=["Content-Type", "X-Request-ID"],
+        expose_headers=["X-Request-ID"],
     )
+    app.add_middleware(
+        ApiRuntimeMiddleware,
+        max_request_body_bytes=runtime.max_request_body_bytes,
+    )
+
+    @app.exception_handler(RequestBodyTooLargeError)
+    async def request_too_large_handler(
+        request: Request,
+        exc: RequestBodyTooLargeError,
+    ) -> JSONResponse:
+        body = ErrorResponse(
+            error=type(exc).__name__,
+            detail=str(exc.detail),
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            content=body.model_dump(mode="json"),
+        )
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(_request: Request, exc: DomainError) -> JSONResponse:
@@ -92,7 +132,11 @@ def create_app(application: MemoryApplication | None = None) -> FastAPI:
             code = status.HTTP_422_UNPROCESSABLE_CONTENT
         else:
             code = status.HTTP_400_BAD_REQUEST
-        body = ErrorResponse(error=type(exc).__name__, detail=str(exc))
+        body = ErrorResponse(
+            error=type(exc).__name__,
+            detail=str(exc),
+            request_id=getattr(_request.state, "request_id", None),
+        )
         return JSONResponse(status_code=code, content=body.model_dump(mode="json"))
 
     @app.get(
@@ -107,16 +151,35 @@ def create_app(application: MemoryApplication | None = None) -> FastAPI:
             name="Evolvable User Memory",
             version="0.1.0",
             status="ok",
-            storage="memory",
-            frontend_url="http://127.0.0.1:33009",
-            documentation_url="http://127.0.0.1:38089/docs",
+            storage=runtime.store,
+            frontend_url=runtime.frontend_url,
+            documentation_url=f"{runtime.public_api_url.rstrip('/')}/docs",
             production_ready=False,
-            notice="Development contract: data is cleared when the backend restarts.",
+            notice=(
+                "Development contract: data is cleared when the backend restarts."
+                if runtime.store == "memory"
+                else (
+                    "PostgreSQL authority enabled; authentication and privacy policy "
+                    "remain required."
+                )
+            ),
         )
 
     @app.get("/health", tags=["operations"], summary="检查服务存活状态")
     def health() -> dict[str, str]:
-        return {"status": "ok", "version": "0.1.0"}
+        return {"status": "ok", "version": "0.1.0", "storage": runtime.store}
+
+    @app.get("/livez", tags=["operations"], summary="检查进程存活状态")
+    def livez() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/readyz", tags=["operations"], summary="检查依赖就绪状态")
+    def readyz() -> JSONResponse:
+        ready = service.is_ready()
+        return JSONResponse(
+            status_code=status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "ready" if ready else "not_ready", "storage": runtime.store},
+        )
 
     @app.post(
         "/v1/preferences",
@@ -165,6 +228,7 @@ def create_app(application: MemoryApplication | None = None) -> FastAPI:
                 value=request.value,
                 evidence_text=request.evidence_text,
                 reason=request.reason,
+                expected_revision_id=request.expected_revision_id,
                 occurred_at=_occurred_at(request.occurred_at),
             )
         )
@@ -242,6 +306,21 @@ def create_app(application: MemoryApplication | None = None) -> FastAPI:
         return OutcomeResponse.from_result(result)
 
     return app
+
+
+def _build_application(settings: Settings) -> MemoryApplication:
+    store: MemoryStore
+    if settings.store == "postgres":
+        if settings.database_url is None:
+            raise RuntimeError("database_url was not validated")
+        store = PostgresMemoryStore(
+            settings.database_url,
+            min_size=settings.database_pool_min_size,
+            max_size=settings.database_pool_max_size,
+        )
+    else:
+        store = InMemoryMemoryStore()
+    return MemoryApplication(store=store, clock=SystemClock(), ids=Uuid4Generator())
 
 
 def _occurred_at(value: datetime | None) -> datetime:

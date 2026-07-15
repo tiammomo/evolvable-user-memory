@@ -67,10 +67,17 @@ class MemoryApplication:
             recency_half_life_days=180.0,
             created_at=clock.now(),
         )
+        self._store.save_strategy(self._policy)
 
     @property
     def retrieval_policy(self) -> StrategySnapshot:
         return self._policy
+
+    def is_ready(self) -> bool:
+        return self._store.is_ready()
+
+    def close(self) -> None:
+        self._store.close()
 
     def remember_preference(self, command: RememberPreference) -> PreferenceResult:
         with self._store.transaction():
@@ -79,10 +86,14 @@ class MemoryApplication:
             )
             if existing is not None:
                 return self._existing_preference_result(
-                    existing.id,
+                    existing,
+                    expected_kind=ObservationKind.MESSAGE,
+                    source=command.source,
                     key=command.key,
                     value=command.value,
                     context_fingerprint=command.context.fingerprint,
+                    evidence_text=command.evidence_text,
+                    confidence=command.confidence,
                 )
 
             now = self._clock.now()
@@ -114,8 +125,29 @@ class MemoryApplication:
                 confidence=command.confidence,
                 proposed_at=now,
             )
-            self._store.save_ingestion(observation, evidence, candidate)
-            result = self._accept_candidate(candidate, valid_from=command.occurred_at)
+            try:
+                self._store.save_ingestion(observation, evidence, candidate)
+            except ConflictError:
+                concurrent = self._store.observation_by_idempotency(
+                    command.scope, command.idempotency_key
+                )
+                if concurrent is None:
+                    raise
+                return self._existing_preference_result(
+                    concurrent,
+                    expected_kind=ObservationKind.MESSAGE,
+                    source=command.source,
+                    key=command.key,
+                    value=command.value,
+                    context_fingerprint=command.context.fingerprint,
+                    evidence_text=command.evidence_text,
+                    confidence=command.confidence,
+                )
+            result = self._accept_candidate(
+                candidate,
+                valid_from=command.occurred_at,
+                source=command.source,
+            )
             return result
 
     def correct_preference(self, command: CorrectPreference) -> PreferenceResult:
@@ -131,11 +163,22 @@ class MemoryApplication:
             )
             if existing is not None:
                 return self._existing_preference_result(
-                    existing.id,
+                    existing,
+                    expected_kind=ObservationKind.USER_FEEDBACK,
+                    source=command.source,
                     key=current.record.key,
                     value=command.value,
                     context_fingerprint=current.record.context.fingerprint,
+                    evidence_text=command.evidence_text,
+                    confidence=1.0,
+                    expected_record_id=command.record_id,
+                    correction_reason=command.reason,
                 )
+            if (
+                command.expected_revision_id is not None
+                and current.revision.id != command.expected_revision_id
+            ):
+                raise ConflictError("expected revision is no longer active")
 
             now = self._clock.now()
             observation = Observation(
@@ -169,10 +212,30 @@ class MemoryApplication:
                 confidence=1.0,
                 proposed_at=now,
             )
-            self._store.save_ingestion(observation, evidence, candidate)
+            try:
+                self._store.save_ingestion(observation, evidence, candidate)
+            except ConflictError:
+                concurrent = self._store.observation_by_idempotency(
+                    command.scope, command.idempotency_key
+                )
+                if concurrent is None:
+                    raise
+                return self._existing_preference_result(
+                    concurrent,
+                    expected_kind=ObservationKind.USER_FEEDBACK,
+                    source=command.source,
+                    key=current.record.key,
+                    value=command.value,
+                    context_fingerprint=current.record.context.fingerprint,
+                    evidence_text=command.evidence_text,
+                    confidence=1.0,
+                    expected_record_id=command.record_id,
+                    correction_reason=command.reason,
+                )
             return self._accept_candidate(
                 candidate,
                 valid_from=command.occurred_at,
+                source=command.source,
                 reason=command.reason,
                 expected_record_id=command.record_id,
             )
@@ -192,7 +255,7 @@ class MemoryApplication:
             semantic = _lexical_similarity(query, f"{record.key} {revision.value}")
             context = record.context.similarity(command.context)
             belief = revision.belief.confidence
-            utility = self._store.utility_for(revision.id, command.context).mean
+            utility = self._store.utility_for(command.scope, revision.id, command.context).mean
             age_days = max(
                 0.0,
                 (now - revision.belief.last_evidence_at).total_seconds() / 86_400.0,
@@ -259,6 +322,8 @@ class MemoryApplication:
                 note=command.note,
             )
             stored, utility, created = self._store.apply_outcome(outcome, trace.context)
+            if not created and stored.note != outcome.note:
+                raise ConflictError("outcome idempotency key was reused with different data")
             return OutcomeResult(
                 outcome=stored,
                 utility=utility,
@@ -292,6 +357,7 @@ class MemoryApplication:
         candidate: Candidate,
         *,
         valid_from: datetime,
+        source: str,
         reason: str | None = None,
         expected_record_id: UUID | None = None,
     ) -> PreferenceResult:
@@ -319,6 +385,7 @@ class MemoryApplication:
                     contradiction_count=0,
                     source_diversity=1,
                     last_evidence_at=valid_from,
+                    source_keys=(source,),
                 ),
                 evidence_ids=candidate.evidence_ids,
                 valid_from=valid_from,
@@ -337,7 +404,11 @@ class MemoryApplication:
             if expected_record_id is not None and current.record.id != expected_record_id:
                 raise ConflictError("correction target does not match active memory identity")
             if current.revision.value == candidate.value:
-                belief = current.revision.belief.reinforced(candidate.confidence, valid_from)
+                belief = current.revision.belief.reinforced(
+                    candidate.confidence,
+                    valid_from,
+                    source=source,
+                )
                 evidence_ids = current.revision.evidence_ids + candidate.evidence_ids
             else:
                 belief = BeliefState(
@@ -346,6 +417,7 @@ class MemoryApplication:
                     contradiction_count=0,
                     source_diversity=1,
                     last_evidence_at=valid_from,
+                    source_keys=(source,),
                 )
                 evidence_ids = candidate.evidence_ids
             record = current.record
@@ -387,25 +459,43 @@ class MemoryApplication:
 
     def _existing_preference_result(
         self,
-        observation_id: UUID,
+        observation: Observation,
         *,
+        expected_kind: ObservationKind,
+        source: str,
         key: str,
         value: str,
         context_fingerprint: str,
+        evidence_text: str,
+        confidence: float,
+        expected_record_id: UUID | None = None,
+        correction_reason: str | None = None,
     ) -> PreferenceResult:
-        candidate = self._store.candidate_for_observation(observation_id)
+        candidate = self._store.candidate_for_observation(observation.scope, observation.id)
         if (
             candidate is None
             or candidate.accepted_record_id is None
             or candidate.accepted_revision_id is None
         ):
             raise ConflictError("idempotency key belongs to an incomplete ingestion")
+        # occurred_at is intentionally excluded: the HTTP boundary supplies the current
+        # time when callers omit it, so a safe network retry may carry a different value.
+        # The stable, caller-controlled business fields below form the replay identity.
         if (
-            candidate.key != key
+            observation.kind is not expected_kind
+            or observation.source != source
+            or observation.content != evidence_text
+            or candidate.key != key
             or candidate.value != value
             or candidate.context.fingerprint != context_fingerprint
+            or candidate.confidence != confidence
+            or (
+                expected_record_id is not None
+                and candidate.accepted_record_id != expected_record_id
+            )
+            or dict(observation.metadata).get("correction_reason") != correction_reason
         ):
-            raise ConflictError("idempotency key was reused for a different preference")
+            raise ConflictError("idempotency key was reused for a different preference request")
         snapshot = self._store.snapshot(candidate.scope, candidate.accepted_record_id)
         history = self._store.revision_history(candidate.scope, candidate.accepted_record_id)
         matching = next(
@@ -415,7 +505,7 @@ class MemoryApplication:
         if snapshot is None or matching is None:
             raise ConflictError("accepted idempotent result is no longer resolvable")
         return PreferenceResult(
-            observation_id=observation_id,
+            observation_id=observation.id,
             candidate_id=candidate.id,
             record_id=candidate.accepted_record_id,
             revision_id=candidate.accepted_revision_id,

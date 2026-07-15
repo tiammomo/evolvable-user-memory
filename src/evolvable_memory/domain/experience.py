@@ -5,7 +5,13 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
-from evolvable_memory.domain.common import ContextSignature, DomainError, Scope, require_utc
+from evolvable_memory.domain.common import (
+    ContextSignature,
+    DomainError,
+    Scope,
+    require_text,
+    require_utc,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,11 +97,17 @@ class OutcomeEvent:
     note: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.idempotency_key.strip():
-            raise DomainError("outcome idempotency_key must not be blank")
+        object.__setattr__(
+            self,
+            "idempotency_key",
+            require_text(self.idempotency_key, "outcome idempotency_key"),
+        )
         if not 0.0 < self.weight <= 10.0:
             raise DomainError("outcome weight must be in (0, 10]")
         object.__setattr__(self, "occurred_at", require_utc(self.occurred_at, "occurred_at"))
+        if self.note is not None:
+            normalized = self.note.strip()
+            object.__setattr__(self, "note", normalized or None)
 
 
 @dataclass(frozen=True, slots=True)

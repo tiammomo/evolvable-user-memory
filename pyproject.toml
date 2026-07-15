@@ -21,14 +21,19 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "alembic>=1.15,<2",
     "fastapi>=0.115,<1",
+    "psycopg[binary,pool]>=3.2,<4",
+    "pydantic>=2.10,<3",
     "uvicorn>=0.34,<1",
 ]
 
 [dependency-groups]
 dev = [
     "httpx>=0.28,<1",
+    "httpx2>=2.7,<3",
     "mypy>=1.15,<2",
+    "playwright>=1.52,<2",
     "pytest>=8.3,<10",
     "pytest-cov>=6,<8",
     "ruff>=0.11,<1",
@@ -37,6 +42,7 @@ dev = [
 [project.scripts]
 evolvable-memory = "evolvable_memory.main:run"
 evolvable-memory-frontend = "evolvable_memory.frontend:run"
+evolvable-memory-migrate = "evolvable_memory.migrate:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evolvable_memory"]
@@ -44,10 +50,19 @@ packages = ["src/evolvable_memory"]
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers --cov=evolvable_memory --cov-report=term-missing"
 testpaths = ["tests"]
+markers = [
+    "browser: Playwright browser E2E tests (skip safely when Chromium is unavailable)",
+    "postgres: integration tests requiring EMF_TEST_DATABASE_URL",
+]
 
 [tool.coverage.run]
 branch = true
 source = ["evolvable_memory"]
+omit = [
+    "src/evolvable_memory/adapters/postgres.py",
+    "src/evolvable_memory/migrate.py",
+    "src/evolvable_memory/migrations/*",
+]
 
 [tool.coverage.report]
 fail_under = 85

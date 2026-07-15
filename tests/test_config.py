@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import evolvable_memory.main as main_module
 from evolvable_memory.config import FrontendSettings, Settings
 from evolvable_memory.domain.common import DomainError
 
@@ -39,7 +40,67 @@ def test_service_settings_are_loaded_from_environment(monkeypatch: pytest.Monkey
 def test_invalid_service_settings_are_rejected() -> None:
     with pytest.raises(DomainError, match="port"):
         Settings(port=0)
-    with pytest.raises(DomainError, match="memory store"):
+    with pytest.raises(DomainError, match="DATABASE_URL"):
         Settings(store="postgres")
+    with pytest.raises(DomainError, match="either"):
+        Settings(store="unknown")
+    with pytest.raises(DomainError, match="max_size"):
+        Settings(database_pool_min_size=3, database_pool_max_size=2)
+    with pytest.raises(DomainError, match="max_request_body_bytes"):
+        Settings(max_request_body_bytes=0)
     with pytest.raises(DomainError, match="frontend port"):
         FrontendSettings(port=65_536)
+
+
+def test_postgres_settings_and_runtime_urls_are_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EMF_STORE", "postgres")
+    monkeypatch.setenv("EMF_DATABASE_URL", "postgresql://user:secret@db/memory")
+    monkeypatch.setenv("EMF_DATABASE_POOL_MIN_SIZE", "2")
+    monkeypatch.setenv("EMF_DATABASE_POOL_MAX_SIZE", "8")
+    monkeypatch.setenv("EMF_MAX_REQUEST_BODY_BYTES", "2097152")
+    monkeypatch.setenv("EMF_FRONTEND_URL", "https://memory.example")
+    monkeypatch.setenv("EMF_PUBLIC_API_URL", "https://api.example")
+    monkeypatch.setenv(
+        "EMF_CORS_ORIGINS",
+        "https://memory.example, https://admin.example",
+    )
+
+    settings = Settings.from_environment()
+
+    assert settings.store == "postgres"
+    assert settings.database_pool_min_size == 2
+    assert settings.database_pool_max_size == 8
+    assert settings.max_request_body_bytes == 2_097_152
+    assert settings.frontend_url == "https://memory.example"
+    assert settings.public_api_url == "https://api.example"
+    assert settings.cors_origins == (
+        "https://memory.example",
+        "https://admin.example",
+    )
+
+
+def test_backend_entrypoint_disables_query_bearing_uvicorn_access_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(_app: object, **options: object) -> None:
+        captured.update(options)
+
+    monkeypatch.setenv("EMF_STORE", "memory")
+    monkeypatch.setenv("EMF_LOG_LEVEL", "INFO")
+    monkeypatch.setattr(main_module.uvicorn, "run", fake_run)
+
+    main_module.run()
+
+    assert captured["access_log"] is False
+    log_config = captured["log_config"]
+    assert isinstance(log_config, dict)
+    for logger_name in ("evolvable_memory.access", "evolvable_memory.error"):
+        assert log_config["loggers"][logger_name] == {
+            "handlers": ["emf_json"],
+            "level": "INFO",
+            "propagate": False,
+        }

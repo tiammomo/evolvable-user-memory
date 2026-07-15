@@ -7,6 +7,7 @@ from uuid import UUID
 
 from evolvable_memory.domain.common import ConflictError, ContextSignature, Scope
 from evolvable_memory.domain.evidence import Candidate, EvidenceSpan, Observation
+from evolvable_memory.domain.evolution import StrategySnapshot
 from evolvable_memory.domain.experience import OutcomeEvent, RecallTrace, UtilityEstimate
 from evolvable_memory.domain.memory import (
     MemoryRecord,
@@ -51,7 +52,21 @@ class InMemoryMemoryStore:
         self._traces: dict[UUID, RecallTrace] = {}
         self._outcomes: dict[UUID, OutcomeEvent] = {}
         self._outcome_keys: dict[tuple[Scope, str], UUID] = {}
-        self._utilities: dict[tuple[UUID, str], UtilityEstimate] = {}
+        self._utilities: dict[tuple[Scope, UUID, str], UtilityEstimate] = {}
+        self._strategies: dict[UUID, StrategySnapshot] = {}
+
+    def close(self) -> None:
+        """The in-process adapter owns no external resources."""
+
+    def is_ready(self) -> bool:
+        return True
+
+    def save_strategy(self, strategy: StrategySnapshot) -> None:
+        with self._lock:
+            existing = self._strategies.get(strategy.id)
+            if existing is not None and existing != strategy:
+                raise ConflictError("strategy id already belongs to a different snapshot")
+            self._strategies[strategy.id] = strategy
 
     def transaction(self) -> AbstractContextManager[None]:
         return _LockedTransaction(self._lock)
@@ -81,10 +96,15 @@ class InMemoryMemoryStore:
             self._candidates[candidate.id] = candidate
             self._candidate_by_observation[observation.id] = candidate.id
 
-    def candidate_for_observation(self, observation_id: UUID) -> Candidate | None:
+    def candidate_for_observation(
+        self,
+        scope: Scope,
+        observation_id: UUID,
+    ) -> Candidate | None:
         with self._lock:
             candidate_id = self._candidate_by_observation.get(observation_id)
-            return self._candidates.get(candidate_id) if candidate_id else None
+            candidate = self._candidates.get(candidate_id) if candidate_id else None
+            return candidate if candidate is not None and candidate.scope == scope else None
 
     def update_candidate(self, candidate: Candidate) -> None:
         with self._lock:
@@ -182,11 +202,12 @@ class InMemoryMemoryStore:
 
     def utility_for(
         self,
+        scope: Scope,
         revision_id: UUID,
         context: ContextSignature,
     ) -> UtilityEstimate:
         with self._lock:
-            key = (revision_id, context.fingerprint)
+            key = (scope, revision_id, context.fingerprint)
             return self._utilities.get(
                 key,
                 UtilityEstimate(
@@ -205,16 +226,20 @@ class InMemoryMemoryStore:
             existing_id = self._outcome_keys.get(idempotency)
             if existing_id is not None:
                 existing = self._outcomes[existing_id]
+                # occurred_at may be generated independently for otherwise identical
+                # HTTP retries; compare the stable business payload instead.
                 if (
                     existing.trace_id != outcome.trace_id
                     or existing.revision_id != outcome.revision_id
                     or existing.kind != outcome.kind
                     or existing.weight != outcome.weight
+                    or existing.note != outcome.note
                 ):
                     raise ConflictError("outcome idempotency key was reused with different data")
-                return existing, self.utility_for(existing.revision_id, context), False
+                utility = self.utility_for(outcome.scope, existing.revision_id, context)
+                return existing, utility, False
 
-            current = self.utility_for(outcome.revision_id, context)
+            current = self.utility_for(outcome.scope, outcome.revision_id, context)
             updated = current.updated(
                 success=outcome.kind.success_value,
                 weight=outcome.weight,
@@ -222,7 +247,7 @@ class InMemoryMemoryStore:
             )
             self._outcomes[outcome.id] = outcome
             self._outcome_keys[idempotency] = outcome.id
-            self._utilities[(outcome.revision_id, context.fingerprint)] = updated
+            self._utilities[(outcome.scope, outcome.revision_id, context.fingerprint)] = updated
             return outcome, updated, True
 
     @property
