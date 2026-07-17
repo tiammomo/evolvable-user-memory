@@ -48,8 +48,12 @@ jobs:
         run: uv run mypy
 
   evaluation-smoke:
-    name: Built-in memory evaluation
+    name: Built-in memory evaluation (${{ matrix.dataset }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [smoke-v1, temporal-v1]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -72,34 +76,35 @@ jobs:
       - name: Run deterministic memory quality gates
         run: >-
           uv run evolvable-memory-eval run
-          --dataset builtin:smoke-v1
+          --dataset builtin:${{ matrix.dataset }}
           --format json
-          --report artifacts/memory-evaluation.json
+          --report artifacts/memory-evaluation-${{ matrix.dataset }}.json
 
       - name: Upload evaluation report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: memory-evaluation-report
-          path: artifacts/memory-evaluation.json
+          name: memory-evaluation-report-${{ matrix.dataset }}
+          path: artifacts/memory-evaluation-${{ matrix.dataset }}.json
           if-no-files-found: error
 
   test:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     env:
-      EMF_TEST_DATABASE_URL: postgresql://emf:emf-local-only@127.0.0.1:5432/evolvable_memory
+      EMF_TEST_DATABASE_URL: postgresql://emf:emf-local-only@127.0.0.1:5432/evolvable_memory_test
+      EMF_ALLOW_DESTRUCTIVE_TEST_DATABASE: "1"
     services:
       postgres:
         image: postgres:17-alpine
         env:
-          POSTGRES_DB: evolvable_memory
+          POSTGRES_DB: evolvable_memory_test
           POSTGRES_USER: emf
           POSTGRES_PASSWORD: emf-local-only
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U emf -d evolvable_memory"
+          --health-cmd "pg_isready -U emf -d evolvable_memory_test"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 15
@@ -143,10 +148,32 @@ jobs:
             --fail-under=80
 
   browser-e2e:
-    name: Frontend E2E (Chromium)
+    name: Frontend E2E (Chromium, ${{ matrix.store }})
     runs-on: ubuntu-latest
     env:
       EMF_REQUIRE_BROWSER_E2E: "1"
+      EMF_REQUIRE_ACCESSIBILITY_E2E: "1"
+      EMF_BROWSER_E2E_STORE: ${{ matrix.store }}
+      EMF_TEST_DATABASE_URL: postgresql://emf:emf-local-only@127.0.0.1:5432/evolvable_memory_test
+      EMF_ALLOW_DESTRUCTIVE_TEST_DATABASE: "1"
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: evolvable_memory_test
+          POSTGRES_USER: emf
+          POSTGRES_PASSWORD: emf-local-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U emf -d evolvable_memory_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 15
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [memory, postgres]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -155,6 +182,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Set up Node.js for accessibility audit
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
@@ -165,6 +198,9 @@ jobs:
 
       - name: Install locked dependencies
         run: uv sync --locked
+
+      - name: Install locked accessibility audit dependency
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Install Chromium and system dependencies
         run: uv run playwright install --with-deps chromium
@@ -199,6 +235,8 @@ jobs:
           uv pip install --python /tmp/emf-wheel/bin/python --no-deps dist/*.whl
           /tmp/emf-wheel/bin/evolvable-memory-eval validate --dataset builtin:smoke-v1
           /tmp/emf-wheel/bin/evolvable-memory-eval run --dataset builtin:smoke-v1
+          /tmp/emf-wheel/bin/evolvable-memory-eval validate --dataset builtin:temporal-v1
+          /tmp/emf-wheel/bin/evolvable-memory-eval run --dataset builtin:temporal-v1
 
       - name: Upload distributions
         uses: actions/upload-artifact@v4
