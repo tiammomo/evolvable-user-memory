@@ -18,3 +18,6 @@ Implementation rules:
 
 The repository uses AGPL-3.0-only, consistent with the originating project. This file documents provenance; it is not a substitute for the license terms.
 
+Test-only third-party dependency:
+
+- `axe-core` 4.11.4, maintained by Deque Systems and distributed under MPL-2.0, is exact-pinned through `package-lock.json` for local Chromium accessibility audits. It is installed into ignored `node_modules/`, is not copied into the application image or Python distribution, and does not become a runtime frontend dependency.

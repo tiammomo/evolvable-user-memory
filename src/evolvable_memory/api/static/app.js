@@ -1,17 +1,53 @@
 "use strict";
 
-const apiPort = document.querySelector('meta[name="api-port"]')?.content || "38089";
-const API_BASE = `${window.location.protocol}//${window.location.hostname}:${apiPort}`;
+const configuredApiBase = globalThis.EMF_RUNTIME_CONFIG?.apiBaseUrl;
+const API_BASE = typeof configuredApiBase === "string" && configuredApiBase.trim()
+  ? configuredApiBase.replace(/\/+$/, "")
+  : `${window.location.protocol}//${window.location.hostname}:38089`;
+
+const JOURNEY_STORAGE_PREFIX = "emf.journey.v1:";
+const initialScope = {
+  tenantId: localStorage.getItem("emf.tenantId") || "demo",
+  subjectId: localStorage.getItem("emf.subjectId") || "alice",
+};
+
+function emptyJourney() {
+  return { write: false, view: false, recall: false, outcome: false };
+}
+
+function journeyStorageKey(scope) {
+  return `${JOURNEY_STORAGE_PREFIX}${JSON.stringify([scope.tenantId, scope.subjectId])}`;
+}
+
+function readJourney(scope) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(journeyStorageKey(scope)) || "null");
+    if (!saved || typeof saved !== "object") return emptyJourney();
+    return {
+      write: saved.write === true,
+      view: saved.view === true,
+      recall: saved.recall === true,
+      outcome: saved.outcome === true,
+    };
+  } catch {
+    return emptyJourney();
+  }
+}
+
+function persistJourney(scope, journey) {
+  try {
+    localStorage.setItem(journeyStorageKey(scope), JSON.stringify(journey));
+  } catch {
+    // The console remains usable when storage is unavailable or full.
+  }
+}
 
 const state = {
-  scope: {
-    tenantId: localStorage.getItem("emf.tenantId") || "demo",
-    subjectId: localStorage.getItem("emf.subjectId") || "alice",
-  },
+  scope: initialScope,
   counts: { writes: 0, recalls: 0, outcomes: 0, results: 0 },
   lastTrace: null,
   activities: [],
-  journey: { write: false, view: false, recall: false, outcome: false },
+  journey: readJourney(initialScope),
   scopeGeneration: 0,
   scopeControllers: new Set(),
   requestChannels: new Map(),
@@ -30,7 +66,9 @@ const viewCopy = {
 };
 
 const scoreLabels = {
-  semantic: "词法匹配",
+  semantic: "相关性",
+  lexical: "词法匹配",
+  vector: "向量语义",
   context: "上下文",
   belief: "信念",
   utility: "效用",
@@ -41,7 +79,8 @@ const ONBOARDING_STORAGE_KEY = "emf.onboarding.v1";
 const ONBOARDING_DISMISSED_KEY = "emf.onboarding.dismissed";
 const API_TIMEOUT_MS = 12000;
 const HEALTH_TIMEOUT_MS = 3500;
-const DIALOG_FOCUSABLE_SELECTOR = [
+const MOBILE_NAVIGATION_MEDIA = window.matchMedia("(max-width: 900px)");
+const FOCUSABLE_SELECTOR = [
   "a[href]",
   "button:not([disabled])",
   "input:not([disabled]):not([type='hidden'])",
@@ -87,7 +126,7 @@ const onboardingSteps = [
   {
     eyebrow: "04 · TRACE",
     title: "在当前语境中召回",
-    description: "系统综合词法相关性、上下文、信念、效用与时效性排序，并为每次召回保存独立 Trace。",
+    description: "系统综合词法/向量相关性、上下文、信念、效用与时效性排序，并为每次召回保存独立 Trace。",
     points: [
       "查询描述当前需要解决的问题。",
       "上下文用于匹配记忆成立的场景。",
@@ -170,16 +209,23 @@ function getScope() {
 }
 
 function describeError(error) {
-  if (error instanceof ApiError) return error.message;
+  if (error instanceof ApiError) {
+    const requestReference = error.requestId ? `（请求号 ${shortId(error.requestId)}）` : "";
+    return `${error.message}${requestReference}`;
+  }
   if (error instanceof Error) return error.message;
   return "发生了未知错误";
 }
 
 class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, details = {}) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.errorCode = details.errorCode || null;
+    this.bodyRequestId = details.bodyRequestId || null;
+    this.responseRequestId = details.responseRequestId || null;
+    this.requestId = this.bodyRequestId || this.responseRequestId;
   }
 }
 
@@ -216,17 +262,30 @@ async function api(path, options = {}) {
   };
   try {
     const response = await fetch(`${API_BASE}${path}`, request);
+    const responseRequestId = response.headers.get("x-request-id");
     const contentType = response.headers.get("content-type") || "";
     const body = contentType.includes("application/json") ? await response.json() : await response.text();
     if (!response.ok) {
       let message = `请求失败（HTTP ${response.status}）`;
+      let bodyRequestId = null;
+      let errorCode = null;
       if (typeof body === "object" && body) {
         if (typeof body.detail === "string") message = body.detail;
         if (Array.isArray(body.detail)) {
           message = body.detail.map((item) => item.msg || "参数校验失败").join("；");
         }
+        if (typeof body.request_id === "string" && body.request_id.trim()) {
+          bodyRequestId = body.request_id.trim();
+        }
+        if (typeof body.error === "string" && body.error.trim()) {
+          errorCode = body.error.trim();
+        }
       }
-      throw new ApiError(message, response.status);
+      throw new ApiError(message, response.status, {
+        bodyRequestId,
+        errorCode,
+        responseRequestId,
+      });
     }
     return body;
   } catch (error) {
@@ -366,6 +425,7 @@ function updateStats() {
 }
 
 function updateJourney() {
+  persistJourney(state.scope, state.journey);
   $("#journey-scope").classList.add("is-done");
   $("#journey-scope small").textContent = `${state.scope.tenantId} / ${state.scope.subjectId}`;
   $("#journey-write").classList.toggle("is-done", state.journey.write);
@@ -445,15 +505,83 @@ function goToView(name) {
 }
 
 function openMobileMenu() {
-  $("#sidebar").classList.add("is-open");
+  if (!MOBILE_NAVIGATION_MEDIA.matches) return;
+  const sidebar = $("#sidebar");
+  sidebar.inert = false;
+  sidebar.setAttribute("aria-hidden", "false");
+  sidebar.classList.add("is-open");
   $("#mobile-scrim").classList.add("is-open");
-  $("#mobile-menu").setAttribute("aria-expanded", "true");
+  document.body.classList.add("is-mobile-menu-open");
+  const menu = $("#mobile-menu");
+  menu.setAttribute("aria-expanded", "true");
+  menu.setAttribute("aria-label", "关闭导航");
+  const activeNavigation = $(".nav-item[aria-current='page']", sidebar) || $(".nav-item", sidebar);
+  activeNavigation?.focus({ preventScroll: true });
 }
 
-function closeMobileMenu() {
-  $("#sidebar").classList.remove("is-open");
+function closeMobileMenu({ restoreFocus = true } = {}) {
+  const sidebar = $("#sidebar");
+  const menu = $("#mobile-menu");
+  const wasOpen = sidebar.classList.contains("is-open");
+  if (restoreFocus && wasOpen && MOBILE_NAVIGATION_MEDIA.matches) {
+    menu.focus({ preventScroll: true });
+  }
+  sidebar.classList.remove("is-open");
   $("#mobile-scrim").classList.remove("is-open");
-  $("#mobile-menu").setAttribute("aria-expanded", "false");
+  document.body.classList.remove("is-mobile-menu-open");
+  menu.setAttribute("aria-expanded", "false");
+  menu.setAttribute("aria-label", "打开导航");
+  if (MOBILE_NAVIGATION_MEDIA.matches) {
+    sidebar.inert = true;
+    sidebar.setAttribute("aria-hidden", "true");
+  } else {
+    sidebar.inert = false;
+    sidebar.removeAttribute("aria-hidden");
+  }
+}
+
+function synchronizeMobileNavigation() {
+  const sidebar = $("#sidebar");
+  const menu = $("#mobile-menu");
+  if (!MOBILE_NAVIGATION_MEDIA.matches) {
+    closeMobileMenu({ restoreFocus: false });
+    return;
+  }
+  const isOpen = sidebar.classList.contains("is-open");
+  if (!isOpen && sidebar.contains(document.activeElement)) {
+    menu.focus({ preventScroll: true });
+  }
+  sidebar.inert = !isOpen;
+  sidebar.setAttribute("aria-hidden", String(!isOpen));
+  menu.setAttribute("aria-expanded", String(isOpen));
+  menu.setAttribute("aria-label", isOpen ? "关闭导航" : "打开导航");
+  document.body.classList.toggle("is-mobile-menu-open", isOpen);
+}
+
+function trapMobileMenuFocus(event) {
+  const sidebar = $("#sidebar");
+  if (
+    event.key !== "Tab"
+    || !MOBILE_NAVIGATION_MEDIA.matches
+    || !sidebar.classList.contains("is-open")
+  ) return;
+  const focusable = $$(FOCUSABLE_SELECTOR, sidebar).filter(
+    (element) => element.getClientRects().length > 0,
+  );
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  if (event.shiftKey && (active === first || !sidebar.contains(active))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (active === last || !sidebar.contains(active))) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function addContextRow(containerId, key = "", value = "") {
@@ -709,8 +837,12 @@ async function loadMemories(silent = false) {
       { method: "GET", headers: {} },
       "memories",
     );
-    state.journey.write = items.length > 0;
-    if (items.length > 0 && $("#view-memories").classList.contains("is-active")) state.journey.view = true;
+    if (items.length === 0) {
+      state.journey = emptyJourney();
+    } else {
+      state.journey.write = true;
+      if ($("#view-memories").classList.contains("is-active")) state.journey.view = true;
+    }
     updateJourney();
     renderMemoryLibrary(items);
   } catch (error) {
@@ -752,7 +884,9 @@ function renderScorePanel(item) {
   panel.append(total);
   const breakdown = createElement("div", "score-breakdown");
   for (const [key, label] of Object.entries(scoreLabels)) {
-    const value = Number(item.breakdown[key] || 0);
+    const rawValue = item.breakdown[key];
+    if ((key === "lexical" || key === "vector") && rawValue == null) continue;
+    const value = Number(rawValue || 0);
     const row = createElement("div", "score-row");
     const track = createElement("div", "score-track");
     const fill = createElement("i");
@@ -924,7 +1058,7 @@ function showDialog(dialog) {
 
 function trapDialogFocus(dialog, event) {
   if (event.key !== "Tab" || !dialog.open) return;
-  const focusable = $$(DIALOG_FOCUSABLE_SELECTOR, dialog).filter(
+  const focusable = $$(FOCUSABLE_SELECTOR, dialog).filter(
     (element) => element.getClientRects().length > 0,
   );
   if (!focusable.length) {
@@ -1045,7 +1179,7 @@ function renderInitialRecallState() {
   empty.append(
     rings,
     createElement("h3", "", "输入一个问题，开始检索记忆"),
-    createElement("p", "", "系统会综合词法相关性、上下文、信念、效用与时效性进行排序。"),
+    createElement("p", "", "系统会综合词法/向量相关性、上下文、信念、效用与时效性进行排序。"),
   );
   results.replaceChildren(empty);
 }
@@ -1054,7 +1188,7 @@ function resetScopedViewState() {
   state.counts = { writes: 0, recalls: 0, outcomes: 0, results: 0 };
   state.lastTrace = null;
   state.activities = [];
-  state.journey = { write: false, view: false, recall: false, outcome: false };
+  state.journey = readJourney(state.scope);
   state.idempotencyOperations.clear();
 
   for (const dialog of [$("#history-modal"), $("#correction-modal")]) {
@@ -1092,11 +1226,37 @@ function resetScopedViewState() {
   updateJourney();
 }
 
+function updateScopeControlState() {
+  const tenantInput = $("#tenant-id");
+  const subjectInput = $("#subject-id");
+  const tenantId = tenantInput.value.trim();
+  const subjectId = subjectInput.value.trim();
+  const complete = Boolean(tenantId && subjectId);
+  const dirty = tenantId !== state.scope.tenantId || subjectId !== state.scope.subjectId;
+  const control = $(".scope-control");
+  const button = $("#save-scope");
+  const status = $("#scope-status-label");
+
+  control.classList.toggle("is-dirty", dirty && complete);
+  control.classList.toggle("is-invalid", !complete);
+  tenantInput.setAttribute("aria-invalid", String(!tenantId));
+  subjectInput.setAttribute("aria-invalid", String(!subjectId));
+  status.textContent = complete ? (dirty ? "待应用" : "已应用") : "请补全";
+  $("#scope-save-label").textContent = dirty ? "应用" : "当前";
+  button.setAttribute(
+    "aria-label",
+    dirty ? (complete ? "应用新的数据作用域" : "数据作用域字段不完整") : "当前数据作用域已应用",
+  );
+  button.disabled = !dirty;
+}
+
 function applyScope() {
   const tenantId = $("#tenant-id").value.trim();
   const subjectId = $("#subject-id").value.trim();
   if (!tenantId || !subjectId) {
+    updateScopeControlState();
     toast("无法应用作用域", "租户和用户均不能为空。", "error");
+    $(tenantId ? "#subject-id" : "#tenant-id").focus();
     return;
   }
   if (tenantId === state.scope.tenantId && subjectId === state.scope.subjectId) {
@@ -1109,6 +1269,7 @@ function applyScope() {
   localStorage.setItem("emf.tenantId", tenantId);
   localStorage.setItem("emf.subjectId", subjectId);
   resetScopedViewState();
+  updateScopeControlState();
   loadMemories(true);
   toast("作用域已切换", `${tenantId} / ${subjectId}；旧作用域的页面状态与请求已清除。`);
 }
@@ -1127,19 +1288,38 @@ async function checkHealth() {
   retry.disabled = true;
   retry.setAttribute("aria-busy", "true");
   try {
-    const health = await api("/health", {
+    const requestOptions = {
       method: "GET",
       headers: {},
       signal: controller.signal,
       timeoutMs: HEALTH_TIMEOUT_MS,
-    });
+    };
+    const [healthResult, readinessResult] = await Promise.allSettled([
+      api("/health", requestOptions),
+      api("/readyz", requestOptions),
+    ]);
     if (state.healthController !== controller) return;
-    dot.className = "status-dot is-online";
-    label.textContent = "API 在线";
+    if (healthResult.status === "rejected") throw healthResult.reason;
+    const health = healthResult.value;
     updateStorageDisplay(health.storage);
     updateAuthorizationDisplay(health.auth_mode);
     const authLabel = health.auth_mode === "jwt" ? "JWT 权限" : "开发身份";
-    detail.textContent = `v${health.version} · ${health.storage === "postgres" ? "PostgreSQL" : "进程内存"} · ${authLabel}`;
+    const metadata = `v${health.version} · ${health.storage === "postgres" ? "PostgreSQL" : "进程内存"} · ${authLabel}`;
+    if (readinessResult.status === "rejected") {
+      dot.className = "status-dot is-not-ready";
+      label.textContent = "服务未就绪";
+      detail.textContent = `${metadata} · ${describeError(readinessResult.reason)}`;
+      return;
+    }
+    if (readinessResult.value.status !== "ready") {
+      dot.className = "status-dot is-not-ready";
+      label.textContent = "服务未就绪";
+      detail.textContent = `${metadata} · 依赖检查尚未通过`;
+      return;
+    }
+    dot.className = "status-dot is-online";
+    label.textContent = "API 在线";
+    detail.textContent = metadata;
   } catch (error) {
     if (isRequestCancelled(error)) return;
     dot.className = "status-dot is-offline";
@@ -1170,6 +1350,7 @@ function updateAuthorizationDisplay(authMode) {
   state.authMode = authMode;
   const control = $(".scope-control");
   control.dataset.authMode = authMode;
+  $("#scope-control-label").textContent = authMode === "jwt" ? "授权目标" : "开发作用域";
   control.title = authMode === "jwt"
     ? "Scope 是目标选择器，后端会按可信 JWT grant 校验权限"
     : "当前使用仅限本机评估的开发身份，Scope 可手动切换";
@@ -1180,9 +1361,12 @@ function bindEvents() {
   $$("[data-go]").forEach((button) => button.addEventListener("click", () => goToView(button.dataset.go)));
   $$("[data-add-context]").forEach((button) => button.addEventListener("click", () => addContextRow(button.dataset.addContext)));
   $("#mobile-menu").addEventListener("click", openMobileMenu);
-  $("#mobile-scrim").addEventListener("click", closeMobileMenu);
+  $("#mobile-scrim").addEventListener("click", () => closeMobileMenu());
+  $("#sidebar").addEventListener("keydown", trapMobileMenuFocus);
+  MOBILE_NAVIGATION_MEDIA.addEventListener("change", synchronizeMobileNavigation);
   $("#save-scope").addEventListener("click", applyScope);
   for (const input of [$("#tenant-id"), $("#subject-id")]) {
+    input.addEventListener("input", updateScopeControlState);
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") applyScope();
     });
@@ -1230,7 +1414,10 @@ function bindEvents() {
     dialog.addEventListener("keydown", (event) => trapDialogFocus(dialog, event));
   });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeMobileMenu();
+    if (event.key === "Escape" && $("#sidebar").classList.contains("is-open")) {
+      event.preventDefault();
+      closeMobileMenu();
+    }
   });
 }
 
@@ -1240,6 +1427,8 @@ function initialize() {
   });
   $("#tenant-id").value = state.scope.tenantId;
   $("#subject-id").value = state.scope.subjectId;
+  synchronizeMobileNavigation();
+  updateScopeControlState();
   resetCaptureContext();
   addContextRow("recall-context", "time_of_day", "evening");
   updateStats();

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -14,19 +15,23 @@ from uuid import uuid4
 import httpx
 import pytest
 import uvicorn
-from playwright.sync_api import Browser, Error, Page, expect, sync_playwright
+from playwright.sync_api import Browser, Error, Page, Route, expect, sync_playwright
 
+from conftest import prepare_postgres_database
 from evolvable_memory import frontend
 from evolvable_memory.api.app import create_app
 from evolvable_memory.config import Settings
 
 pytestmark = pytest.mark.browser
 
+_AXE_SOURCE = Path(__file__).parents[1] / "node_modules" / "axe-core" / "axe.min.js"
+
 
 @dataclass(frozen=True, slots=True)
 class RunningConsole:
     frontend_url: str
     api_url: str
+    storage: str
 
 
 class QuietFrontendRequestHandler(frontend.FrontendRequestHandler):
@@ -53,10 +58,14 @@ def running_console(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Runnin
     static_directory = tmp_path_factory.mktemp("frontend-e2e")
     shutil.copytree(frontend._STATIC_DIRECTORY, static_directory, dirs_exist_ok=True)
 
-    handler = partial(QuietFrontendRequestHandler, directory=str(static_directory))
-    frontend_server = frontend.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    frontend_port = int(frontend_server.server_address[1])
-    frontend_url = f"http://127.0.0.1:{frontend_port}"
+    storage = os.getenv("EMF_BROWSER_E2E_STORE", "memory")
+    if storage not in {"memory", "postgres"}:
+        pytest.fail("EMF_BROWSER_E2E_STORE must be memory or postgres")
+    database_url = os.getenv("EMF_TEST_DATABASE_URL") if storage == "postgres" else None
+    if storage == "postgres":
+        if database_url is None:
+            pytest.fail("EMF_TEST_DATABASE_URL is required for PostgreSQL browser E2E")
+        prepare_postgres_database(database_url)
 
     api_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     api_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -64,20 +73,22 @@ def running_console(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Runnin
     api_port = int(api_socket.getsockname()[1])
     api_url = f"http://127.0.0.1:{api_port}"
 
-    index_path = Path(static_directory) / "index.html"
-    index = index_path.read_text(encoding="utf-8")
-    configured_index = index.replace(
-        '<meta name="api-port" content="38089" />',
-        f'<meta name="api-port" content="{api_port}" />',
+    handler = partial(
+        QuietFrontendRequestHandler,
+        directory=str(static_directory),
+        public_api_url=api_url,
     )
-    if configured_index == index:
-        raise RuntimeError("frontend api-port meta tag was not found")
-    index_path.write_text(configured_index, encoding="utf-8")
+    frontend_server = frontend.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    frontend_port = int(frontend_server.server_address[1])
+    frontend_url = f"http://127.0.0.1:{frontend_port}"
 
     settings = Settings(
         host="127.0.0.1",
         port=api_port,
-        store="memory",
+        store=storage,
+        database_url=database_url,
+        database_pool_min_size=1,
+        database_pool_max_size=3,
         frontend_url=frontend_url,
         public_api_url=api_url,
         cors_origins=(frontend_url,),
@@ -105,8 +116,11 @@ def running_console(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Runnin
     frontend_thread.start()
     try:
         _wait_for_url(f"{api_url}/health")
+        _wait_for_url(f"{api_url}/readyz")
         _wait_for_url(frontend_url)
-        yield RunningConsole(frontend_url=frontend_url, api_url=api_url)
+        health = httpx.get(f"{api_url}/health", timeout=2).json()
+        assert health["storage"] == storage
+        yield RunningConsole(frontend_url=frontend_url, api_url=api_url, storage=storage)
     finally:
         frontend_server.shutdown()
         frontend_server.server_close()
@@ -152,6 +166,196 @@ def _boxes_overlap(left: dict[str, float], right: dict[str, float]) -> bool:
     return horizontal > 1 and vertical > 1
 
 
+def _install_axe(page: Page) -> None:
+    if not _AXE_SOURCE.is_file():
+        message = "axe-core is unavailable; run `npm ci` to enable accessibility E2E"
+        if os.getenv("EMF_REQUIRE_ACCESSIBILITY_E2E") == "1":
+            pytest.fail(message)
+        pytest.skip(message)
+    page.add_script_tag(path=str(_AXE_SOURCE))
+
+
+def _assert_no_accessibility_violations(page: Page, state: str) -> None:
+    results = page.evaluate(
+        """async () => await globalThis.axe.run(document, {
+            resultTypes: ["violations"],
+        })"""
+    )
+    violations = results["violations"]
+    report = [
+        {
+            "rule": violation["id"],
+            "impact": violation["impact"],
+            "help": violation["help"],
+            "nodes": [
+                {
+                    "target": node["target"],
+                    "failure_summary": node["failureSummary"],
+                }
+                for node in violation["nodes"]
+            ],
+        }
+        for violation in violations
+    ]
+    formatted_report = json.dumps(report, ensure_ascii=False, indent=2)
+    assert not violations, f"axe-core violations in {state}:\n{formatted_report}"
+
+
+def test_console_reports_configured_authoritative_storage(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": 1366, "height": 900})
+    page = context.new_page()
+    try:
+        _open_console(page, running_console)
+        expected = (
+            "PostgreSQL 权威存储" if running_console.storage == "postgres" else "后端进程内存"
+        )
+        expect(page.locator("#storage-title")).to_have_text(expected)
+    finally:
+        context.close()
+
+
+def test_readiness_failure_never_reports_the_service_as_online(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": 1366, "height": 900})
+    page = context.new_page()
+    request_id = "ready-check-1234567890"
+
+    def reject_readiness(route: Route) -> None:
+        route.fulfill(
+            status=503,
+            headers={
+                "access-control-allow-origin": running_console.frontend_url,
+                "access-control-expose-headers": "X-Request-ID",
+                "content-type": "application/json",
+                "x-request-id": request_id,
+            },
+            body=json.dumps({"status": "not_ready", "storage": running_console.storage}),
+        )
+
+    page.route("**/readyz", reject_readiness)
+    try:
+        page.goto(f"{running_console.frontend_url}/?tour=0", wait_until="networkidle")
+        expect(page.locator("#status-label")).to_have_text("服务未就绪")
+        expect(page.locator("#status-dot")).to_have_class("status-dot is-not-ready")
+        expect(page.locator("#status-detail")).to_contain_text("请求号 ready-ch…7890")
+
+        page.unroute("**/readyz", reject_readiness)
+        page.locator("#retry-health").click()
+        expect(page.locator("#status-label")).to_have_text("API 在线")
+        expect(page.locator("#status-dot")).to_have_class("status-dot is-online")
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize(
+    ("body_request_id", "header_request_id", "expected_reference"),
+    (
+        ("body-request-abcdef123456", "ignored-header-123456", "body-req…3456"),
+        (None, "header-request-abcdef123456", "header-r…3456"),
+    ),
+)
+def test_api_errors_show_a_short_correlated_request_reference(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+    body_request_id: str | None,
+    header_request_id: str,
+    expected_reference: str,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": 1366, "height": 900})
+    page = context.new_page()
+
+    def reject_recall(route: Route) -> None:
+        if route.request.method == "OPTIONS":
+            route.continue_()
+            return
+        body: dict[str, str] = {
+            "detail": "simulated recall failure",
+            "error": "ConflictError",
+        }
+        if body_request_id is not None:
+            body["request_id"] = body_request_id
+        route.fulfill(
+            status=409,
+            headers={
+                "access-control-allow-origin": running_console.frontend_url,
+                "access-control-expose-headers": "X-Request-ID",
+                "content-type": "application/json",
+                "x-request-id": header_request_id,
+            },
+            body=json.dumps(body),
+        )
+
+    page.route("**/v1/recall", reject_recall)
+    try:
+        _open_console(page, running_console)
+        page.locator('[data-view="recall"]').click()
+        page.locator('#recall-form input[name="query"]').fill("correlated failure")
+        page.locator('#recall-form button[type="submit"]').click()
+        expect(page.locator(".toast.is-error p")).to_have_text(
+            f"simulated recall failure\uff08请求号 {expected_reference}\uff09"
+        )
+    finally:
+        context.close()
+
+
+def test_visible_workbench_states_pass_automated_accessibility_audit(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+) -> None:
+    context = chromium_browser.new_context(
+        viewport={"width": 1366, "height": 900},
+        bypass_csp=True,
+    )
+    page = context.new_page()
+    tenant = f"a11y-{uuid4().hex[:8]}"
+    subject = f"subject-{uuid4().hex[:8]}"
+    try:
+        _open_console(page, running_console)
+        _install_axe(page)
+        _assert_no_accessibility_violations(page, "overview")
+
+        page.locator("#open-onboarding").click()
+        expect(page.locator("#onboarding-dialog")).to_be_visible()
+        _assert_no_accessibility_violations(page, "onboarding dialog")
+        page.keyboard.press("Escape")
+
+        page.locator("#tenant-id").fill(tenant)
+        page.locator("#subject-id").fill(subject)
+        page.locator("#save-scope").click()
+        page.locator('[data-view="capture"]').click()
+        _assert_no_accessibility_violations(page, "capture form")
+
+        page.locator('#memory-form input[name="key"]').fill("drink.preference")
+        page.locator('#memory-form input[name="value"]').fill("decaf coffee")
+        page.locator('#memory-form textarea[name="evidence_text"]').fill(
+            "I prefer decaf coffee in the evening"
+        )
+        page.locator('#memory-form button[type="submit"]').click()
+        expect(page.locator("#capture-result")).to_be_visible()
+        _assert_no_accessibility_violations(page, "capture success")
+
+        page.locator('[data-view="memories"]').click()
+        expect(page.locator(".memory-card")).to_have_count(1)
+        _assert_no_accessibility_violations(page, "memory library")
+
+        page.locator('[data-view="recall"]').click()
+        page.locator('#recall-form input[name="query"]').fill("decaf coffee")
+        page.locator('#recall-form button[type="submit"]').click()
+        expect(page.locator(".result-card")).to_have_count(1)
+        _assert_no_accessibility_violations(page, "recall results")
+
+        page.locator(".result-card").first.get_by_role("button", name="修正记忆").click()
+        expect(page.locator("#correction-modal")).to_be_visible()
+        _assert_no_accessibility_violations(page, "correction dialog")
+    finally:
+        context.close()
+
+
 @pytest.mark.parametrize(
     ("width", "height"),
     [(390, 844), (900, 900), (1366, 900), (2048, 1152)],
@@ -192,6 +396,36 @@ def test_quickstart_has_no_horizontal_overflow_or_text_overlap(
         for index, left in enumerate(visible_boxes):
             for right in visible_boxes[index + 1 :]:
                 assert not _boxes_overlap(left, right)
+    finally:
+        context.close()
+
+
+def test_anime_hero_stays_readable_on_mobile(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": 390, "height": 844})
+    page = context.new_page()
+    try:
+        _open_console(page, running_console)
+        geometry = page.evaluate(
+            """() => {
+                const hero = document.querySelector('.hero-panel').getBoundingClientRect();
+                const copy = document.querySelector('.hero-copy').getBoundingClientRect();
+                const heading = document.querySelector('.hero-copy h2').getBoundingClientRect();
+                return {
+                    heroWidth: hero.width,
+                    copyWidth: copy.width,
+                    headingHeight: heading.height,
+                    documentClientWidth: document.documentElement.clientWidth,
+                    documentScrollWidth: document.documentElement.scrollWidth,
+                };
+            }"""
+        )
+
+        assert geometry["copyWidth"] >= geometry["heroWidth"] * 0.85
+        assert geometry["headingHeight"] < 120
+        assert geometry["documentScrollWidth"] <= geometry["documentClientWidth"] + 1
     finally:
         context.close()
 
@@ -304,6 +538,135 @@ def test_onboarding_dialog_has_accessible_keyboard_flow(
         expect(page.locator("#onboarding-dialog")).to_be_hidden()
         assert page.evaluate("localStorage.getItem('emf.onboarding.v1')") == "complete"
         assert page.evaluate("sessionStorage.getItem('emf.onboarding.dismissed')") is None
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize(("width", "height"), ((1366, 900), (900, 720)))
+def test_onboarding_dialog_keeps_stable_geometry_between_steps(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+    width: int,
+    height: int,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": width, "height": height})
+    page = context.new_page()
+    try:
+        _open_console(page, running_console, tour=True)
+        dialog = page.locator("#onboarding-dialog")
+        expect(dialog).to_be_visible()
+
+        page.locator("#onboarding-dots button").nth(1).click()
+        step_two = dialog.bounding_box()
+        page.locator("#onboarding-dots button").nth(2).click()
+        step_three = dialog.bounding_box()
+
+        assert step_two is not None and step_three is not None
+        assert step_three["width"] == pytest.approx(step_two["width"], abs=1)
+        assert step_three["height"] == pytest.approx(step_two["height"], abs=1)
+    finally:
+        context.close()
+
+
+def test_scope_control_distinguishes_applied_draft_and_invalid_states(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": 1366, "height": 900})
+    page = context.new_page()
+    subject = f"scope-state-{uuid4().hex[:8]}"
+    try:
+        _open_console(page, running_console)
+        control = page.locator(".scope-control")
+        save = page.locator("#save-scope")
+        status = page.locator("#scope-status-label")
+        subject_input = page.locator("#subject-id")
+
+        expect(page.locator("#scope-control-label")).to_have_text("开发作用域")
+        expect(status).to_have_text("已应用")
+        expect(page.locator("#scope-save-label")).to_have_text("当前")
+        expect(save).to_be_disabled()
+        expect(page.locator("#tenant-id")).to_have_attribute("maxlength", "128")
+        expect(subject_input).to_have_attribute("maxlength", "128")
+
+        guide_box = page.locator("#open-onboarding").bounding_box()
+        control_box = control.bounding_box()
+        assert guide_box is not None and control_box is not None
+        assert guide_box["height"] == pytest.approx(48, abs=1)
+        assert control_box["height"] == pytest.approx(48, abs=1)
+        assert control_box["width"] < 350
+
+        subject_input.fill(subject)
+        expect(control).to_have_class("scope-control is-dirty")
+        expect(status).to_have_text("待应用")
+        expect(page.locator("#scope-save-label")).to_have_text("应用")
+        expect(save).to_be_enabled()
+
+        save.click()
+        expect(page.locator("#stat-subject")).to_have_text(subject)
+        expect(control).to_have_class("scope-control")
+        expect(status).to_have_text("已应用")
+        expect(save).to_be_disabled()
+
+        subject_input.fill("")
+        expect(control).to_have_class("scope-control is-invalid")
+        expect(status).to_have_text("请补全")
+        expect(subject_input).to_have_attribute("aria-invalid", "true")
+        expect(save).to_be_enabled()
+        save.click()
+        expect(subject_input).to_be_focused()
+        expect(page.get_by_text("无法应用作用域", exact=True)).to_be_visible()
+    finally:
+        context.close()
+
+
+def test_journey_progress_is_restored_per_scope(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": 1366, "height": 900})
+    page = context.new_page()
+    tenant = f"journey-{uuid4().hex[:8]}"
+    subject = f"subject-{uuid4().hex[:8]}"
+    empty_subject = f"empty-{uuid4().hex[:8]}"
+    try:
+        _open_console(page, running_console)
+        page.locator("#tenant-id").fill(tenant)
+        page.locator("#subject-id").fill(subject)
+        page.locator("#save-scope").click()
+
+        page.locator('[data-view="capture"]').click()
+        page.locator('#memory-form input[name="key"]').fill("drink.preference")
+        page.locator('#memory-form input[name="value"]').fill("decaf coffee")
+        page.locator('#memory-form textarea[name="evidence_text"]').fill(
+            "I prefer decaf coffee in the evening"
+        )
+        page.locator('#memory-form button[type="submit"]').click()
+        expect(page.locator("#capture-result")).to_be_visible()
+
+        page.locator('[data-view="memories"]').click()
+        expect(page.locator(".memory-card")).to_have_count(1)
+        page.locator('[data-view="recall"]').click()
+        page.locator('#recall-form input[name="query"]').fill("decaf coffee")
+        page.locator('#recall-form button[type="submit"]').click()
+        expect(page.locator(".result-card")).to_have_count(1)
+        page.locator(".result-card .positive").click()
+        expect(page.locator(".utility-update")).to_be_visible()
+        expect(page.locator("#journey-progress")).to_have_text("已完成 5 / 5")
+
+        page.reload(wait_until="networkidle")
+        expect(page.locator("#status-label")).to_have_text("API 在线")
+        expect(page.locator("#journey-progress")).to_have_text("已完成 5 / 5")
+
+        page.locator("#subject-id").fill(empty_subject)
+        page.locator("#save-scope").click()
+        expect(page.locator("#memory-count")).to_have_text("0 条记忆")
+        expect(page.locator("#journey-progress")).to_have_text("已完成 1 / 5")
+
+        page.locator("#subject-id").fill(subject)
+        page.locator("#save-scope").click()
+        expect(page.locator("#memory-count")).to_have_text("1 条记忆")
+        expect(page.locator("#journey-progress")).to_have_text("已完成 5 / 5")
     finally:
         context.close()
 
@@ -425,5 +788,65 @@ def test_basic_keyboard_navigation(
         expect(page.locator("#onboarding-dialog")).to_be_visible()
         page.keyboard.press("Escape")
         expect(page.locator("#onboarding-dialog")).to_be_hidden()
+    finally:
+        context.close()
+
+
+def test_mobile_navigation_has_a_complete_keyboard_focus_lifecycle(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": 390, "height": 844})
+    page = context.new_page()
+    try:
+        _open_console(page, running_console)
+        sidebar = page.locator("#sidebar")
+        menu = page.locator("#mobile-menu")
+        current_navigation = page.locator('.nav-item[data-view="overview"]')
+
+        expect(sidebar).to_have_attribute("inert", "")
+        expect(sidebar).to_have_attribute("aria-hidden", "true")
+        page.keyboard.press("Tab")
+        expect(page.locator(".skip-link")).to_be_focused()
+        page.keyboard.press("Tab")
+        expect(menu).to_be_focused()
+
+        page.keyboard.press("Enter")
+        expect(menu).to_have_attribute("aria-expanded", "true")
+        expect(sidebar).to_have_attribute("aria-hidden", "false")
+        assert not page.evaluate("document.querySelector('#sidebar').hasAttribute('inert')")
+        expect(current_navigation).to_be_focused()
+
+        page.keyboard.press("Shift+Tab")
+        expect(page.locator("#retry-health")).to_be_focused()
+        page.keyboard.press("Tab")
+        expect(current_navigation).to_be_focused()
+
+        page.keyboard.press("Escape")
+        expect(sidebar).to_have_attribute("aria-hidden", "true")
+        expect(sidebar).to_have_attribute("inert", "")
+        expect(menu).to_be_focused()
+
+        menu.click()
+        page.locator("#mobile-scrim").click()
+        expect(menu).to_be_focused()
+        expect(sidebar).to_have_attribute("inert", "")
+
+        menu.click()
+        page.locator('.nav-item[data-view="capture"]').click()
+        expect(page.locator("#view-capture")).to_have_class("view is-active")
+        expect(menu).to_be_focused()
+        expect(sidebar).to_have_attribute("inert", "")
+
+        menu.click()
+        page.set_viewport_size({"width": 1000, "height": 844})
+        expect(sidebar).to_have_class("sidebar")
+        assert not page.evaluate("document.querySelector('#sidebar').hasAttribute('inert')")
+        assert not page.evaluate("document.querySelector('#sidebar').hasAttribute('aria-hidden')")
+        expect(menu).to_have_attribute("aria-expanded", "false")
+
+        page.set_viewport_size({"width": 390, "height": 844})
+        expect(sidebar).to_have_attribute("inert", "")
+        expect(sidebar).to_have_attribute("aria-hidden", "true")
     finally:
         context.close()

@@ -47,6 +47,8 @@ def test_frontend_server_serves_console_without_cache(
     assert 'id="start-example"' in response.text
     assert 'id="open-onboarding"' in response.text
     assert 'id="onboarding-dialog"' in response.text
+    assert 'id="scope-status"' in response.text
+    assert 'id="scope-save-label"' in response.text
     assert 'id="retry-health"' in response.text
     assert 'id="history-modal" aria-labelledby="history-title"' in response.text
     assert 'id="correction-modal" aria-labelledby="correction-title"' in response.text
@@ -58,7 +60,10 @@ def test_frontend_server_serves_console_without_cache(
     assert 'name="expected_revision_id"' in response.text
     assert 'href="#main-content"' in response.text
     assert 'id="main-content" tabindex="-1"' in response.text
+    assert 'id="sidebar" inert aria-hidden="true"' in response.text
     assert 'data-view="overview" aria-current="page"' in response.text
+    assert '<script src="./runtime-config.js" defer></script>' in response.text
+    assert 'meta name="api-port"' not in response.text
 
     styles = (frontend._STATIC_DIRECTORY / "styles.css").read_text(encoding="utf-8")
     assert ".journey-number {" in styles
@@ -67,6 +72,8 @@ def test_frontend_server_serves_console_without_cache(
     script = (frontend._STATIC_DIRECTORY / "app.js").read_text(encoding="utf-8")
     assert "updateStorageDisplay(health.storage)" in script
     assert "updateAuthorizationDisplay(health.auth_mode)" in script
+    assert 'api("/readyz", requestOptions)' in script
+    assert 'label.textContent = "服务未就绪"' in script
     assert 'health.auth_mode === "jwt" ? "JWT 权限" : "开发身份"' in script
     assert "form.elements.expected_revision_id.value = item.revision_id" in script
     assert "--muted: #5f6e67;" in styles
@@ -86,6 +93,40 @@ def test_frontend_guards_scope_changes_and_idempotent_retries() -> None:
     assert 'idempotencyKeyFor(operation, "web:correction"' in script
     assert "HEALTH_TIMEOUT_MS = 3500" in script
     assert '$("#retry-health").addEventListener("click", checkHealth)' in script
+    assert "MOBILE_NAVIGATION_MEDIA" in script
+    assert "sidebar.inert = !isOpen" in script
+    assert "trapMobileMenuFocus" in script
+    assert 'response.headers.get("x-request-id")' in script
+    assert "this.requestId = this.bodyRequestId || this.responseRequestId" in script
+    assert "journeyStorageKey" in script
+    assert "persistJourney(state.scope, state.journey)" in script
+    assert "state.journey = readJourney(state.scope)" in script
+
+
+def test_frontend_serves_runtime_api_configuration() -> None:
+    handler = partial(
+        frontend.FrontendRequestHandler,
+        directory=str(frontend._STATIC_DIRECTORY),
+        public_api_url="https://api.example.test/memory/",
+    )
+    server = frontend.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = Thread(target=server.handle_request)
+    thread.start()
+    try:
+        host, port = server.server_address
+        response = httpx.get(f"http://{host}:{port}/runtime-config.js", timeout=2)
+    finally:
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/javascript; charset=utf-8"
+    assert (
+        "connect-src 'self' https://api.example.test" in response.headers["content-security-policy"]
+    )
+    assert response.text == (
+        'globalThis.EMF_RUNTIME_CONFIG = {"apiBaseUrl":"https://api.example.test/memory"};\n'
+    )
 
 
 def test_frontend_entrypoint_uses_configured_address(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -104,6 +145,7 @@ def test_frontend_entrypoint_uses_configured_address(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setenv("EMF_FRONTEND_HOST", "127.0.0.2")
     monkeypatch.setenv("EMF_FRONTEND_PORT", "33010")
+    monkeypatch.setenv("EMF_PUBLIC_API_URL", "https://api.example.test/base")
     monkeypatch.setattr(frontend, "ThreadingHTTPServer", FakeServer)
 
     frontend.run()

@@ -1,0 +1,9 @@
+{
+  "name": "evolvable-user-memory-test-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-only accessibility audit dependencies for the Python project",
+  "devDependencies": {
+    "axe-core": "4.11.4"
+  }
+}
