@@ -9,11 +9,14 @@ from evolvable_memory.application.commands import (
     CorrectPreference,
     OutcomeResult,
     PreferenceResult,
+    ProjectRecallContext,
+    RecallContextResult,
     RecallMemory,
     RecallResult,
     RecordOutcome,
     RememberPreference,
 )
+from evolvable_memory.application.compression import RecallContextCompressor
 from evolvable_memory.application.ports import (
     Clock,
     IdGenerator,
@@ -69,6 +72,7 @@ class MemoryApplication:
         recall_projection: RecallProjectionPort | None = None,
         projection_required: bool = False,
         projection_search_oversample: int = 10,
+        context_compressor: RecallContextCompressor | None = None,
     ) -> None:
         if projection_required and recall_projection is None:
             raise ValueError("a required recall projection must be configured")
@@ -80,6 +84,7 @@ class MemoryApplication:
         self._recall_projection = recall_projection
         self._projection_required = projection_required
         self._projection_search_oversample = projection_search_oversample
+        self._context_compressor = context_compressor or RecallContextCompressor()
         self._projection_available: bool | None = None
         self._follow_active_strategy = retrieval_policy is None
         if retrieval_policy is not None:
@@ -433,6 +438,16 @@ class MemoryApplication:
                 utility=utility,
                 idempotent_replay=not created,
             )
+
+    def project_recall_context(self, command: ProjectRecallContext) -> RecallContextResult:
+        trace = self._store.trace(command.scope, command.trace_id)
+        if trace is None:
+            raise NotFoundError("recall trace not found in scope")
+        return self._context_compressor.project(
+            trace,
+            algorithm=command.algorithm,
+            budget_characters=command.budget_characters,
+        )
 
     def history(self, scope: Scope, record_id: UUID) -> tuple[MemoryRevision, ...]:
         if self._store.snapshot(scope, record_id) is None:

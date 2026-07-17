@@ -6,6 +6,7 @@ from uuid import UUID
 
 from evolvable_memory.domain.common import (
     ContextSignature,
+    DomainError,
     Scope,
     require_text,
     require_utc,
@@ -15,6 +16,10 @@ from evolvable_memory.domain.experience import (
     OutcomeKind,
     RecallTrace,
     UtilityEstimate,
+)
+from evolvable_memory.domain.projection import (
+    ContextCompressionAlgorithm,
+    RecallContextProjection,
 )
 
 
@@ -136,6 +141,20 @@ class RecordOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectRecallContext:
+    scope: Scope
+    trace_id: UUID
+    algorithm: ContextCompressionAlgorithm = ContextCompressionAlgorithm.RANKED_EXTRACTIVE
+    budget_characters: int = 2_000
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.algorithm, ContextCompressionAlgorithm):
+            raise DomainError("context compression algorithm is invalid")
+        if not 64 <= self.budget_characters <= 100_000:
+            raise DomainError("projection budget must be in [64, 100000] characters")
+
+
+@dataclass(frozen=True, slots=True)
 class PreferenceResult:
     observation_id: UUID
     candidate_id: UUID
@@ -153,3 +172,4 @@ class OutcomeResult:
 
 
 RecallResult = RecallTrace
+RecallContextResult = RecallContextProjection

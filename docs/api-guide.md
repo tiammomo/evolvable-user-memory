@@ -238,7 +238,7 @@ curl -X POST http://127.0.0.1:38089/v1/recall \
 
 | 分量 | 当前含义 |
 | --- | --- |
-| `semantic` | 查询与 `key + value` 的词法相似度 |
+| `semantic` | 词法相似度与可用 Milvus COSINE 分数的较大值；投影不可用时退回词法 |
 | `context` | 保存上下文与请求上下文的匹配程度 |
 | `belief` | 该双时间快照中修订的信念置信度 |
 | `utility` | 当前上下文中、截至 `known_at` 已记录 Outcome 的效用均值 |
@@ -251,6 +251,39 @@ curl -X POST http://127.0.0.1:38089/v1/recall \
 > `valid_at` / `known_at` 重建的是 Revision 与 Outcome 的历史可见状态。召回评分仍使用请求执行时的不可变 `StrategySnapshot`，而不是自动寻找过去运行时使用过的策略、投影实现或索引版本。因此该接口提供的是 historical state projection，不是完整历史策略 replay。Trace 中的 `policy_id` / `policy_version` 明确记录本次实际使用的执行时策略。
 
 PostgreSQL `0003_bitemporal_recall` 会为旧 Trace 回填边界与 item 修订时间。旧 Outcome 原 Schema 没有保存系统摄入时点，迁移只能用 `min(occurred_at, migration time)` 近似 `recorded_at`；涉及迁移前 Outcome 的历史 Utility 是 best-effort 结果，不能作为精确的历史知识审计。
+
+### `POST /v1/recall-contexts`
+
+从一次不可变 RecallTrace 生成字符预算内的可归因 JSON 上下文：
+
+```bash
+curl -X POST http://127.0.0.1:38089/v1/recall-contexts \
+  -H 'content-type: application/json' \
+  -d '{
+    "tenant_id": "demo",
+    "subject_id": "alice",
+    "trace_id": "TRACE_ID",
+    "algorithm": "ranked-extractive-v1",
+    "max_characters": 2000
+  }'
+```
+
+当前算法：
+
+| algorithm | 行为 |
+| --- | --- |
+| `ranked-extractive-v1` | 按 Trace rank 选择完整的规范 JSON 记忆对象，超预算对象整条省略 |
+| `exact-deduplicated-v1` | 先精确去重相同 JSON 对象，再选择；合并片段保留全部源 revision |
+
+响应中的 `content` 是 `{"memories":[...]}` 规范 JSON。`segments` 为每个对象保存源
+`record_id`、`revision_id`、rank 和 score；`source_revision_ids` 提供扁平归因清单。
+`configuration_sha256`、`source_sha256` 和 `projection_sha256` 分别固定算法配置、完整源 Trace
+和最终投影。相同 Trace、算法和预算会得到相同内容与摘要。
+
+该端点是需要 `projection.compress` 权限的纯读取操作：不创建新 Trace，不更新 Belief 或
+Utility，也不把压缩正文持久化为第二份权威记忆。字符预算范围为 64–100000；它不是模型
+token 预算。`value` 仍是不受信任的数据，下游必须把 JSON 作为数据而不是指令处理。算法、
+完整性字段和后续 LLM 摘要扩展边界见[记忆压缩与上下文投影](memory-compression.md)。
 
 ### `POST /v1/outcomes`
 
@@ -312,3 +345,4 @@ Outcome 种类：
 5. 对 `409` 区分安全重试和业务内容冲突，不要盲目换键重试。
 6. 对 `404` 保持 Scope 无关的错误文案，避免跨租户枚举。
 7. 需要可复现的历史状态时同时保存请求与响应中的 `valid_at`、`known_at`、`policy_id` 和 `policy_version`；不要把 historical state projection 表述为完整历史策略 replay。
+8. 需要给 Agent 控制上下文体积时，先保存 Recall 的 `trace_id`，再调用 `/v1/recall-contexts`；仍应使用目标模型 tokenizer 做最终预算复核。

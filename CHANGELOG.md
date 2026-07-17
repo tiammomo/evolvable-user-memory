@@ -29,6 +29,7 @@
 - Milvus 2.6 可重建向量投影、离线 hash 与 OpenAI-compatible embedding 适配器，以及 PostgreSQL 最终 Scope/双时间复核的词法/向量混合召回。
 - `0006_milvus_projection_queue`、独立 projector CLI，以及支持租约抢占、指数退避、死信、游标、幂等 upsert 和全量重建的 Revision outbox 消费链。
 - 默认 Compose 的 etcd、MinIO、Milvus 和 projector 服务；Milvus 故障时 API 自动退回词法召回，并在健康信息中显示投影降级状态。
+- `POST /v1/recall-contexts` 可重现上下文压缩投影：按字符预算执行排序抽取或精确去重，保留每个片段的 record/revision/rank/score 归因，并返回配置、源 Trace 与最终投影 SHA-256；该纯读取路径使用独立 `projection.compress` 权限且不更新 Belief/Utility。
 
 ### Changed
 

@@ -58,6 +58,19 @@ def test_http_vertical_slice(harness: Harness) -> None:
     assert trace["valid_at"] == trace["known_at"] == trace["created_at"]
     assert trace["items"][0]["revision_valid_from"] == trace["items"][0]["revision_recorded_at"]
 
+    compressed = client.post(
+        "/v1/recall-contexts",
+        json={
+            "tenant_id": "tenant-a",
+            "subject_id": "alice",
+            "trace_id": trace["trace_id"],
+            "algorithm": "ranked-extractive-v1",
+            "max_characters": 2_000,
+        },
+    )
+    assert compressed.status_code == 200
+    assert compressed.json()["source_revision_ids"] == [memory["revision_id"]]
+
     outcome = client.post(
         "/v1/outcomes",
         json={
@@ -416,6 +429,7 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
         ("/v1/preferences/{record_id}/corrections", "post"),
         ("/v1/preferences/{record_id}/revisions", "get"),
         ("/v1/recall", "post"),
+        ("/v1/recall-contexts", "post"),
         ("/v1/outcomes", "post"),
     ):
         assert schema["paths"][path][method]["security"] == [{"OAuth2AccessToken": []}]
@@ -428,6 +442,9 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
     assert recall_schema["properties"]["known_at"]["anyOf"][0]["format"] == "date-time"
     recall_response = schema["components"]["schemas"]["RecallResponse"]
     assert {"valid_at", "known_at"} <= set(recall_response["required"])
+    compression_schema = schema["components"]["schemas"]["RecallContextProjectionRequest"]
+    assert compression_schema["properties"]["max_characters"]["minimum"] == 64
+    assert compression_schema["properties"]["max_characters"]["maximum"] == 100_000
 
 
 def test_openapi_documents_scope_bounds_timestamps_and_route_errors(
@@ -467,6 +484,7 @@ def test_openapi_documents_scope_bounds_timestamps_and_route_errors(
         },
         ("/v1/preferences/{record_id}/revisions", "get"): {401, 403, 404},
         ("/v1/recall", "post"): {400, 401, 403, 404, 413},
+        ("/v1/recall-contexts", "post"): {400, 401, 403, 404, 413},
         ("/v1/outcomes", "post"): {400, 401, 403, 404, 409, 413},
     }
     for (path, method), error_codes in expected_errors.items():

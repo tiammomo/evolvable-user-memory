@@ -9,6 +9,10 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstrai
 from evolvable_memory.application.commands import OutcomeResult, PreferenceResult
 from evolvable_memory.domain.experience import OutcomeKind, RecallTrace, UtilityEstimate
 from evolvable_memory.domain.memory import MemoryRevision, MemorySnapshot
+from evolvable_memory.domain.projection import (
+    ContextCompressionAlgorithm,
+    RecallContextProjection,
+)
 
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 OutcomeWeight = Annotated[float, Field(gt=0.0, le=10.0)]
@@ -311,6 +315,107 @@ class RecallResponse(ApiModel):
                 )
                 for item in trace.items
             ],
+        )
+
+
+class RecallContextProjectionRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    trace_id: UUID
+    algorithm: ContextCompressionAlgorithm = ContextCompressionAlgorithm.RANKED_EXTRACTIVE
+    max_characters: int = Field(default=2_000, ge=64, le=100_000)
+    purpose: PurposeText = "personalization"
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "tenant_id": "demo",
+                "subject_id": "alice",
+                "trace_id": "00000000-0000-0000-0000-000000000101",
+                "algorithm": "ranked-extractive-v1",
+                "max_characters": 2000,
+            }
+        },
+    )
+
+
+class ContextProjectionSourceResponse(ApiModel):
+    record_id: UUID
+    revision_id: UUID
+    rank: int
+    score: float
+
+
+class ContextProjectionSegmentResponse(ApiModel):
+    content: str
+    sources: list[ContextProjectionSourceResponse]
+
+
+class RecallContextProjectionResponse(ApiModel):
+    trace_id: UUID
+    policy_id: UUID
+    policy_version: int
+    algorithm: ContextCompressionAlgorithm
+    algorithm_version: int
+    max_characters: int
+    valid_at: datetime
+    known_at: datetime
+    trace_created_at: datetime
+    content: str
+    segments: list[ContextProjectionSegmentResponse]
+    source_revision_ids: list[UUID]
+    source_item_count: int
+    included_item_count: int
+    omitted_item_count: int
+    original_character_count: int
+    projected_character_count: int
+    compression_ratio: float
+    configuration_sha256: str
+    source_sha256: str
+    projection_sha256: str
+
+    @classmethod
+    def from_projection(
+        cls,
+        projection: RecallContextProjection,
+    ) -> RecallContextProjectionResponse:
+        return cls(
+            trace_id=projection.trace_id,
+            policy_id=projection.policy_id,
+            policy_version=projection.policy_version,
+            algorithm=projection.algorithm,
+            algorithm_version=projection.algorithm.version,
+            max_characters=projection.budget_characters,
+            valid_at=projection.valid_at,
+            known_at=projection.known_at,
+            trace_created_at=projection.trace_created_at,
+            content=projection.content,
+            segments=[
+                ContextProjectionSegmentResponse(
+                    content=segment.content,
+                    sources=[
+                        ContextProjectionSourceResponse(
+                            record_id=source.record_id,
+                            revision_id=source.revision_id,
+                            rank=source.rank,
+                            score=source.score,
+                        )
+                        for source in segment.sources
+                    ],
+                )
+                for segment in projection.segments
+            ],
+            source_revision_ids=list(projection.source_revision_ids),
+            source_item_count=projection.source_item_count,
+            included_item_count=projection.included_item_count,
+            omitted_item_count=projection.omitted_item_count,
+            original_character_count=projection.original_character_count,
+            projected_character_count=len(projection.content),
+            compression_ratio=projection.compression_ratio,
+            configuration_sha256=projection.configuration_sha256,
+            source_sha256=projection.source_sha256,
+            projection_sha256=projection.projection_sha256,
         )
 
 

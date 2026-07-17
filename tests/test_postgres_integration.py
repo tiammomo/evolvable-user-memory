@@ -25,6 +25,7 @@ from evolvable_memory.adapters.system import Uuid4Generator
 from evolvable_memory.api.app import create_app
 from evolvable_memory.application.commands import (
     CorrectPreference,
+    ProjectRecallContext,
     RecallMemory,
     RecordOutcome,
     RememberPreference,
@@ -36,7 +37,7 @@ from evolvable_memory.application.evolution import (
 )
 from evolvable_memory.application.service import MemoryApplication
 from evolvable_memory.config import Settings
-from evolvable_memory.domain.common import ConflictError, ContextSignature, Scope
+from evolvable_memory.domain.common import ConflictError, ContextSignature, NotFoundError, Scope
 from evolvable_memory.domain.evolution import (
     EvolutionExperiment,
     ExperimentStage,
@@ -234,6 +235,14 @@ def test_postgres_store_persists_the_attributable_memory_loop(postgres_url: str)
     )
     assert [item.revision_id for item in trace.items] == [created.revision_id]
     assert store.trace(other_scope, trace.id) is None
+    context_projection = app.project_recall_context(
+        ProjectRecallContext(scope=scope, trace_id=trace.id, budget_characters=2_000)
+    )
+    assert context_projection.source_revision_ids == (created.revision_id,)
+    with pytest.raises(NotFoundError, match="trace not found"):
+        app.project_recall_context(
+            ProjectRecallContext(scope=other_scope, trace_id=trace.id, budget_characters=2_000)
+        )
 
     outcome = app.record_outcome(
         RecordOutcome(
@@ -334,6 +343,10 @@ def test_postgres_store_persists_the_attributable_memory_loop(postgres_url: str)
     assert persisted_trace.known_at == trace.known_at
     assert persisted_trace.items[0].revision_valid_from == trace.items[0].revision_valid_from
     assert persisted_trace.items[0].revision_recorded_at == trace.items[0].revision_recorded_at
+    persisted_projection = reopened.project_recall_context(
+        ProjectRecallContext(scope=scope, trace_id=trace.id, budget_characters=2_000)
+    )
+    assert persisted_projection == context_projection
 
     with psycopg.connect(conninfo) as connection:
         outbox_count = connection.execute("SELECT count(*) FROM outbox_events").fetchone()

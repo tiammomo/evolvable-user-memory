@@ -116,13 +116,20 @@ bootstrap  →  api / adapters  →  application  →  domain
 
 ### Projection：投影平面
 
-关键词、embedding、图和摘要索引都是可丢弃投影：
+关键词、embedding、压缩上下文、图和摘要索引都是可丢弃投影：
 
 - 可从权威 Observation 和 Revision 重建。
 - 不能静默创造新的 Revision。
 - 必须有源修订号或游标，才能衡量投影延迟。
 
-当前版本没有独立投影存储，而是从 Scope 内权威修订链重建双时间可见快照，再计算词法分数。这是可替换实现，不是目标架构的权威数据模型。
+当前召回会从 Scope 内权威修订链重建双时间可见快照，计算词法分数，并可使用 Milvus
+生成向量候选；Milvus 命中必须由 PostgreSQL 最终复核。`RecallContextProjection` 还能从一次
+不可变 Trace 生成字符预算内的规范 JSON：`ranked-extractive-v1` 保留原排名，
+`exact-deduplicated-v1` 只合并完全相同的对象。每个输出片段都保留源 revision、rank 和 score，
+并用配置、源和结果 SHA-256 支持重建校验。它不持久化第二份权威正文，也不学习 Belief/Utility。
+
+当前压缩是确定性抽取和精确去重，不是 LLM 摘要、模糊语义聚类或物理遗忘。完整合同见
+[记忆压缩与上下文投影](memory-compression.md)。
 
 ### Evolution：演化平面
 
@@ -212,6 +219,19 @@ sorted RecalledItem list
   ↓
 append RecallTrace
 ```
+
+可选的上下文压缩发生在 Trace 已冻结之后：
+
+```text
+RecallTrace in Scope
+  ↓ deterministic extract / exact dedup
+bounded canonical JSON
+  ↓
+source revision attribution + reproducibility digests
+```
+
+这一步是纯读取投影。相同 Trace、算法和字符预算得到相同结果；过长条目会整条省略而不是
+截断事实，读取仍不修改 Belief 或 Utility。
 
 固定 relevance admission 先于加权评分：候选必须有词法命中，或者保存与请求两侧都提供了显式上下文且上下文为正向匹配。信念、效用和时效分量本身不能把无关候选变成相关结果。这条安全底线不属于 `StrategySnapshot` 的可演化权重，策略调优不能降低或绕过它。
 

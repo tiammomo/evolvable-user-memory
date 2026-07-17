@@ -24,6 +24,7 @@ ROLE_PERMISSIONS: Mapping[str, frozenset[MemoryAction]] = {
             MemoryAction.BELIEF_CORRECT,
             MemoryAction.EXPERIENCE_OUTCOME_WRITE,
             MemoryAction.EXPERIENCE_UTILITY_READ,
+            MemoryAction.PROJECTION_COMPRESS,
             MemoryAction.PROJECTION_RECALL,
         }
     ),
@@ -31,6 +32,7 @@ ROLE_PERMISSIONS: Mapping[str, frozenset[MemoryAction]] = {
         {
             MemoryAction.BELIEF_READ_CURRENT,
             MemoryAction.BELIEF_READ_HISTORY,
+            MemoryAction.PROJECTION_COMPRESS,
             MemoryAction.PROJECTION_RECALL,
         }
     ),
@@ -42,6 +44,7 @@ ROLE_PERMISSIONS: Mapping[str, frozenset[MemoryAction]] = {
             MemoryAction.BELIEF_CORRECT,
             MemoryAction.EXPERIENCE_OUTCOME_WRITE,
             MemoryAction.EXPERIENCE_UTILITY_READ,
+            MemoryAction.PROJECTION_COMPRESS,
             MemoryAction.PROJECTION_RECALL,
         }
     ),
@@ -50,6 +53,7 @@ ROLE_PERMISSIONS: Mapping[str, frozenset[MemoryAction]] = {
             MemoryAction.EVIDENCE_INGEST,
             MemoryAction.BELIEF_READ_CURRENT,
             MemoryAction.EXPERIENCE_OUTCOME_WRITE,
+            MemoryAction.PROJECTION_COMPRESS,
             MemoryAction.PROJECTION_RECALL,
         }
     ),

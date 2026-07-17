@@ -108,7 +108,7 @@ grant 的 purpose 拼接后放行。
 | Evidence | `evidence.ingest`、`evidence.read_raw`、`evidence.export` |
 | Belief | `belief.read_current`、`belief.read_history`、`belief.correct` |
 | Experience | `experience.trace_read`、`experience.outcome_write`、`experience.utility_read` |
-| Projection | `projection.recall`、`projection.rebuild` |
+| Projection | `projection.recall`、`projection.compress`、`projection.rebuild` |
 | Evolution | `evolution.strategy_propose/promote/rollback` |
 | Governance | `governance.role_manage`、`policy_manage`、`privacy_suppress`、`erasure_approve`、`audit_read`、`outbox_replay` |
 
@@ -121,16 +121,17 @@ grant 的 purpose 拼接后放行。
 | `POST /v1/preferences/{id}/corrections` | `belief.correct` |
 | `GET /v1/preferences/{id}/revisions` | `belief.read_history` |
 | `POST /v1/recall` | `projection.recall` |
+| `POST /v1/recall-contexts` | `projection.compress` |
 | `POST /v1/outcomes` | `experience.outcome_write` |
 
 ## 5. 内置角色模板
 
 | 角色 | 用途与边界 |
 | --- | --- |
-| `subject_self` | 当前信念、历史、修正、召回、摄入和 Outcome；不读取原始 Evidence |
-| `memory_reader` | 当前信念、历史和召回 |
-| `memory_operator` | 当前 API 的完整记忆闭环；不管理治理策略 |
-| `service_agent` | 摄入、当前信念、召回和 Outcome；不读取历史或原始 Evidence |
+| `subject_self` | 当前信念、历史、修正、召回/压缩、摄入和 Outcome；不读取原始 Evidence |
+| `memory_reader` | 当前信念、历史、召回和可归因上下文压缩 |
+| `memory_operator` | 当前 API 的完整记忆闭环与上下文压缩；不管理治理策略 |
+| `service_agent` | 摄入、当前信念、召回/压缩和 Outcome；不读取历史或原始 Evidence |
 | `privacy_officer` | 原始证据导出、抑制和删除审批 |
 | `auditor` | 只读取授权审计 |
 | `tenant_admin` | 管理角色和策略；不会自动获得记忆读取权 |

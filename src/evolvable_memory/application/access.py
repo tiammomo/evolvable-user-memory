@@ -6,6 +6,8 @@ from evolvable_memory.application.commands import (
     CorrectPreference,
     OutcomeResult,
     PreferenceResult,
+    ProjectRecallContext,
+    RecallContextResult,
     RecallMemory,
     RecallResult,
     RecordOutcome,
@@ -105,6 +107,19 @@ class AuthorizedMemoryApplication:
             resource_id=command.trace_id,
         )
         return self._application.record_outcome(command)
+
+    def project_recall_context(
+        self,
+        invocation: InvocationContext,
+        command: ProjectRecallContext,
+    ) -> RecallContextResult:
+        self._authorize(
+            invocation,
+            action=MemoryAction.PROJECTION_COMPRESS,
+            scope=command.scope,
+            resource_id=command.trace_id,
+        )
+        return self._application.project_recall_context(command)
 
     def history(
         self,

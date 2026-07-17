@@ -25,7 +25,7 @@
 | Evidence | 实际观察到了什么？ | `Observation`、`EvidenceSpan`、`Candidate` |
 | Belief | 当前相信什么？ | `MemoryRecord`、`MemoryRevision`、`BeliefState` |
 | Experience | 使用后结果如何？ | `RecallTrace`、`OutcomeEvent`、`UtilityEstimate` |
-| Projection | 如何高效检索？ | 词法召回 + 可选 Milvus 向量投影；PostgreSQL 最终复核 |
+| Projection | 如何高效检索和控制上下文？ | 词法/Milvus 候选 + `RecallContextProjection`；PostgreSQL/Trace 最终归因 |
 | Evolution | 如何安全优化策略？ | `StrategySnapshot`、有界提案、实验状态机 |
 
 最重要的不变量是：**列表和召回都是只读操作，不会强化信念或效用。只有引用某次 `RecallTrace` 的真实 Outcome 才能学习上下文效用。**
@@ -42,6 +42,7 @@
 - 通过可选 `valid_at` / `known_at` 在业务有效时间与系统知识时间上重建 Scope 内历史状态；省略时两轴使用同一次服务端时钟读数。
 - 按词法/向量相关性、上下文、信念、截至 `known_at` 已记录的 Outcome 效用，以及相对 `valid_at` 的时效进行可解释召回。
 - 为每次召回冻结双时间边界、策略版本、命中修订的有效/记录时间、评分拆解和 `trace_id`。
+- 从不可变 RecallTrace 生成字符预算内的确定性 JSON 上下文投影，支持排序抽取、精确去重、逐片段 revision 归因和可复现摘要校验。
 - 只接受能归因到对应 Trace 的 Outcome，并更新上下文效用。
 - 生成有界策略提案，持久化带幂等键、证据引用和 append-only 转换历史的演化实验；只有完整经过阶段顺序的内部编排才能原子晋升候选或回滚基线，普通候选注册不会激活。
 - 提供隔离运行的 `smoke-v1` 与显式时间线 `temporal-v1` synthetic 评测，对 Recall@k、MRR、更新、迟到/未来修订、历史 Outcome Utility、预期领域拒绝、forbidden/Scope 隔离和执行失败应用硬门禁。
@@ -55,6 +56,14 @@
 - CI 在内存与 PostgreSQL 两种权威存储下运行同一套 Chromium E2E，并验证 PostgreSQL 池连接被终止后 `/readyz` 与权威数据可恢复。
 - 浏览器门禁使用锁定版本的 axe-core 审计首页、引导、写入、列表、召回与修正弹窗的可见状态。
 - 提供独立前端工作台、Swagger UI 和可执行客户端示例。
+
+## 技术全景图
+
+[![Evolvable User Memory 可归因自进化技术架构](docs/assets/evolvable-memory-technical-architecture.png)](docs/assets/evolvable-memory-technical-architecture.png)
+
+图中的“压缩”边界已由当前 `RecallContextProjection` 落实为确定性抽取与精确去重；LLM 摘要、
+模糊聚类和物理遗忘仍明确属于未实现能力。生成提示词见
+[架构图提示词](docs/assets/evolvable-memory-technical-architecture.prompt.txt)。
 
 ## 记忆闭环
 
@@ -183,6 +192,7 @@ uv run python examples/first_memory.py
 | `POST` | `/v1/preferences/{record_id}/corrections` | 追加偏好修订 | 是 |
 | `GET` | `/v1/preferences/{record_id}/revisions` | 读取不可变历史 | 否 |
 | `POST` | `/v1/recall` | 执行当前或双时间历史状态召回并产生 Trace | 仅追加 Trace |
+| `POST` | `/v1/recall-contexts` | 从 Trace 生成可归因的有界上下文投影 | 否 |
 | `POST` | `/v1/outcomes` | 提交可归因结果并更新效用 | 是 |
 
 完整请求、响应、幂等规则、Outcome 类型和错误码见 [API 使用指南](docs/api-guide.md)。
@@ -289,6 +299,7 @@ uv run evolvable-memory-eval run --dataset builtin:temporal-v1
 
 - 原生快速开始的内存模式不持久化，后端重启即清空；PostgreSQL 是默认 Compose 的权威存储，但其故障恢复和生产运维仍处于开发预览。
 - 默认 Compose 已实现词法 + Milvus 向量的混合召回；原生内存模式仍只使用词法召回。默认离线 hash embedding 是确定性基线，不等于生产语义模型质量。
+- Trace 上下文压缩当前只提供确定性排序抽取与精确去重，预算按字符而不是模型 token 计算；尚未实现 LLM 摘要、模糊语义聚类或物理遗忘。
 - 双时间召回会按 `valid_at` / `known_at` 重建 Revision 和 Outcome 可见性，但仍使用执行时的 `StrategySnapshot`；它不是完整历史策略 replay。
 - `0003_bitemporal_recall` 会为旧 Outcome 近似回填系统记录时间。旧 Schema 没有保存真实摄入时点，因此迁移结果只能用于 best-effort 历史边界，不能当作精确历史审计事实。
 - 内置 `smoke-v1` / `temporal-v1` 只证明当前提交通过对应 synthetic 契约，不能外推为 LongMemEval、LoCoMo、SOTA 或真实业务质量；时间线回放也不是完整历史策略 replay。
@@ -312,6 +323,7 @@ uv run evolvable-memory-eval run --dataset builtin:temporal-v1
 | [身份与权限设计](docs/authorization.md) | 平台、安全与集成者 | JWT、角色、动作、purpose、审计和生产门禁 |
 | [架构说明](docs/architecture.md) | 开发者与架构师 | 分层、五平面、状态和不变量 |
 | [Milvus 投影指南](docs/milvus-projection.md) | 开发者与运维 | 向量投影、混合召回、worker、重建与故障降级 |
+| [记忆压缩与上下文投影](docs/memory-compression.md) | Agent 与平台集成者 | 字符预算、算法、归因摘要、安全边界和扩展规则 |
 | [开发指南](docs/development.md) | 贡献者 | 添加能力、测试和扩展方式 |
 | [记忆评测指南](docs/evaluation.md) | 开发者与策略评审者 | synthetic 契约集、指标、硬门禁和结果边界 |
 | [部署与运行指南](docs/deployment.md) | 新人与运维者 | uv、Docker Compose、健康检查和生产缺口 |

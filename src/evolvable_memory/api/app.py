@@ -33,6 +33,8 @@ from evolvable_memory.api.schemas import (
     PreferenceWriteRequest,
     PurposeText,
     ReadinessResponse,
+    RecallContextProjectionRequest,
+    RecallContextProjectionResponse,
     RecallRequest,
     RecallResponse,
     RevisionResponse,
@@ -48,6 +50,7 @@ from evolvable_memory.api.security import (
 from evolvable_memory.application.access import AuthorizedMemoryApplication
 from evolvable_memory.application.commands import (
     CorrectPreference,
+    ProjectRecallContext,
     RecallMemory,
     RecordOutcome,
     RememberPreference,
@@ -87,7 +90,10 @@ _OPENAPI_TAGS = [
     },
     {
         "name": "recall",
-        "description": "按双时间可见性、相关性、上下文、信念、效用和时效进行可追踪召回。",
+        "description": (
+            "按双时间可见性、相关性、上下文、信念、效用和时效进行可追踪召回, "
+            "并从 Trace 生成可归因的有界上下文投影。"
+        ),
     },
     {
         "name": "experience",
@@ -480,6 +486,34 @@ def create_app(
             ),
         )
         return RecallResponse.from_trace(trace)
+
+    @app.post(
+        "/v1/recall-contexts",
+        response_model=RecallContextProjectionResponse,
+        tags=["recall"],
+        summary="压缩一次召回的可归因上下文",
+        description=(
+            "从不可变 RecallTrace 生成字符预算内的确定性 JSON 投影。"
+            "每个片段保留源 record/revision、排名和得分, 不会改写证据、创建信念或学习效用。"
+            "相同 Trace、算法和预算会得到相同内容与 SHA-256。"
+        ),
+        responses=_error_responses(400, 401, 403, 404, 413),
+    )
+    def project_recall_context(
+        payload: RecallContextProjectionRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
+    ) -> RecallContextProjectionResponse:
+        projection = access.project_recall_context(
+            _invocation(http_request, actor, payload.purpose),
+            ProjectRecallContext(
+                scope=Scope(payload.tenant_id, payload.subject_id),
+                trace_id=payload.trace_id,
+                algorithm=payload.algorithm,
+                budget_characters=payload.max_characters,
+            ),
+        )
+        return RecallContextProjectionResponse.from_projection(projection)
 
     @app.post(
         "/v1/outcomes",

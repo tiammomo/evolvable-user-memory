@@ -15,7 +15,7 @@ from uuid import uuid4
 import httpx
 import pytest
 import uvicorn
-from playwright.sync_api import Browser, Error, Page, Route, expect, sync_playwright
+from playwright.sync_api import Browser, Error, FloatRect, Page, Route, expect, sync_playwright
 
 from conftest import prepare_postgres_database
 from evolvable_memory import frontend
@@ -156,7 +156,7 @@ def _open_console(page: Page, console: RunningConsole, *, tour: bool = False) ->
     expect(page.locator("#status-label")).to_have_text("API 在线")
 
 
-def _boxes_overlap(left: dict[str, float], right: dict[str, float]) -> bool:
+def _boxes_overlap(left: FloatRect, right: FloatRect) -> bool:
     horizontal = min(left["x"] + left["width"], right["x"] + right["width"]) - max(
         left["x"], right["x"]
     )
@@ -164,6 +164,20 @@ def _boxes_overlap(left: dict[str, float], right: dict[str, float]) -> bool:
         left["y"], right["y"]
     )
     return horizontal > 1 and vertical > 1
+
+
+def _box_is_inside(
+    inner: FloatRect,
+    outer: FloatRect,
+    *,
+    tolerance: float = 1,
+) -> bool:
+    return (
+        inner["x"] >= outer["x"] - tolerance
+        and inner["y"] >= outer["y"] - tolerance
+        and inner["x"] + inner["width"] <= outer["x"] + outer["width"] + tolerance
+        and inner["y"] + inner["height"] <= outer["y"] + outer["height"] + tolerance
+    )
 
 
 def _install_axe(page: Page) -> None:
@@ -396,6 +410,81 @@ def test_quickstart_has_no_horizontal_overflow_or_text_overlap(
         for index, left in enumerate(visible_boxes):
             for right in visible_boxes[index + 1 :]:
                 assert not _boxes_overlap(left, right)
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize("width", (320, 390, 568, 720, 721, 800, 801, 901, 1024))
+def test_topbar_actions_stay_inside_the_viewport_without_overlap(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+    width: int,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": width, "height": 844})
+    page = context.new_page()
+    try:
+        _open_console(page, running_console)
+        topbar = page.locator(".topbar")
+        actions = page.locator(".topbar-actions")
+        guide = page.locator("#open-onboarding")
+        scope = page.locator(".scope-control")
+        editor = page.locator(".scope-editor")
+        status = page.locator("#scope-status")
+        subject_field = page.locator(".scope-fields label").nth(1)
+        save = page.locator("#save-scope")
+
+        expect(guide).to_have_accessible_name("新手引导")
+        topbar_box = topbar.bounding_box()
+        actions_box = actions.bounding_box()
+        guide_box = guide.bounding_box()
+        scope_box = scope.bounding_box()
+        editor_box = editor.bounding_box()
+        status_box = status.bounding_box()
+        subject_field_box = subject_field.bounding_box()
+        save_box = save.bounding_box()
+        assert all(
+            box is not None
+            for box in (
+                topbar_box,
+                actions_box,
+                guide_box,
+                scope_box,
+                editor_box,
+                status_box,
+                subject_field_box,
+                save_box,
+            )
+        )
+        assert topbar_box is not None
+        assert actions_box is not None
+        assert guide_box is not None
+        assert scope_box is not None
+        assert editor_box is not None
+        assert status_box is not None
+        assert subject_field_box is not None
+        assert save_box is not None
+
+        assert _box_is_inside(actions_box, topbar_box)
+        assert _box_is_inside(guide_box, actions_box)
+        assert _box_is_inside(scope_box, actions_box)
+        assert _box_is_inside(editor_box, scope_box)
+        assert _box_is_inside(save_box, scope_box)
+        assert not _boxes_overlap(guide_box, scope_box)
+        assert not _boxes_overlap(editor_box, save_box)
+        assert status_box["x"] == pytest.approx(subject_field_box["x"], abs=1)
+
+        dimensions = page.evaluate(
+            """() => ({
+                documentClientWidth: document.documentElement.clientWidth,
+                documentScrollWidth: document.documentElement.scrollWidth,
+            })"""
+        )
+        assert dimensions["documentScrollWidth"] <= dimensions["documentClientWidth"] + 1
+
+        if width <= 620:
+            assert guide_box["width"] == pytest.approx(44, abs=1)
+        else:
+            assert guide_box["width"] > 44
     finally:
         context.close()
 

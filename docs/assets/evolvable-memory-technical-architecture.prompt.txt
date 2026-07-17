@@ -1,0 +1,80 @@
+Use case: infographic-diagram
+Asset type: repository technical architecture infographic
+Primary request: 为 Python 项目“Evolvable User Memory”生成一张严谨、可读的 16:9 横版中文技术架构图，解释记忆如何形成、自进化、召回，以及当前压缩边界。面向高级工程师和架构评审，不要营销海报感。
+Scene/backdrop: 浅灰白技术画布，极淡网格，清晰分区卡片，深蓝主线，青色数据流，橙色反馈/演化流，红色安全边界，留白充足。
+Style/medium: clean vector-like systems architecture infographic, crisp sans-serif Chinese typography, precise arrows, consistent icons, subtle shadows, flat design.
+Composition/framing: 3840×2160 感的 16:9 横版。主体从左到右分为五个平面，上方是一条闭环主链，右侧是演化状态机，下方是权威存储与可丢弃投影。避免小字，所有框线和箭头不交叉。
+
+Text (verbatim), only use these labels and formulas, render every label exactly once unless noted:
+Title: "Evolvable User Memory：可归因的自进化记忆"
+Subtitle: "Evidence → Belief → Experience → Projection → Evolution"
+
+Main flow cards:
+"① Evidence 证据"
+"Observation"
+"EvidenceSpan"
+"Candidate"
+"幂等键 + tenant/subject Scope"
+"② Belief 信念"
+"MemoryRecord"
+"不可变 MemoryRevision 链"
+"同值强化：c′ = 1 − (1−c)(1−e)"
+"异值修正：追加新版本，不覆盖历史"
+"valid_from / recorded_at"
+"③ Projection 召回"
+"双时间可见性"
+"词法 Jaccard + Milvus COSINE"
+"semantic = max(lexical, vector)"
+"S = .35语义 + .25上下文 + .20信念 + .15效用 + .05时效"
+"阈值 0.20｜半衰期 180 天"
+"RecallTrace 冻结策略与评分"
+"④ Experience 经验"
+"Outcome 必须命中 Trace 中的 revision"
+"Utility = (1 + 正向权重) / (2 + 总权重)"
+"只由真实 Outcome 学习"
+"读取绝不强化信念或效用"
+"⑤ Evolution 演化"
+"FailureDiagnosis"
+"单次权重变化 ≤ 0.03"
+"每个权重 ∈ [0.05, 0.60]，总和 = 1"
+"不可变 StrategySnapshot"
+
+Evolution state machine:
+"PROPOSED"
+"OFFLINE PASSED"
+"SHADOW"
+"CANARY"
+"PROMOTED"
+"ROLLED BACK"
+"GateReceipt：HMAC-SHA256"
+"晋升 / 回滚与策略激活原子提交"
+
+Bottom storage band:
+"PostgreSQL：唯一权威"
+"Observation · Revision · Trace · Outcome · Strategy"
+"Outbox → 租约 / 重试 / 死信 → Embedding"
+"Milvus：可丢弃、可重建投影"
+"哈希 Scope + 向量；PostgreSQL 最终复核"
+"故障降级：回退词法召回"
+
+Compression truth callout, clearly separated:
+"压缩真相"
+"当前已实现：证据巩固、版本链、分数筛选、确定性预算投影、精确去重"
+"当前未实现：LLM 摘要、模糊聚类、语义合并、token 级截断、遗忘删除"
+"原则：压缩不能改写证据，不能破坏归因"
+
+Security boundary footer:
+"不可演化：认证｜授权｜Scope 隔离｜删除/保留｜审计｜固定相关性门槛"
+
+Visual relationships:
+- Evidence arrows to Belief.
+- Belief arrows to Projection.
+- Projection arrows to RecallTrace and then Outcome/Experience.
+- Experience orange feedback arrow to FailureDiagnosis, then bounded candidate StrategySnapshot, then gated state machine, then back to retrieval weights.
+- Same-value reinforcement loops only within Belief and creates a new revision.
+- Show valid_at and known_at as two small clock axes before scoring.
+- PostgreSQL sits underneath all planes as authority; outbox flows to Milvus; Milvus only returns candidates back to Projection.
+- Put a red shield around non-evolvable constraints.
+
+Constraints: exact Chinese text, readable at full size, no invented algorithms or components, no logos, no watermark, no decorative people, no pseudo-code beyond supplied formulas, no 3D, no gradients behind text, no tiny footnotes.
+Avoid: illegible labels, misspelled Chinese, duplicated text, tangled arrows, dense wall of text, AI brain imagery, neural-network clichés, futuristic HUD, dark background.

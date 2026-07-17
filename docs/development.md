@@ -72,12 +72,14 @@ api / adapters  →  application  →  domain
 - 双时间 Recall 是否同时覆盖缺省同一时钟、单轴/双轴、迟到修正、未来生效修订、未来 `known_at` 拒绝和无合格 Revision。
 - 历史 Utility 是否排除 `known_at` 之后记录的 Outcome，Recency 是否以 `valid_at` 为参考，并且 Scope 隔离在每个时间查询中仍然成立。
 - Trace 与 Trace item 是否冻结最终双时间边界及命中 Revision 时间，内存与 PostgreSQL 是否返回一致结果。
+- 上下文压缩是否保持完整片段归因、预算上限、确定性摘要、Scope 隔离，并证明压缩读取不修改 Revision、Outcome 或 Utility。
 
 测试分层：
 
 | 位置 | 关注点 |
 | --- | --- |
 | `tests/test_memory_application.py` | 用例语义、双时间状态/效用、隔离、幂等、归因和召回中立性 |
+| `tests/test_compression.py` | Trace 上下文压缩算法、预算、精确去重、归因摘要和无副作用 |
 | `tests/test_api.py` | HTTP 状态、双时间 Schema、错误映射、CORS、OpenAPI |
 | `tests/test_authorization.py` | JWT claim、角色/action、Scope、purpose、失败关闭与伪名审计 |
 | `tests/test_evolution.py` | 策略边界和实验状态机 |
@@ -165,6 +167,10 @@ uv run evolvable-memory-eval run --dataset builtin:temporal-v1
 - 继续把最终结果固化到 RecallTrace。
 - 投影缺失或滞后时不能静默发明信念。
 - 召回仍然必须是信念和效用的只读操作。
+
+Trace 后置上下文压缩还必须遵守[记忆压缩与上下文投影](memory-compression.md)：不能截断单条
+事实，必须保存源 revision，不能把模糊相似度当成事实等价。模型驱动摘要需要独立 port、
+模型/prompt 版本和可重建摘要；不得直接替换当前 extractive 合同。
 
 当前双时间结果只重建历史 Revision/Outcome 状态，使用的仍是执行时 `StrategySnapshot`。若实现完整历史策略 replay，必须显式版本化并还原策略、投影代码/索引和必要运行环境，不能悄悄改变 `valid_at` / `known_at` 的既有含义。
 

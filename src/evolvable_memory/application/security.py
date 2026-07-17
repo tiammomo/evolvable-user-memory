@@ -33,6 +33,7 @@ class MemoryAction(StrEnum):
     EXPERIENCE_OUTCOME_WRITE = "experience.outcome_write"
     EXPERIENCE_UTILITY_READ = "experience.utility_read"
     PROJECTION_RECALL = "projection.recall"
+    PROJECTION_COMPRESS = "projection.compress"
     PROJECTION_REBUILD = "projection.rebuild"
     EVOLUTION_STRATEGY_PROPOSE = "evolution.strategy_propose"
     EVOLUTION_STRATEGY_PROMOTE = "evolution.strategy_promote"
@@ -60,6 +61,7 @@ _ACTION_PLANES: dict[MemoryAction, MemoryPlane] = {
     MemoryAction.EXPERIENCE_OUTCOME_WRITE: MemoryPlane.EXPERIENCE,
     MemoryAction.EXPERIENCE_UTILITY_READ: MemoryPlane.EXPERIENCE,
     MemoryAction.PROJECTION_RECALL: MemoryPlane.PROJECTION,
+    MemoryAction.PROJECTION_COMPRESS: MemoryPlane.PROJECTION,
     MemoryAction.PROJECTION_REBUILD: MemoryPlane.PROJECTION,
     MemoryAction.EVOLUTION_STRATEGY_PROPOSE: MemoryPlane.EVOLUTION,
     MemoryAction.EVOLUTION_STRATEGY_PROMOTE: MemoryPlane.EVOLUTION,

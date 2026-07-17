@@ -66,7 +66,16 @@ def test_role_policy_combines_action_scope_and_purpose_without_role_escalation()
     reader = _actor(role="memory_reader")
 
     allowed = authorizer.decide(_authorization_request(reader, MemoryAction.BELIEF_READ_CURRENT))
+    compression_allowed = authorizer.decide(
+        _authorization_request(reader, MemoryAction.PROJECTION_COMPRESS)
+    )
     write_denied = authorizer.decide(_authorization_request(reader, MemoryAction.EVIDENCE_INGEST))
+    strategy_compression_denied = authorizer.decide(
+        _authorization_request(
+            _actor(role="strategy_operator"),
+            MemoryAction.PROJECTION_COMPRESS,
+        )
+    )
     purpose_denied = authorizer.decide(
         _authorization_request(
             reader,
@@ -120,8 +129,10 @@ def test_role_policy_combines_action_scope_and_purpose_without_role_escalation()
     )
 
     assert allowed.allowed is True
+    assert compression_allowed.allowed is True
     assert allowed.reason == "explicit_grant"
     assert write_denied.reason == "action_not_granted"
+    assert strategy_compression_denied.reason == "action_not_granted"
     assert purpose_denied.reason == "purpose_not_granted"
     assert scope_denied.reason == "scope_not_granted"
     assert tenant_denied.reason == "scope_not_granted"

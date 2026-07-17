@@ -2,14 +2,17 @@
 
 这套文档按“先成功运行，再理解设计，最后扩展系统”的顺序组织。
 
+如果希望通过一份文档完整了解项目的适用场景、架构、数据库分工、本地运行、网页/API 使用、测试、故障排查和生产边界，请先阅读[完整项目手册](project-handbook.md)。
+
 ## 按角色阅读
 
 ### 第一次使用
 
-1. [快速开始](getting-started.md)
-2. [前端工作台指南](frontend-guide.md)
-3. [部署与运行指南](deployment.md)（使用 Docker 时）
-4. [故障排查](troubleshooting.md)
+1. [完整项目手册](project-handbook.md)
+2. [快速开始](getting-started.md)
+3. [前端工作台指南](frontend-guide.md)
+4. [部署与运行指南](deployment.md)（使用 Docker 时）
+5. [故障排查](troubleshooting.md)
 
 完成后，你应该能够写入一条偏好、召回它、提交真实结果并追加修订。
 
