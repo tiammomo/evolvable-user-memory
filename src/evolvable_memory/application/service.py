@@ -14,7 +14,12 @@ from evolvable_memory.application.commands import (
     RecordOutcome,
     RememberPreference,
 )
-from evolvable_memory.application.ports import Clock, IdGenerator, MemoryStore
+from evolvable_memory.application.ports import (
+    Clock,
+    IdGenerator,
+    MemoryStore,
+    RecallProjectionPort,
+)
 from evolvable_memory.domain.common import (
     AttributionError,
     ConflictError,
@@ -30,7 +35,12 @@ from evolvable_memory.domain.evidence import (
     Observation,
     ObservationKind,
 )
-from evolvable_memory.domain.evolution import RetrievalWeights, StrategySnapshot
+from evolvable_memory.domain.evolution import (
+    RetrievalWeights,
+    StrategyActivation,
+    StrategyActivationKind,
+    StrategySnapshot,
+)
 from evolvable_memory.domain.experience import (
     OutcomeEvent,
     RecalledItem,
@@ -56,29 +66,79 @@ class MemoryApplication:
         clock: Clock,
         ids: IdGenerator,
         retrieval_policy: StrategySnapshot | None = None,
+        recall_projection: RecallProjectionPort | None = None,
+        projection_required: bool = False,
+        projection_search_oversample: int = 10,
     ) -> None:
+        if projection_required and recall_projection is None:
+            raise ValueError("a required recall projection must be configured")
+        if not 1 <= projection_search_oversample <= 100:
+            raise ValueError("projection_search_oversample must be in [1, 100]")
         self._store = store
         self._clock = clock
         self._ids = ids
-        self._policy = retrieval_policy or StrategySnapshot(
-            id=ids.new(),
-            version=1,
-            weights=RetrievalWeights(),
-            min_score=0.20,
-            recency_half_life_days=180.0,
-            created_at=clock.now(),
-        )
-        self._store.save_strategy(self._policy)
+        self._recall_projection = recall_projection
+        self._projection_required = projection_required
+        self._projection_search_oversample = projection_search_oversample
+        self._projection_available: bool | None = None
+        self._follow_active_strategy = retrieval_policy is None
+        if retrieval_policy is not None:
+            self._policy = retrieval_policy
+            self._store.save_strategy(retrieval_policy)
+        else:
+            active = self._store.active_strategy()
+            if active is not None:
+                self._policy = active
+            else:
+                now = clock.now()
+                default = StrategySnapshot(
+                    id=ids.new(),
+                    version=1,
+                    weights=RetrievalWeights(),
+                    min_score=0.20,
+                    recency_half_life_days=180.0,
+                    created_at=now,
+                )
+                bootstrap = StrategyActivation(
+                    id=ids.new(),
+                    strategy_id=default.id,
+                    kind=StrategyActivationKind.BOOTSTRAP,
+                    activated_at=now,
+                    reason="initial default strategy",
+                )
+                self._policy = self._store.ensure_active_strategy(default, bootstrap)
 
     @property
     def retrieval_policy(self) -> StrategySnapshot:
+        if self._follow_active_strategy:
+            active = self._store.active_strategy()
+            if active is None:
+                raise DomainError("active strategy is unavailable")
+            return active
         return self._policy
 
     def is_ready(self) -> bool:
-        return self._store.is_ready()
+        authority_ready = self._store.is_ready()
+        if self._recall_projection is None or not self._projection_required:
+            return authority_ready
+        projection_ready = self._recall_projection.is_ready()
+        self._projection_available = projection_ready
+        return authority_ready and projection_ready
+
+    @property
+    def projection_status(self) -> str:
+        if self._recall_projection is None:
+            return "disabled"
+        if self._projection_available is None:
+            return "enabled"
+        return "ready" if self._projection_available else "degraded"
 
     def close(self) -> None:
-        self._store.close()
+        try:
+            if self._recall_projection is not None:
+                self._recall_projection.close()
+        finally:
+            self._store.close()
 
     def remember_preference(self, command: RememberPreference) -> PreferenceResult:
         with self._store.transaction():
@@ -249,6 +309,7 @@ class MemoryApplication:
             raise DomainError("recall query must not be blank")
 
         now = self._clock.now()
+        policy = self.retrieval_policy
         valid_at = command.valid_at or now
         known_at = command.known_at or now
         if known_at > now:
@@ -260,10 +321,23 @@ class MemoryApplication:
             valid_at=valid_at,
             known_at=known_at,
         )
+        vector_scores: dict[UUID, float] = {}
+        if self._recall_projection is not None:
+            projection_result = self._recall_projection.search(
+                command.scope,
+                query=query,
+                limit=command.limit * self._projection_search_oversample,
+                valid_at=valid_at,
+                known_at=known_at,
+            )
+            self._projection_available = projection_result.available
+            vector_scores = {hit.revision_id: hit.score for hit in projection_result.hits}
         for snapshot in snapshots:
             record = snapshot.record
             revision = snapshot.revision
-            semantic = _lexical_similarity(query, f"{record.key} {revision.value}")
+            lexical = _lexical_similarity(query, f"{record.key} {revision.value}")
+            vector = vector_scores.get(revision.id)
+            semantic = max(lexical, vector or 0.0)
             context = record.context.similarity(command.context)
             belief = revision.belief.confidence
             utility = self._store.utility_for_as_of(
@@ -276,13 +350,15 @@ class MemoryApplication:
                 0.0,
                 (valid_at - revision.belief.last_evidence_at).total_seconds() / 86_400.0,
             )
-            recency = pow(0.5, age_days / self._policy.recency_half_life_days)
+            recency = pow(0.5, age_days / policy.recency_half_life_days)
             breakdown = ScoreBreakdown(
                 semantic=semantic,
                 context=context,
                 belief=belief,
                 utility=utility,
                 recency=recency,
+                lexical=lexical,
+                vector=vector,
             )
             if not _passes_relevance_admission(
                 semantic=semantic,
@@ -291,8 +367,8 @@ class MemoryApplication:
                 context_score=context,
             ):
                 continue
-            score = _weighted_score(breakdown, self._policy.weights)
-            if score >= self._policy.min_score:
+            score = _weighted_score(breakdown, policy.weights)
+            if score >= policy.min_score:
                 scored.append((score, revision.recorded_at, record, revision, breakdown))
 
         scored.sort(key=lambda entry: (entry[0], entry[1], str(entry[3].id)), reverse=True)
@@ -319,8 +395,8 @@ class MemoryApplication:
             scope=command.scope,
             query=query,
             context=command.context,
-            policy_id=self._policy.id,
-            policy_version=self._policy.version,
+            policy_id=policy.id,
+            policy_version=policy.version,
             items=items,
             valid_at=valid_at,
             known_at=known_at,

@@ -1,0 +1,259 @@
+{
+  "schema_version": 2,
+  "name": "builtin-temporal-v1",
+  "version": "1.0.0",
+  "recall_k": 1,
+  "cases": [
+    {
+      "type": "write",
+      "id": "destination-original",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "source": "synthetic-user",
+      "idempotency_key": "temporal/destination/1",
+      "key": "travel.destination",
+      "value": "Berlin",
+      "context": {"trip": "spring"},
+      "evidence_text": "My spring destination is Berlin",
+      "confidence": 0.9,
+      "occurred_at": "2026-04-01T00:00:00Z",
+      "run_at": "2026-04-01T00:00:00Z",
+      "expected": {"sequence": 1, "idempotent_replay": false}
+    },
+    {
+      "type": "recall",
+      "id": "original-at-ingestion",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "run_at": "2026-04-01T00:00:00Z",
+      "expected": {
+        "relevant": [{"case_id": "destination-original"}],
+        "forbidden": [],
+        "abstain": false
+      }
+    },
+    {
+      "type": "correction",
+      "id": "destination-late-correction",
+      "target": {"case_id": "destination-original"},
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "source": "synthetic-user-correction",
+      "idempotency_key": "temporal/destination/2",
+      "value": "Kyoto",
+      "evidence_text": "The earlier destination was Kyoto, not Berlin",
+      "reason": "late-arriving explicit correction",
+      "occurred_at": "2026-03-15T00:00:00Z",
+      "run_at": "2026-04-10T00:00:00Z",
+      "expected": {"sequence": 2, "idempotent_replay": false}
+    },
+    {
+      "type": "recall",
+      "id": "before-late-correction-was-known",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-04-10T00:00:00Z",
+      "known_at": "2026-04-09T23:59:59Z",
+      "run_at": "2026-04-10T00:00:00Z",
+      "expected": {
+        "relevant": [{"case_id": "destination-original"}],
+        "forbidden": [{"case_id": "destination-late-correction"}],
+        "abstain": false
+      }
+    },
+    {
+      "type": "recall",
+      "id": "at-late-correction-knowledge-boundary",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-04-10T00:00:00Z",
+      "known_at": "2026-04-10T00:00:00Z",
+      "run_at": "2026-04-10T00:00:00Z",
+      "expected": {
+        "relevant": [{"case_id": "destination-late-correction"}],
+        "forbidden": [{"case_id": "destination-original"}],
+        "abstain": false
+      }
+    },
+    {
+      "type": "correction",
+      "id": "destination-future-correction",
+      "target": {"case_id": "destination-late-correction"},
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "source": "synthetic-user-correction",
+      "idempotency_key": "temporal/destination/3",
+      "value": "Osaka",
+      "evidence_text": "My destination changes to Osaka in May",
+      "reason": "scheduled future preference",
+      "occurred_at": "2026-05-01T00:00:00Z",
+      "run_at": "2026-04-11T00:00:00Z",
+      "expected": {"sequence": 3, "idempotent_replay": false}
+    },
+    {
+      "type": "recall",
+      "id": "before-future-correction-is-effective",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-04-30T23:59:59Z",
+      "known_at": "2026-04-11T00:00:00Z",
+      "run_at": "2026-04-11T00:00:00Z",
+      "expected": {
+        "relevant": [{"case_id": "destination-late-correction"}],
+        "forbidden": [{"case_id": "destination-future-correction"}],
+        "abstain": false
+      }
+    },
+    {
+      "type": "recall",
+      "id": "at-future-correction-valid-boundary",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-05-01T00:00:00Z",
+      "known_at": "2026-04-11T00:00:00Z",
+      "run_at": "2026-04-11T00:00:00Z",
+      "expected": {
+        "relevant": [{"case_id": "destination-future-correction"}],
+        "forbidden": [{"case_id": "destination-late-correction"}],
+        "abstain": false
+      }
+    },
+    {
+      "type": "recall",
+      "id": "trace-for-helpful-outcome",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-04-12T00:00:00Z",
+      "known_at": "2026-04-12T00:00:00Z",
+      "run_at": "2026-04-12T00:00:00Z",
+      "expected": {
+        "relevant": [{"case_id": "destination-late-correction"}],
+        "forbidden": [{"case_id": "destination-future-correction"}],
+        "abstain": false,
+        "utilities": [
+          {"memory": {"case_id": "destination-late-correction"}, "mean": 0.5}
+        ]
+      }
+    },
+    {
+      "type": "outcome",
+      "id": "helpful-outcome",
+      "trace": "trace-for-helpful-outcome",
+      "memory": {"case_id": "destination-late-correction"},
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "kind": "helpful",
+      "idempotency_key": "temporal/outcome/1",
+      "occurred_at": "2026-04-12T00:01:00Z",
+      "run_at": "2026-04-12T00:01:00Z",
+      "note": "synthetic attributable outcome",
+      "expected": {"utility_mean": 0.6666666666666666, "idempotent_replay": false}
+    },
+    {
+      "type": "recall",
+      "id": "utility-before-outcome-was-known",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-04-12T00:00:00Z",
+      "known_at": "2026-04-12T00:00:00Z",
+      "run_at": "2026-04-12T00:01:00Z",
+      "expected": {
+        "relevant": [{"case_id": "destination-late-correction"}],
+        "forbidden": [],
+        "abstain": false,
+        "utilities": [
+          {"memory": {"case_id": "destination-late-correction"}, "mean": 0.5}
+        ]
+      }
+    },
+    {
+      "type": "recall",
+      "id": "utility-at-outcome-knowledge-boundary",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-04-12T00:00:00Z",
+      "known_at": "2026-04-12T00:01:00Z",
+      "run_at": "2026-04-12T00:01:00Z",
+      "expected": {
+        "relevant": [{"case_id": "destination-late-correction"}],
+        "forbidden": [],
+        "abstain": false,
+        "utilities": [
+          {
+            "memory": {"case_id": "destination-late-correction"},
+            "mean": 0.6666666666666666
+          }
+        ]
+      }
+    },
+    {
+      "type": "outcome",
+      "id": "helpful-outcome-replay",
+      "trace": "trace-for-helpful-outcome",
+      "memory": {"case_id": "destination-late-correction"},
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "kind": "helpful",
+      "idempotency_key": "temporal/outcome/1",
+      "occurred_at": "2026-04-12T00:01:00Z",
+      "run_at": "2026-04-12T00:02:00Z",
+      "note": "synthetic attributable outcome",
+      "expected": {"utility_mean": 0.6666666666666666, "idempotent_replay": true}
+    },
+    {
+      "type": "recall",
+      "id": "no-revision-at-early-valid-time",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-03-01T00:00:00Z",
+      "known_at": "2026-04-12T00:02:00Z",
+      "run_at": "2026-04-12T00:03:00Z",
+      "expected": {"relevant": [], "forbidden": [], "abstain": true}
+    },
+    {
+      "type": "recall",
+      "id": "temporal-scope-isolation",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "bob"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "valid_at": "2026-05-01T00:00:00Z",
+      "known_at": "2026-04-12T00:03:00Z",
+      "run_at": "2026-04-12T00:04:00Z",
+      "expected": {
+        "relevant": [],
+        "forbidden": [{"case_id": "destination-future-correction"}],
+        "abstain": true
+      }
+    },
+    {
+      "type": "recall",
+      "id": "future-known-at-is-rejected",
+      "scope": {"tenant_id": "eval-temporal", "subject_id": "alice"},
+      "query": "spring travel destination Berlin Kyoto Osaka",
+      "context": {"trip": "spring"},
+      "limit": 5,
+      "known_at": "2026-04-13T00:00:00Z",
+      "run_at": "2026-04-12T00:05:00Z",
+      "expected": {
+        "relevant": [],
+        "forbidden": [],
+        "abstain": false,
+        "error": "future_known_at"
+      }
+    }
+  ]
+}

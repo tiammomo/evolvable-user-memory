@@ -1,31 +1,160 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import psycopg
 import pytest
 from alembic import command as alembic_command
+from fastapi.testclient import TestClient
 from psycopg.errors import CheckViolation, ForeignKeyViolation
 
-from conftest import FixedClock, SequentialIds
+from conftest import FixedClock, SequentialIds, prepare_postgres_database
+from evolvable_memory.adapters.gate_receipts import (
+    HmacGateReceiptSigner,
+    HmacGateReceiptVerifier,
+)
 from evolvable_memory.adapters.postgres import PostgresMemoryStore
 from evolvable_memory.adapters.system import Uuid4Generator
+from evolvable_memory.api.app import create_app
 from evolvable_memory.application.commands import (
     CorrectPreference,
     RecallMemory,
     RecordOutcome,
     RememberPreference,
 )
+from evolvable_memory.application.evolution import (
+    EvolutionApplication,
+    EvolutionProposal,
+    EvolutionTransitionResult,
+)
 from evolvable_memory.application.service import MemoryApplication
+from evolvable_memory.config import Settings
 from evolvable_memory.domain.common import ConflictError, ContextSignature, Scope
+from evolvable_memory.domain.evolution import (
+    EvolutionExperiment,
+    ExperimentStage,
+    FailureDiagnosis,
+    GateDecision,
+    GateReceipt,
+    StrategyActivationKind,
+    StrategySnapshot,
+)
 from evolvable_memory.domain.experience import OutcomeKind
-from evolvable_memory.migrate import alembic_config, upgrade_database
+from evolvable_memory.migrate import alembic_config
+from fault_proxy import TcpFaultProxy, database_url_through_proxy, postgres_target
 
 pytestmark = pytest.mark.postgres
+
+_GATE_ISSUER = "postgres-test-evaluator"
+_GATE_KEY_ID = "postgres-test-key-v1"
+_GATE_SECRET = b"postgres-test-gate-receipt-secret-32-bytes-minimum"
+_GATE_SIGNER = HmacGateReceiptSigner(
+    issuer=_GATE_ISSUER,
+    key_id=_GATE_KEY_ID,
+    secret=_GATE_SECRET,
+)
+
+
+def _evolution_application(
+    store: PostgresMemoryStore,
+    clock: FixedClock,
+    ids: SequentialIds | Uuid4Generator,
+) -> EvolutionApplication:
+    return EvolutionApplication(
+        store=store,
+        clock=clock,
+        ids=ids,
+        gate_verifier=HmacGateReceiptVerifier({(_GATE_ISSUER, _GATE_KEY_ID): _GATE_SECRET}),
+    )
+
+
+def _gate_receipt(
+    experiment: EvolutionExperiment,
+    clock: FixedClock,
+    target: ExperimentStage,
+    *,
+    reason: str,
+    evidence_ref: str,
+) -> GateReceipt:
+    if target is ExperimentStage.REJECTED:
+        decision = GateDecision.REJECT
+    elif target is ExperimentStage.ROLLED_BACK:
+        decision = GateDecision.ROLLBACK
+    else:
+        decision = GateDecision.PASS
+    identity = "|".join(
+        (
+            str(experiment.id),
+            experiment.stage.value,
+            target.value,
+            reason,
+            evidence_ref,
+            clock.now().isoformat(),
+        )
+    )
+    return _GATE_SIGNER.issue(
+        receipt_id=uuid5(NAMESPACE_URL, identity),
+        experiment=experiment,
+        target=target,
+        decision=decision,
+        artifact_ref=evidence_ref,
+        artifact_sha256=sha256(evidence_ref.encode()).hexdigest(),
+        issued_at=clock.now(),
+        expires_at=clock.now() + timedelta(minutes=5),
+        hard_gates_passed=decision is GateDecision.PASS,
+        reason=reason,
+    )
+
+
+def _advance_evolution(
+    application: EvolutionApplication,
+    store: PostgresMemoryStore,
+    clock: FixedClock,
+    experiment_id: UUID,
+    target: ExperimentStage,
+    *,
+    reason: str,
+    evidence_ref: str,
+    idempotency_key: str,
+) -> EvolutionTransitionResult:
+    current = store.evolution_experiment(experiment_id)
+    assert current is not None
+    existing = store.experiment_transition_by_idempotency(idempotency_key.strip())
+    receipt_experiment = current
+    if (
+        existing is not None
+        and existing.experiment_id == experiment_id
+        and existing.to_stage is target
+        and existing.from_stage is not None
+    ):
+        receipt_experiment = replace(current, stage=existing.from_stage)
+    return application.advance(
+        experiment_id,
+        target,
+        receipt=_gate_receipt(
+            receipt_experiment,
+            clock,
+            target,
+            reason=reason,
+            evidence_ref=evidence_ref,
+        ),
+        idempotency_key=idempotency_key,
+    )
+
+
+def test_postgres_store_rejects_nonpositive_readiness_timeout() -> None:
+    with pytest.raises(ValueError, match="readiness_timeout"):
+        PostgresMemoryStore(
+            "postgresql://unused:unused@127.0.0.1:1/unused",
+            readiness_timeout=0,
+        )
 
 
 @pytest.fixture
@@ -34,18 +163,7 @@ def postgres_url() -> Iterator[str]:
     if database_url is None:
         pytest.skip("set EMF_TEST_DATABASE_URL to run PostgreSQL integration tests")
 
-    upgrade_database(database_url)
-    conninfo = database_url.replace("postgresql+psycopg://", "postgresql://", 1)
-    with psycopg.connect(conninfo) as connection:
-        connection.execute(
-            """
-            TRUNCATE TABLE
-                outbox_events, utility_estimates, outcomes, recall_trace_items,
-                recall_traces, revision_transitions, candidates, memory_revisions,
-                memory_records, evidence_spans, observations, strategy_snapshots
-            CASCADE
-            """
-        )
+    prepare_postgres_database(database_url)
     yield database_url
 
 
@@ -70,8 +188,23 @@ def test_postgres_store_persists_the_attributable_memory_loop(postgres_url: str)
     clock = FixedClock()
     store = PostgresMemoryStore(postgres_url, min_size=1, max_size=2)
     app = MemoryApplication(store=store, clock=clock, ids=SequentialIds())
+    original_policy = app.retrieval_policy
 
     assert app.is_ready()
+    activation_history = store.strategy_activation_history()
+    assert [item.kind for item in activation_history] == [StrategyActivationKind.BOOTSTRAP]
+    conninfo = postgres_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    with psycopg.connect(conninfo, autocommit=True) as connection:
+        with pytest.raises(CheckViolation, match="append-only"):
+            connection.execute(
+                "UPDATE strategy_activations SET reason = 'changed' WHERE id = %s",
+                (activation_history[0].id,),
+            )
+        with pytest.raises(CheckViolation, match="append-only"):
+            connection.execute(
+                "DELETE FROM strategy_activations WHERE id = %s",
+                (activation_history[0].id,),
+            )
     with pytest.raises(ConflictError, match="strategy id"):
         store.save_strategy(replace(app.retrieval_policy, min_score=0.3))
     with pytest.raises(RuntimeError, match="force rollback"), store.transaction():
@@ -189,6 +322,8 @@ def test_postgres_store_persists_the_attributable_memory_loop(postgres_url: str)
         clock=FixedClock(),
         ids=SequentialIds(),
     )
+    assert reopened.retrieval_policy == original_policy
+    assert len(reopened_store.strategy_activation_history()) == 1
     snapshots = reopened.list_preferences(scope)
     assert [(item.revision.value, item.revision.sequence) for item in snapshots] == [
         ("herbal tea", 2)
@@ -200,12 +335,448 @@ def test_postgres_store_persists_the_attributable_memory_loop(postgres_url: str)
     assert persisted_trace.items[0].revision_valid_from == trace.items[0].revision_valid_from
     assert persisted_trace.items[0].revision_recorded_at == trace.items[0].revision_recorded_at
 
-    conninfo = postgres_url.replace("postgresql+psycopg://", "postgresql://", 1)
     with psycopg.connect(conninfo) as connection:
         outbox_count = connection.execute("SELECT count(*) FROM outbox_events").fetchone()
         assert outbox_count is not None and outbox_count[0] >= 4
     reopened.close()
     assert not reopened.is_ready()
+
+
+def test_postgres_out_of_order_outcomes_keep_utility_time_monotonic(
+    postgres_url: str,
+) -> None:
+    scope = Scope("tenant-utility-order", "alice")
+    context = ContextSignature.from_mapping({"time_of_day": "evening"})
+    clock = FixedClock()
+    store = PostgresMemoryStore(postgres_url, min_size=1, max_size=2)
+    app = MemoryApplication(store=store, clock=clock, ids=SequentialIds())
+    memory = app.remember_preference(_preference(scope, context, "utility:preference"))
+    trace = app.recall(RecallMemory(scope=scope, query="decaf coffee", context=context))
+    clock.advance(days=2)
+    latest_outcome_at = clock.now()
+    app.record_outcome(
+        RecordOutcome(
+            scope=scope,
+            trace_id=trace.id,
+            revision_id=memory.revision_id,
+            kind=OutcomeKind.HELPFUL,
+            idempotency_key="utility:latest-business-time",
+            occurred_at=latest_outcome_at,
+        )
+    )
+    clock.advance(seconds=1)
+    late_arrival = app.record_outcome(
+        RecordOutcome(
+            scope=scope,
+            trace_id=trace.id,
+            revision_id=memory.revision_id,
+            kind=OutcomeKind.HARMFUL,
+            idempotency_key="utility:late-arrival",
+            occurred_at=latest_outcome_at - timedelta(days=1),
+        )
+    )
+
+    historical = store.utility_for_as_of(
+        scope,
+        memory.revision_id,
+        context,
+        known_at=clock.now(),
+    )
+    assert late_arrival.utility.last_outcome_at == latest_outcome_at
+    assert historical.last_outcome_at == latest_outcome_at
+    assert late_arrival.utility == historical
+    app.close()
+
+
+def test_postgres_concurrent_startup_bootstraps_one_active_strategy(
+    postgres_url: str,
+) -> None:
+    store = PostgresMemoryStore(postgres_url, min_size=1, max_size=4)
+    clock = FixedClock()
+
+    def start_application() -> StrategySnapshot:
+        application = MemoryApplication(store=store, clock=clock, ids=Uuid4Generator())
+        return application.retrieval_policy
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        policies = tuple(executor.map(lambda _: start_application(), range(2)))
+
+    assert policies[0] == policies[1] == store.active_strategy()
+    assert len(store.strategy_activation_history()) == 1
+    conninfo = postgres_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    with psycopg.connect(conninfo) as connection:
+        strategy_count = connection.execute("SELECT count(*) FROM strategy_snapshots").fetchone()
+        activation_count = connection.execute(
+            "SELECT count(*) FROM strategy_activations"
+        ).fetchone()
+    assert strategy_count == (1,)
+    assert activation_count == (1,)
+    store.close()
+
+
+def test_postgres_persists_gated_promotion_and_atomic_rollback(
+    postgres_url: str,
+) -> None:
+    store = PostgresMemoryStore(postgres_url, min_size=1, max_size=2)
+    clock = FixedClock()
+    ids = Uuid4Generator()
+    memory = MemoryApplication(store=store, clock=clock, ids=ids)
+    evolution = _evolution_application(store, clock, ids)
+    baseline = memory.retrieval_policy
+    proposal = evolution.propose(
+        FailureDiagnosis(harmful_results=4),
+        reason="harmful outcome diagnosis",
+        evidence_ref="artifact://postgres/diagnosis",
+        idempotency_key="postgres:proposal:gated",
+    )
+    assert proposal is not None
+    proposal_replay = evolution.propose(
+        FailureDiagnosis(harmful_results=4),
+        reason="harmful outcome diagnosis",
+        evidence_ref="artifact://postgres/diagnosis",
+        idempotency_key="postgres:proposal:gated",
+    )
+    assert proposal_replay is not None
+    assert proposal_replay.candidate == proposal.candidate
+    assert proposal_replay.experiment == proposal.experiment
+    assert proposal_replay.idempotent_replay is True
+    assert memory.retrieval_policy == baseline
+
+    for stage in (
+        ExperimentStage.OFFLINE_PASSED,
+        ExperimentStage.SHADOW,
+        ExperimentStage.CANARY,
+        ExperimentStage.PROMOTED,
+    ):
+        clock.advance(seconds=1)
+        result = _advance_evolution(
+            evolution,
+            store,
+            clock,
+            proposal.experiment.id,
+            stage,
+            reason=f"passed {stage.value}",
+            evidence_ref=f"artifact://postgres/{stage.value}",
+            idempotency_key=f"postgres:advance:gated:{stage.value}",
+        )
+        if stage is ExperimentStage.OFFLINE_PASSED:
+            replay = _advance_evolution(
+                evolution,
+                store,
+                clock,
+                proposal.experiment.id,
+                stage,
+                reason=f"passed {stage.value}",
+                evidence_ref=f"artifact://postgres/{stage.value}",
+                idempotency_key=f"postgres:advance:gated:{stage.value}",
+            )
+            assert replay.experiment == result.experiment
+            assert replay.idempotent_replay is True
+
+    assert memory.retrieval_policy == proposal.candidate
+    assert [item.kind for item in store.strategy_activation_history()] == [
+        StrategyActivationKind.BOOTSTRAP,
+        StrategyActivationKind.PROMOTION,
+    ]
+    app_history = store.experiment_transition_history(proposal.experiment.id)
+    assert [item.to_stage for item in app_history] == [
+        ExperimentStage.PROPOSED,
+        ExperimentStage.OFFLINE_PASSED,
+        ExperimentStage.SHADOW,
+        ExperimentStage.CANARY,
+        ExperimentStage.PROMOTED,
+    ]
+    memory.close()
+
+    reopened_store = PostgresMemoryStore(postgres_url, min_size=1, max_size=2)
+    reopened_memory = MemoryApplication(
+        store=reopened_store,
+        clock=clock,
+        ids=Uuid4Generator(),
+    )
+    reopened_evolution = _evolution_application(reopened_store, clock, Uuid4Generator())
+    assert reopened_memory.retrieval_policy == proposal.candidate
+    assert reopened_store.strategy(proposal.candidate.id) == proposal.candidate
+    persisted = reopened_store.evolution_experiment(proposal.experiment.id)
+    assert persisted is not None and persisted.stage is ExperimentStage.PROMOTED
+
+    clock.advance(seconds=1)
+    rolled_back = _advance_evolution(
+        reopened_evolution,
+        reopened_store,
+        clock,
+        proposal.experiment.id,
+        ExperimentStage.ROLLED_BACK,
+        reason="production regression rollback",
+        evidence_ref="alert://postgres/rollback",
+        idempotency_key="postgres:advance:gated:rollback",
+    )
+    assert rolled_back.experiment.stage is ExperimentStage.ROLLED_BACK
+    assert reopened_memory.retrieval_policy == baseline
+    assert [item.kind for item in reopened_store.strategy_activation_history()] == [
+        StrategyActivationKind.BOOTSTRAP,
+        StrategyActivationKind.PROMOTION,
+        StrategyActivationKind.ROLLBACK,
+    ]
+
+    conninfo = postgres_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    with psycopg.connect(conninfo, autocommit=True) as connection:
+        transition_id = reopened_store.experiment_transition_history(proposal.experiment.id)[0].id
+        with pytest.raises(CheckViolation, match="append-only"):
+            connection.execute(
+                "DELETE FROM evolution_experiment_transitions WHERE id = %s",
+                (transition_id,),
+            )
+        with pytest.raises(CheckViolation, match="cannot be deleted"):
+            connection.execute(
+                "DELETE FROM evolution_experiments WHERE id = %s",
+                (proposal.experiment.id,),
+            )
+        with pytest.raises(CheckViolation, match="illegal evolution experiment transition"):
+            connection.execute(
+                """
+                UPDATE evolution_experiments
+                SET stage = 'promoted', updated_at = updated_at + interval '1 second'
+                WHERE id = %s
+                """,
+                (proposal.experiment.id,),
+            )
+    reopened_memory.close()
+
+
+def test_postgres_rejects_stale_competing_promotion_without_partial_transition(
+    postgres_url: str,
+) -> None:
+    store = PostgresMemoryStore(postgres_url, min_size=1, max_size=2)
+    clock = FixedClock()
+    ids = Uuid4Generator()
+    memory = MemoryApplication(store=store, clock=clock, ids=ids)
+    evolution = _evolution_application(store, clock, ids)
+    proposals = tuple(
+        evolution.propose(
+            FailureDiagnosis(context_mismatches=count),
+            reason=f"diagnosis {count}",
+            evidence_ref=f"artifact://postgres/competing/{count}",
+            idempotency_key=f"postgres:proposal:competing:{count}",
+        )
+        for count in (2, 3)
+    )
+    assert all(proposal is not None for proposal in proposals)
+    first, second = proposals
+    assert first is not None and second is not None
+    for proposal in (first, second):
+        for stage in (
+            ExperimentStage.OFFLINE_PASSED,
+            ExperimentStage.SHADOW,
+            ExperimentStage.CANARY,
+        ):
+            clock.advance(seconds=1)
+            _advance_evolution(
+                evolution,
+                store,
+                clock,
+                proposal.experiment.id,
+                stage,
+                reason=f"passed {stage.value}",
+                evidence_ref=f"artifact://postgres/{proposal.experiment.id}/{stage.value}",
+                idempotency_key=(f"postgres:advance:{proposal.experiment.id}:{stage.value}"),
+            )
+
+    clock.advance(seconds=1)
+    _advance_evolution(
+        evolution,
+        store,
+        clock,
+        first.experiment.id,
+        ExperimentStage.PROMOTED,
+        reason="first promotion",
+        evidence_ref="approval://postgres/first",
+        idempotency_key=f"postgres:advance:{first.experiment.id}:promoted",
+    )
+    second_history = store.experiment_transition_history(second.experiment.id)
+    clock.advance(seconds=1)
+    with pytest.raises(ConflictError, match="does not match experiment state"):
+        _advance_evolution(
+            evolution,
+            store,
+            clock,
+            second.experiment.id,
+            ExperimentStage.PROMOTED,
+            reason="stale second promotion",
+            evidence_ref="approval://postgres/second",
+            idempotency_key=f"postgres:advance:{second.experiment.id}:promoted",
+        )
+
+    persisted_second = store.evolution_experiment(second.experiment.id)
+    assert persisted_second is not None and persisted_second.stage is ExperimentStage.CANARY
+    assert store.experiment_transition_history(second.experiment.id) == second_history
+    assert memory.retrieval_policy == first.candidate
+    memory.close()
+
+
+def test_postgres_concurrent_evolution_retries_are_idempotent(
+    postgres_url: str,
+) -> None:
+    store = PostgresMemoryStore(postgres_url, min_size=1, max_size=4)
+    clock = FixedClock()
+    memory = MemoryApplication(store=store, clock=clock, ids=Uuid4Generator())
+    evolution_apps = tuple(_evolution_application(store, clock, Uuid4Generator()) for _ in range(2))
+
+    def propose(application: EvolutionApplication) -> EvolutionProposal | None:
+        return application.propose(
+            FailureDiagnosis(stale_results=5),
+            reason="concurrent retry diagnosis",
+            evidence_ref="artifact://postgres/concurrent/diagnosis",
+            idempotency_key="postgres:concurrent:proposal",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        proposals = tuple(executor.map(propose, evolution_apps))
+    assert proposals[0] is not None and proposals[1] is not None
+    assert proposals[0].candidate == proposals[1].candidate
+    assert proposals[0].experiment == proposals[1].experiment
+    assert sorted(item.idempotent_replay for item in proposals) == [False, True]
+
+    experiment_id = proposals[0].experiment.id
+    clock.advance(seconds=1)
+
+    def advance(application: EvolutionApplication) -> EvolutionTransitionResult:
+        return _advance_evolution(
+            application,
+            store,
+            clock,
+            experiment_id,
+            ExperimentStage.OFFLINE_PASSED,
+            reason="concurrent offline retry",
+            evidence_ref="artifact://postgres/concurrent/offline",
+            idempotency_key="postgres:concurrent:offline",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(advance, evolution_apps))
+    assert results[0].experiment == results[1].experiment
+    assert sorted(item.idempotent_replay for item in results) == [False, True]
+    assert len(store.experiment_transition_history(experiment_id)) == 2
+
+    conninfo = postgres_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    with psycopg.connect(conninfo) as connection:
+        assert connection.execute("SELECT count(*) FROM evolution_experiments").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT count(*) FROM evolution_experiment_transitions"
+        ).fetchone() == (2,)
+        assert connection.execute("SELECT count(*) FROM strategy_snapshots").fetchone() == (2,)
+    memory.close()
+
+
+def test_readyz_recovers_after_postgres_terminates_pooled_connections(
+    postgres_url: str,
+) -> None:
+    settings = Settings(
+        store="postgres",
+        database_url=postgres_url,
+        database_pool_min_size=1,
+        database_pool_max_size=2,
+    )
+    payload = {
+        "tenant_id": "tenant-recovery",
+        "subject_id": "alice",
+        "source": "integration-test",
+        "idempotency_key": "recovery:preference",
+        "key": "drink.preference",
+        "value": "decaf coffee",
+        "context": {"time_of_day": "evening"},
+        "evidence_text": "I prefer decaf coffee in the evening",
+        "confidence": 0.9,
+    }
+
+    with TestClient(create_app(settings=settings)) as client:
+        assert client.get("/readyz").status_code == 200
+        assert client.post("/v1/preferences", json=payload).status_code == 201
+
+        conninfo = postgres_url.replace("postgresql+psycopg://", "postgresql://", 1)
+        with psycopg.connect(conninfo, autocommit=True) as admin:
+            terminated = admin.execute(
+                """
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND usename = current_user
+                  AND pid <> pg_backend_pid()
+                """
+            ).fetchall()
+        assert any(row[0] for row in terminated)
+
+        deadline = time.monotonic() + 5
+        readiness = client.get("/readyz")
+        while readiness.status_code != 200 and time.monotonic() < deadline:
+            time.sleep(0.05)
+            readiness = client.get("/readyz")
+
+        assert readiness.status_code == 200
+        assert readiness.json() == {"status": "ready", "storage": "postgres"}
+        listed = client.get(
+            "/v1/preferences",
+            params={"tenant_id": "tenant-recovery", "subject_id": "alice"},
+        )
+        assert listed.status_code == 200
+        assert [(item["key"], item["value"]) for item in listed.json()] == [
+            ("drink.preference", "decaf coffee")
+        ]
+
+
+def test_readyz_fails_fast_during_complete_database_outage_and_recovers(
+    postgres_url: str,
+) -> None:
+    target_host, target_port = postgres_target(postgres_url)
+    with TcpFaultProxy(target_host, target_port) as proxy:
+        settings = Settings(
+            store="postgres",
+            database_url=database_url_through_proxy(postgres_url, proxy.port),
+            database_pool_min_size=1,
+            database_pool_max_size=2,
+            database_readiness_timeout_seconds=0.2,
+        )
+        payload = {
+            "tenant_id": "tenant-outage",
+            "subject_id": "alice",
+            "source": "integration-test",
+            "idempotency_key": "outage:preference",
+            "key": "drink.preference",
+            "value": "herbal tea",
+            "context": {"time_of_day": "evening"},
+            "evidence_text": "I prefer herbal tea in the evening",
+            "confidence": 0.9,
+        }
+
+        with TestClient(create_app(settings=settings)) as client:
+            assert client.post("/v1/preferences", json=payload).status_code == 201
+            proxy.set_available(False)
+
+            started_at = time.monotonic()
+            unavailable = client.get("/readyz")
+            elapsed = time.monotonic() - started_at
+
+            assert unavailable.status_code == 503
+            assert unavailable.json() == {"status": "not_ready", "storage": "postgres"}
+            assert elapsed < 2
+            assert client.get("/livez").status_code == 200
+
+            proxy.set_available(True)
+            deadline = time.monotonic() + 15
+            readiness = client.get("/readyz")
+            while readiness.status_code != 200 and time.monotonic() < deadline:
+                time.sleep(0.1)
+                readiness = client.get("/readyz")
+
+            assert readiness.status_code == 200
+            listed = client.get(
+                "/v1/preferences",
+                params={"tenant_id": "tenant-outage", "subject_id": "alice"},
+            )
+            assert listed.status_code == 200
+            assert [(item["key"], item["value"]) for item in listed.json()] == [
+                ("drink.preference", "herbal tea")
+            ]
 
 
 def test_postgres_reconstructs_bitemporal_memory_and_historical_utility(
@@ -376,6 +947,7 @@ def test_bitemporal_migration_downgrades_and_backfills_existing_rows(
     clock = FixedClock()
     store = PostgresMemoryStore(postgres_url, min_size=1, max_size=2)
     app = MemoryApplication(store=store, clock=clock, ids=SequentialIds())
+    legacy_policy_id = app.retrieval_policy.id
     original = app.remember_preference(_preference(scope, context, "migration:preference"))
     future_valid_at = clock.now() + timedelta(days=30)
     created = app.correct_preference(
@@ -437,6 +1009,13 @@ def test_bitemporal_migration_downgrades_and_backfills_existing_rows(
                 """
             ).fetchone()
             assert dropped_indexes == (None, None)
+            assert connection.execute(
+                """
+                SELECT to_regclass('strategy_activations'),
+                       to_regclass('evolution_experiments'),
+                       to_regclass('evolution_experiment_transitions')
+                """
+            ).fetchone() == (None, None, None)
 
         alembic_command.upgrade(config, "head")
         with psycopg.connect(conninfo, autocommit=True) as connection:
@@ -485,6 +1064,23 @@ def test_bitemporal_migration_downgrades_and_backfills_existing_rows(
                 "ix_revisions_record_bitemporal",
                 "ix_outcomes_scope_revision_recorded",
             )
+            assert connection.execute(
+                """
+                SELECT to_regclass('strategy_activations'),
+                       to_regclass('evolution_experiments'),
+                       to_regclass('evolution_experiment_transitions')
+                """
+            ).fetchone() == (
+                "strategy_activations",
+                "evolution_experiments",
+                "evolution_experiment_transitions",
+            )
+            assert connection.execute("SELECT count(*) FROM strategy_activations").fetchone() == (
+                0,
+            )
+            assert connection.execute("SELECT count(*) FROM evolution_experiments").fetchone() == (
+                0,
+            )
             with pytest.raises(CheckViolation):
                 connection.execute(
                     """
@@ -496,14 +1092,21 @@ def test_bitemporal_migration_downgrades_and_backfills_existing_rows(
                 )
 
         reopened = PostgresMemoryStore(postgres_url, min_size=1, max_size=2)
+        migrated_app = MemoryApplication(
+            store=reopened,
+            clock=clock,
+            ids=Uuid4Generator(),
+        )
         try:
+            assert migrated_app.retrieval_policy.id != legacy_policy_id
+            assert len(reopened.strategy_activation_history()) == 1
             migrated_trace = reopened.trace(scope, trace.id)
             assert migrated_trace is not None
             assert migrated_trace.valid_at == future_valid_at
             assert migrated_trace.known_at == migrated_trace.created_at
             assert migrated_trace.items[0].revision_id == created.revision_id
         finally:
-            reopened.close()
+            migrated_app.close()
     finally:
         # Keep the shared integration database at head even if an assertion fails.
         alembic_command.upgrade(config, "head")

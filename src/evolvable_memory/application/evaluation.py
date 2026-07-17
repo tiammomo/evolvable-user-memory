@@ -5,14 +5,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
+from math import isclose
 from typing import Protocol
 from uuid import UUID
 
 from evolvable_memory.application.commands import (
     CorrectPreference,
+    OutcomeResult,
     PreferenceResult,
     RecallMemory,
     RecallResult,
+    RecordOutcome,
     RememberPreference,
 )
 from evolvable_memory.domain.common import (
@@ -22,12 +25,18 @@ from evolvable_memory.domain.common import (
     require_text,
     require_utc,
 )
+from evolvable_memory.domain.experience import OutcomeKind
 
 
 class ReplayCaseKind(StrEnum):
     WRITE = "write"
     CORRECTION = "correction"
     RECALL = "recall"
+    OUTCOME = "outcome"
+
+
+class ExpectedRecallRejection(StrEnum):
+    FUTURE_KNOWN_AT = "future_known_at"
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,10 +72,12 @@ class WriteReplayCase:
     command: RememberPreference
     expected_sequence: int | None = None
     expected_idempotent_replay: bool | None = None
+    run_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "case_id", require_text(self.case_id, "case_id"))
         _validate_expected_sequence(self.expected_sequence)
+        _normalize_run_at(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +94,7 @@ class CorrectionReplayCase:
     enforce_expected_revision: bool = True
     expected_sequence: int | None = None
     expected_idempotent_replay: bool | None = None
+    run_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "case_id", require_text(self.case_id, "case_id"))
@@ -105,6 +117,17 @@ class CorrectionReplayCase:
             require_utc(self.occurred_at, "occurred_at"),
         )
         _validate_expected_sequence(self.expected_sequence)
+        _normalize_run_at(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedUtility:
+    memory: MemoryReference
+    mean: float
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.mean <= 1.0:
+            raise DomainError("expected utility mean must be between 0 and 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,22 +137,89 @@ class RecallReplayCase:
     relevant: tuple[MemoryReference, ...] = ()
     forbidden: tuple[MemoryReference, ...] = ()
     expect_abstention: bool = False
+    expected_utilities: tuple[ExpectedUtility, ...] = ()
+    expected_error: ExpectedRecallRejection | None = None
+    run_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "case_id", require_text(self.case_id, "case_id"))
         object.__setattr__(self, "relevant", tuple(self.relevant))
         object.__setattr__(self, "forbidden", tuple(self.forbidden))
+        object.__setattr__(self, "expected_utilities", tuple(self.expected_utilities))
+        _normalize_run_at(self)
         if len(set(self.relevant)) != len(self.relevant):
             raise DomainError("relevant memory references must be unique")
         if len(set(self.forbidden)) != len(self.forbidden):
             raise DomainError("forbidden memory references must be unique")
         if set(self.relevant) & set(self.forbidden):
             raise DomainError("a memory reference cannot be relevant and forbidden")
+        utility_memories = tuple(expectation.memory for expectation in self.expected_utilities)
+        if len(set(utility_memories)) != len(utility_memories):
+            raise DomainError("expected utility memory references must be unique")
         if self.expect_abstention and self.relevant:
             raise DomainError("an abstention case cannot declare relevant memories")
+        if self.expected_error is not None:
+            if not isinstance(self.expected_error, ExpectedRecallRejection):
+                raise DomainError("expected_error must be an ExpectedRecallRejection")
+            if self.relevant or self.forbidden or self.expect_abstention or self.expected_utilities:
+                raise DomainError("an expected-error recall cannot declare result labels")
+            if self.expected_error is ExpectedRecallRejection.FUTURE_KNOWN_AT:
+                if self.command.known_at is None:
+                    raise DomainError("future_known_at rejection requires known_at")
+                if self.run_at is not None and self.command.known_at <= self.run_at:
+                    raise DomainError("future_known_at rejection requires known_at after run_at")
 
 
-type ReplayCase = WriteReplayCase | CorrectionReplayCase | RecallReplayCase
+@dataclass(frozen=True, slots=True)
+class OutcomeReplayCase:
+    case_id: str
+    trace_case_id: str
+    memory: MemoryReference
+    scope: Scope
+    kind: OutcomeKind
+    idempotency_key: str
+    occurred_at: datetime
+    weight: float = 1.0
+    note: str | None = None
+    expected_utility_mean: float | None = None
+    expected_idempotent_replay: bool | None = None
+    run_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "case_id", require_text(self.case_id, "case_id"))
+        object.__setattr__(
+            self,
+            "trace_case_id",
+            require_text(self.trace_case_id, "trace_case_id"),
+        )
+        object.__setattr__(
+            self,
+            "idempotency_key",
+            require_text(self.idempotency_key, "idempotency_key"),
+        )
+        object.__setattr__(
+            self,
+            "occurred_at",
+            require_utc(self.occurred_at, "occurred_at"),
+        )
+        if not isinstance(self.kind, OutcomeKind):
+            raise DomainError("outcome kind must be an OutcomeKind")
+        if not 0.0 < self.weight <= 10.0:
+            raise DomainError("outcome weight must be in (0, 10]")
+        if self.note is not None:
+            normalized = self.note.strip()
+            object.__setattr__(self, "note", normalized or None)
+        if self.expected_utility_mean is not None and not 0.0 <= self.expected_utility_mean <= 1.0:
+            raise DomainError("expected outcome utility mean must be between 0 and 1")
+        if self.expected_idempotent_replay is not None and not isinstance(
+            self.expected_idempotent_replay,
+            bool,
+        ):
+            raise DomainError("expected outcome idempotent_replay must be a boolean")
+        _normalize_run_at(self)
+
+
+type ReplayCase = WriteReplayCase | CorrectionReplayCase | RecallReplayCase | OutcomeReplayCase
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +228,7 @@ class EvaluationDataset:
     version: str
     cases: tuple[ReplayCase, ...]
     recall_k: int = 5
+    schema_version: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", require_text(self.name, "dataset name"))
@@ -147,27 +238,58 @@ class EvaluationDataset:
             raise DomainError("evaluation dataset must contain at least one case")
         if self.recall_k < 1:
             raise DomainError("recall_k must be positive")
+        if self.schema_version not in {1, 2}:
+            raise DomainError("unsupported evaluation schema_version")
 
         case_ids = tuple(case.case_id for case in self.cases)
         if len(set(case_ids)) != len(case_ids):
             raise DomainError("evaluation case_id values must be unique")
 
         available_memories: set[str] = set()
+        available_traces: set[str] = set()
+        previous_run_at: datetime | None = None
         for case in self.cases:
+            if self.schema_version == 1:
+                if isinstance(case, OutcomeReplayCase) or case.run_at is not None:
+                    raise DomainError("schema v1 cannot contain timeline or outcome cases")
+            elif case.run_at is None:
+                raise DomainError("schema v2 requires run_at on every case")
+            elif previous_run_at is not None and case.run_at < previous_run_at:
+                raise DomainError("schema v2 run_at values must be non-decreasing")
+            if case.run_at is not None:
+                previous_run_at = case.run_at
+
             if isinstance(case, CorrectionReplayCase):
                 _validate_reference_order(case.target, available_memories, case.case_id)
             elif isinstance(case, RecallReplayCase):
-                if case.command.limit < self.recall_k:
-                    raise DomainError("recall command limit must be at least recall_k")
+                if not self.recall_k <= case.command.limit <= 100:
+                    raise DomainError(
+                        "recall command limit must be at least recall_k and at most 100"
+                    )
                 for reference in case.relevant + case.forbidden:
                     _validate_reference_order(reference, available_memories, case.case_id)
+                for expectation in case.expected_utilities:
+                    _validate_reference_order(
+                        expectation.memory,
+                        available_memories,
+                        case.case_id,
+                    )
+                if case.expected_error is None:
+                    available_traces.add(case.case_id)
+            elif isinstance(case, OutcomeReplayCase):
+                _validate_reference_order(case.memory, available_memories, case.case_id)
+                if case.trace_case_id not in available_traces:
+                    raise DomainError(
+                        f"case {case.case_id} references unavailable recall case "
+                        f"{case.trace_case_id}"
+                    )
             if isinstance(case, (WriteReplayCase, CorrectionReplayCase)):
                 available_memories.add(case.case_id)
 
     @property
     def snapshot_hash(self) -> str:
         payload: dict[str, object] = {
-            "schema": "evolvable-memory-evaluation/v1",
+            "schema": f"evolvable-memory-evaluation/v{self.schema_version}",
             "name": self.name,
             "version": self.version,
             "recall_k": self.recall_k,
@@ -189,6 +311,12 @@ class MemoryReplayPort(Protocol):
 
     def recall(self, command: RecallMemory) -> RecallResult: ...
 
+    def record_outcome(self, command: RecordOutcome) -> OutcomeResult: ...
+
+
+class ReplayClockPort(Protocol):
+    def set(self, value: datetime) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ReplayCaseResult:
@@ -198,6 +326,7 @@ class ReplayCaseResult:
     error: str | None = None
     record_id: UUID | None = None
     revision_id: UUID | None = None
+    trace_id: UUID | None = None
     retrieved_revision_ids: tuple[UUID, ...] = ()
     recall_at_k: float | None = None
     reciprocal_rank: float | None = None
@@ -210,6 +339,7 @@ class EvaluationMetrics:
     write_case_count: int
     correction_case_count: int
     recall_case_count: int
+    outcome_case_count: int
     execution_failure_count: int
     recall_at_k: float | None
     mrr_at_k: float | None
@@ -297,6 +427,7 @@ class HardGatePolicy:
 
 @dataclass(frozen=True, slots=True)
 class EvaluationReport:
+    dataset_schema_version: int
     dataset_name: str
     dataset_version: str
     dataset_snapshot_hash: str
@@ -315,24 +446,39 @@ class _ResolvedMemory:
 class DeterministicReplayEvaluator:
     """Runs an ordered dataset without mutating evaluation policy or labels."""
 
-    def __init__(self, application: MemoryReplayPort) -> None:
+    def __init__(
+        self,
+        application: MemoryReplayPort,
+        *,
+        clock: ReplayClockPort | None = None,
+    ) -> None:
         self._application = application
+        self._clock = clock
 
     def evaluate(
         self,
         dataset: EvaluationDataset,
         gate_policy: HardGatePolicy | None = None,
     ) -> EvaluationReport:
+        if dataset.schema_version == 2 and self._clock is None:
+            raise DomainError("schema v2 replay requires a controllable clock")
         resolved: dict[str, _ResolvedMemory] = {}
+        resolved_traces: dict[str, UUID] = {}
         results: list[ReplayCaseResult] = []
 
         for case in dataset.cases:
+            if case.run_at is not None:
+                if self._clock is None:
+                    raise DomainError("timeline replay requires a controllable clock")
+                self._clock.set(case.run_at)
             if isinstance(case, WriteReplayCase):
                 result = self._run_write(case)
             elif isinstance(case, CorrectionReplayCase):
                 result = self._run_correction(case, resolved)
-            else:
+            elif isinstance(case, RecallReplayCase):
                 result = self._run_recall(case, resolved, dataset.recall_k)
+            else:
+                result = self._run_outcome(case, resolved, resolved_traces)
             results.append(result)
             if (
                 isinstance(case, (WriteReplayCase, CorrectionReplayCase))
@@ -343,10 +489,13 @@ class DeterministicReplayEvaluator:
                     record_id=result.record_id,
                     revision_id=result.revision_id,
                 )
+            if isinstance(case, RecallReplayCase) and result.trace_id is not None:
+                resolved_traces[case.case_id] = result.trace_id
 
         metrics = _aggregate_metrics(dataset.cases, results)
         policy = gate_policy or HardGatePolicy()
         return EvaluationReport(
+            dataset_schema_version=dataset.schema_version,
             dataset_name=dataset.name,
             dataset_version=dataset.version,
             dataset_snapshot_hash=dataset.snapshot_hash,
@@ -421,7 +570,19 @@ class DeterministicReplayEvaluator:
         try:
             relevant = tuple(_resolve_reference(reference, resolved) for reference in case.relevant)
             forbidden = {_resolve_reference(reference, resolved) for reference in case.forbidden}
+            expected_utilities = {
+                _resolve_reference(expectation.memory, resolved): expectation.mean
+                for expectation in case.expected_utilities
+            }
             trace = self._application.recall(case.command)
+            if case.expected_error is not None:
+                return ReplayCaseResult(
+                    case_id=case.case_id,
+                    kind=ReplayCaseKind.RECALL,
+                    passed=False,
+                    error=f"expected {case.expected_error.value}",
+                    trace_id=trace.id,
+                )
             ranked = tuple(
                 _ResolvedMemory(item.record_id, item.revision_id) for item in trace.items
             )
@@ -441,10 +602,13 @@ class DeterministicReplayEvaluator:
                 )
             abstention_correct = not ranked if case.expect_abstention else None
             forbidden_hits = tuple(memory.revision_id for memory in ranked if memory in forbidden)
+            utility_error = _utility_expectation_error(trace, expected_utilities)
             return ReplayCaseResult(
                 case_id=case.case_id,
                 kind=ReplayCaseKind.RECALL,
-                passed=True,
+                passed=utility_error is None,
+                error=utility_error,
+                trace_id=trace.id,
                 retrieved_revision_ids=tuple(memory.revision_id for memory in ranked),
                 recall_at_k=recall_score,
                 reciprocal_rank=reciprocal_rank,
@@ -452,6 +616,12 @@ class DeterministicReplayEvaluator:
                 forbidden_hits=forbidden_hits,
             )
         except Exception as error:
+            if _matches_expected_recall_rejection(case.expected_error, error):
+                return ReplayCaseResult(
+                    case_id=case.case_id,
+                    kind=ReplayCaseKind.RECALL,
+                    passed=True,
+                )
             return ReplayCaseResult(
                 case_id=case.case_id,
                 kind=ReplayCaseKind.RECALL,
@@ -462,10 +632,52 @@ class DeterministicReplayEvaluator:
                 abstention_correct=False if case.expect_abstention else None,
             )
 
+    def _run_outcome(
+        self,
+        case: OutcomeReplayCase,
+        resolved: dict[str, _ResolvedMemory],
+        resolved_traces: dict[str, UUID],
+    ) -> ReplayCaseResult:
+        try:
+            memory = _resolve_reference(case.memory, resolved)
+            trace_id = resolved_traces.get(case.trace_case_id)
+            if trace_id is None:
+                raise DomainError(f"recall case {case.trace_case_id} did not produce a trace")
+            result = self._application.record_outcome(
+                RecordOutcome(
+                    scope=case.scope,
+                    trace_id=trace_id,
+                    revision_id=memory.revision_id,
+                    kind=case.kind,
+                    idempotency_key=case.idempotency_key,
+                    occurred_at=case.occurred_at,
+                    weight=case.weight,
+                    note=case.note,
+                )
+            )
+            error = _outcome_expectation_error(case, result)
+            return ReplayCaseResult(
+                case_id=case.case_id,
+                kind=ReplayCaseKind.OUTCOME,
+                passed=error is None,
+                error=error,
+                record_id=memory.record_id,
+                revision_id=memory.revision_id,
+                trace_id=trace_id,
+            )
+        except Exception as error:
+            return _failed_case(case.case_id, ReplayCaseKind.OUTCOME, error)
+
 
 def _validate_expected_sequence(expected: int | None) -> None:
     if expected is not None and expected < 1:
         raise DomainError("expected_sequence must be positive")
+
+
+def _normalize_run_at(case: ReplayCase) -> None:
+    run_at = case.run_at
+    if run_at is not None:
+        object.__setattr__(case, "run_at", require_utc(run_at, "run_at"))
 
 
 def _validate_reference_order(
@@ -512,6 +724,54 @@ def _preference_expectation_error(
     return None
 
 
+def _utility_expectation_error(
+    trace: RecallResult,
+    expected: dict[_ResolvedMemory, float],
+) -> str | None:
+    actual = {
+        _ResolvedMemory(item.record_id, item.revision_id): item.breakdown.utility
+        for item in trace.items
+    }
+    for memory, expected_mean in expected.items():
+        actual_mean = actual.get(memory)
+        if actual_mean is None:
+            return "expected utility memory was not recalled"
+        if not isclose(actual_mean, expected_mean, rel_tol=0.0, abs_tol=1e-9):
+            return "recalled utility did not match expectation"
+    return None
+
+
+def _matches_expected_recall_rejection(
+    expected: ExpectedRecallRejection | None,
+    error: Exception,
+) -> bool:
+    if expected is ExpectedRecallRejection.FUTURE_KNOWN_AT:
+        return type(error) is DomainError and str(error) == "known_at must not be in the future"
+    return False
+
+
+def _outcome_expectation_error(
+    case: OutcomeReplayCase,
+    result: OutcomeResult,
+) -> str | None:
+    if (
+        case.expected_idempotent_replay is not None
+        and result.idempotent_replay is not case.expected_idempotent_replay
+    ):
+        return (
+            "expected idempotent_replay "
+            f"{case.expected_idempotent_replay}, received {result.idempotent_replay}"
+        )
+    if case.expected_utility_mean is not None and not isclose(
+        result.utility.mean,
+        case.expected_utility_mean,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        return "outcome utility did not match expectation"
+    return None
+
+
 def _failed_case(
     case_id: str,
     kind: ReplayCaseKind,
@@ -549,6 +809,7 @@ def _aggregate_metrics(
         write_case_count=sum(isinstance(case, WriteReplayCase) for case in cases),
         correction_case_count=sum(isinstance(case, CorrectionReplayCase) for case in cases),
         recall_case_count=sum(isinstance(case, RecallReplayCase) for case in cases),
+        outcome_case_count=sum(isinstance(case, OutcomeReplayCase) for case in cases),
         execution_failure_count=sum(not result.passed for result in results),
         recall_at_k=_mean(recall_scores),
         mrr_at_k=_mean(reciprocal_ranks),
@@ -615,6 +876,12 @@ def _remember_payload(command: RememberPreference) -> dict[str, object]:
     }
 
 
+def _with_run_at(payload: dict[str, object], case: ReplayCase) -> dict[str, object]:
+    if case.run_at is not None:
+        payload["run_at"] = case.run_at.isoformat()
+    return payload
+
+
 def _recall_payload(command: RecallMemory) -> dict[str, object]:
     return {
         "scope": _scope_payload(command.scope),
@@ -628,34 +895,67 @@ def _recall_payload(command: RecallMemory) -> dict[str, object]:
 
 def _case_payload(case: ReplayCase) -> dict[str, object]:
     if isinstance(case, WriteReplayCase):
-        return {
-            "type": ReplayCaseKind.WRITE.value,
-            "case_id": case.case_id,
-            "command": _remember_payload(case.command),
-            "expected_sequence": case.expected_sequence,
-            "expected_idempotent_replay": case.expected_idempotent_replay,
-        }
+        return _with_run_at(
+            {
+                "type": ReplayCaseKind.WRITE.value,
+                "case_id": case.case_id,
+                "command": _remember_payload(case.command),
+                "expected_sequence": case.expected_sequence,
+                "expected_idempotent_replay": case.expected_idempotent_replay,
+            },
+            case,
+        )
     if isinstance(case, CorrectionReplayCase):
-        return {
-            "type": ReplayCaseKind.CORRECTION.value,
+        return _with_run_at(
+            {
+                "type": ReplayCaseKind.CORRECTION.value,
+                "case_id": case.case_id,
+                "target": _reference_payload(case.target),
+                "scope": _scope_payload(case.scope),
+                "source": case.source,
+                "idempotency_key": case.idempotency_key,
+                "value": case.value,
+                "evidence_text": case.evidence_text,
+                "reason": case.reason,
+                "occurred_at": case.occurred_at.isoformat(),
+                "enforce_expected_revision": case.enforce_expected_revision,
+                "expected_sequence": case.expected_sequence,
+                "expected_idempotent_replay": case.expected_idempotent_replay,
+            },
+            case,
+        )
+    if isinstance(case, RecallReplayCase):
+        payload: dict[str, object] = {
+            "type": ReplayCaseKind.RECALL.value,
             "case_id": case.case_id,
-            "target": _reference_payload(case.target),
-            "scope": _scope_payload(case.scope),
-            "source": case.source,
-            "idempotency_key": case.idempotency_key,
-            "value": case.value,
-            "evidence_text": case.evidence_text,
-            "reason": case.reason,
-            "occurred_at": case.occurred_at.isoformat(),
-            "enforce_expected_revision": case.enforce_expected_revision,
-            "expected_sequence": case.expected_sequence,
-            "expected_idempotent_replay": case.expected_idempotent_replay,
+            "command": _recall_payload(case.command),
+            "relevant": [_reference_payload(reference) for reference in case.relevant],
+            "forbidden": [_reference_payload(reference) for reference in case.forbidden],
+            "expect_abstention": case.expect_abstention,
         }
+        if case.expected_utilities:
+            payload["expected_utilities"] = [
+                {
+                    "memory": _reference_payload(expectation.memory),
+                    "mean": expectation.mean,
+                }
+                for expectation in case.expected_utilities
+            ]
+        if case.expected_error is not None:
+            payload["expected_error"] = case.expected_error.value
+        return _with_run_at(payload, case)
     return {
-        "type": ReplayCaseKind.RECALL.value,
+        "type": ReplayCaseKind.OUTCOME.value,
         "case_id": case.case_id,
-        "command": _recall_payload(case.command),
-        "relevant": [_reference_payload(reference) for reference in case.relevant],
-        "forbidden": [_reference_payload(reference) for reference in case.forbidden],
-        "expect_abstention": case.expect_abstention,
+        "trace_case_id": case.trace_case_id,
+        "memory": _reference_payload(case.memory),
+        "scope": _scope_payload(case.scope),
+        "kind": case.kind.value,
+        "idempotency_key": case.idempotency_key,
+        "occurred_at": case.occurred_at.isoformat(),
+        "weight": case.weight,
+        "note": case.note,
+        "expected_utility_mean": case.expected_utility_mean,
+        "expected_idempotent_replay": case.expected_idempotent_replay,
+        "run_at": case.run_at.isoformat() if case.run_at is not None else None,
     }

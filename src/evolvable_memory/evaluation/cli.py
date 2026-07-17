@@ -29,12 +29,15 @@ from evolvable_memory.evaluation.loader import (
 _DEFAULT_DATASET = "builtin:smoke-v1"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _EvaluationClock:
     current: datetime
 
     def now(self) -> datetime:
         return self.current
+
+    def set(self, value: datetime) -> None:
+        self.current = value
 
 
 class _SequentialIds:
@@ -101,13 +104,14 @@ def _run_evaluation(args: argparse.Namespace, dataset: EvaluationDataset) -> int
         min_abstention_accuracy=args.min_abstention_accuracy,
     )
     store = InMemoryMemoryStore()
+    clock = _EvaluationClock(_evaluation_time(dataset))
     application = MemoryApplication(
         store=store,
-        clock=_EvaluationClock(_evaluation_time(dataset)),
+        clock=clock,
         ids=_SequentialIds(),
     )
     try:
-        report = DeterministicReplayEvaluator(application).evaluate(dataset, policy)
+        report = DeterministicReplayEvaluator(application, clock=clock).evaluate(dataset, policy)
     except Exception as error:
         print(f"evaluation error: {type(error).__name__}", file=sys.stderr)
         return 3
@@ -131,6 +135,11 @@ def _run_evaluation(args: argparse.Namespace, dataset: EvaluationDataset) -> int
 
 
 def _evaluation_time(dataset: EvaluationDataset) -> datetime:
+    if dataset.schema_version == 2:
+        first_run_at = dataset.cases[0].run_at
+        if first_run_at is None:
+            raise DomainError("schema v2 replay is missing its initial run_at")
+        return first_run_at
     timestamps = [
         case.command.occurred_at for case in dataset.cases if isinstance(case, WriteReplayCase)
     ]
@@ -144,6 +153,7 @@ def _report_payload(report: EvaluationReport) -> dict[str, object]:
     return {
         "schema_version": 1,
         "dataset": {
+            "schema_version": report.dataset_schema_version,
             "name": report.dataset_name,
             "version": report.dataset_version,
             "snapshot_sha256": report.dataset_snapshot_hash,
@@ -154,6 +164,7 @@ def _report_payload(report: EvaluationReport) -> dict[str, object]:
             "write_case_count": report.metrics.write_case_count,
             "correction_case_count": report.metrics.correction_case_count,
             "recall_case_count": report.metrics.recall_case_count,
+            "outcome_case_count": report.metrics.outcome_case_count,
             "execution_failure_count": report.metrics.execution_failure_count,
             "recall_at_k": report.metrics.recall_at_k,
             "mrr_at_k": report.metrics.mrr_at_k,

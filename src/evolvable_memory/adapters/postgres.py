@@ -22,7 +22,15 @@ from evolvable_memory.domain.evidence import (
     Observation,
     ObservationKind,
 )
-from evolvable_memory.domain.evolution import StrategySnapshot
+from evolvable_memory.domain.evolution import (
+    EvolutionExperiment,
+    ExperimentStage,
+    ExperimentTransition,
+    RetrievalWeights,
+    StrategyActivation,
+    StrategyActivationKind,
+    StrategySnapshot,
+)
 from evolvable_memory.domain.experience import (
     OutcomeEvent,
     OutcomeKind,
@@ -42,6 +50,7 @@ from evolvable_memory.domain.memory import (
 
 DbRow = dict[str, Any]
 DbConnection = Connection[DbRow]
+_STRATEGY_ACTIVATION_LOCK_ID = 0x45564F4C5645
 
 
 class _ConnectionState(local):
@@ -58,7 +67,10 @@ class PostgresMemoryStore:
         min_size: int = 1,
         max_size: int = 10,
         open_timeout: float = 10.0,
+        readiness_timeout: float = 1.0,
     ) -> None:
+        if readiness_timeout <= 0:
+            raise ValueError("readiness_timeout must be positive")
         conninfo = database_url.replace("postgresql+psycopg://", "postgresql://", 1)
         self._pool: ConnectionPool[DbConnection] = ConnectionPool(
             conninfo,
@@ -69,6 +81,7 @@ class PostgresMemoryStore:
             check=ConnectionPool.check_connection,
         )
         self._pool.wait(timeout=open_timeout)
+        self._readiness_timeout = readiness_timeout
         self._state = _ConnectionState()
 
     def close(self) -> None:
@@ -76,7 +89,7 @@ class PostgresMemoryStore:
 
     def is_ready(self) -> bool:
         try:
-            with self._connection() as connection:
+            with self._pool.connection(timeout=self._readiness_timeout) as connection:
                 connection.execute("SELECT 1").fetchone()
             return True
         except (OSError, PoolClosed, PoolTimeout, PsycopgError):
@@ -520,6 +533,8 @@ class PostgresMemoryStore:
                                     "belief": item.breakdown.belief,
                                     "utility": item.breakdown.utility,
                                     "recency": item.breakdown.recency,
+                                    "lexical": item.breakdown.lexical,
+                                    "vector": item.breakdown.vector,
                                 }
                             ),
                             list(item.evidence_ids),
@@ -700,7 +715,10 @@ class PostgresMemoryStore:
                         utility_estimates.positive_weight + EXCLUDED.positive_weight,
                     negative_weight =
                         utility_estimates.negative_weight + EXCLUDED.negative_weight,
-                    last_outcome_at = EXCLUDED.last_outcome_at
+                    last_outcome_at = GREATEST(
+                        utility_estimates.last_outcome_at,
+                        EXCLUDED.last_outcome_at
+                    )
                 RETURNING *
                 """,
                 (
@@ -768,6 +786,343 @@ class PostgresMemoryStore:
 
     def save_strategy(self, strategy: StrategySnapshot) -> None:
         """Persist an immutable strategy before traces can reference it."""
+        with self._connection() as connection:
+            self._save_strategy(connection, strategy)
+
+    def strategy(self, strategy_id: UUID) -> StrategySnapshot | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM strategy_snapshots WHERE id = %s",
+                (strategy_id,),
+            ).fetchone()
+        return _strategy(row) if row is not None else None
+
+    def ensure_active_strategy(
+        self,
+        strategy: StrategySnapshot,
+        activation: StrategyActivation,
+    ) -> StrategySnapshot:
+        with self._connection() as connection, connection.transaction():
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (_STRATEGY_ACTIVATION_LOCK_ID,),
+            )
+            active = self._active_strategy_row(connection)
+            if active is not None:
+                return _strategy(active)
+            if (
+                activation.kind is not StrategyActivationKind.BOOTSTRAP
+                or activation.strategy_id != strategy.id
+                or strategy.parent_id is not None
+                or strategy.version != 1
+            ):
+                raise ConflictError("initial active strategy requires a root bootstrap activation")
+            self._save_strategy(connection, strategy)
+            connection.execute(
+                """
+                INSERT INTO strategy_activations (
+                    id, strategy_id, previous_strategy_id, kind,
+                    activated_at, reason, experiment_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    activation.id,
+                    activation.strategy_id,
+                    activation.previous_strategy_id,
+                    activation.kind.value,
+                    activation.activated_at,
+                    activation.reason,
+                    activation.experiment_id,
+                ),
+            )
+            return strategy
+
+    def active_strategy(self) -> StrategySnapshot | None:
+        with self._connection() as connection:
+            row = self._active_strategy_row(connection)
+        return _strategy(row) if row is not None else None
+
+    def strategy_activation_history(self) -> tuple[StrategyActivation, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM strategy_activations ORDER BY sequence"
+            ).fetchall()
+        return tuple(_strategy_activation(row) for row in rows)
+
+    def register_evolution_experiment(
+        self,
+        candidate: StrategySnapshot,
+        experiment: EvolutionExperiment,
+        transition: ExperimentTransition,
+    ) -> None:
+        with (
+            self._translate_evolution_conflicts(),
+            self._connection() as connection,
+            connection.transaction(),
+        ):
+            self._lock_strategy_activations(connection)
+            active_row = self._active_strategy_row(connection)
+            if active_row is None:
+                raise ConflictError("experiment baseline is not the active strategy")
+            active = _strategy(active_row)
+            if active.id != experiment.baseline_id:
+                raise ConflictError("experiment baseline is not the active strategy")
+            if (
+                candidate.id != experiment.candidate_id
+                or candidate.parent_id != active.id
+                or candidate.version != active.version + 1
+            ):
+                raise ConflictError("experiment candidate does not extend the active baseline")
+            if (
+                experiment.stage is not ExperimentStage.PROPOSED
+                or experiment.created_at != experiment.updated_at
+                or transition.experiment_id != experiment.id
+                or transition.from_stage is not None
+                or transition.to_stage is not ExperimentStage.PROPOSED
+                or transition.transitioned_at != experiment.created_at
+            ):
+                raise ConflictError("experiment creation evidence is inconsistent")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM evolution_experiments WHERE id = %s",
+                    (experiment.id,),
+                ).fetchone()
+                is not None
+            ):
+                raise ConflictError("evolution experiment already exists")
+            self._save_strategy(connection, candidate)
+            connection.execute(
+                """
+                INSERT INTO evolution_experiments (
+                    id, baseline_id, candidate_id, stage, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    experiment.id,
+                    experiment.baseline_id,
+                    experiment.candidate_id,
+                    experiment.stage.value,
+                    experiment.created_at,
+                    experiment.updated_at,
+                ),
+            )
+            self._insert_experiment_transition(connection, transition)
+
+    def evolution_experiment(self, experiment_id: UUID) -> EvolutionExperiment | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM evolution_experiments WHERE id = %s",
+                (experiment_id,),
+            ).fetchone()
+        return _evolution_experiment(row) if row is not None else None
+
+    def experiment_transition_history(
+        self,
+        experiment_id: UUID,
+    ) -> tuple[ExperimentTransition, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM evolution_experiment_transitions
+                WHERE experiment_id = %s
+                ORDER BY sequence
+                """,
+                (experiment_id,),
+            ).fetchall()
+        return tuple(_experiment_transition(row) for row in rows)
+
+    def experiment_transition_by_idempotency(
+        self,
+        idempotency_key: str,
+    ) -> ExperimentTransition | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM evolution_experiment_transitions
+                WHERE idempotency_key = %s
+                """,
+                (idempotency_key.strip(),),
+            ).fetchone()
+        return _experiment_transition(row) if row is not None else None
+
+    def advance_evolution_experiment(
+        self,
+        experiment: EvolutionExperiment,
+        transition: ExperimentTransition,
+        activation: StrategyActivation | None = None,
+    ) -> None:
+        with (
+            self._translate_evolution_conflicts(),
+            self._connection() as connection,
+            connection.transaction(),
+        ):
+            self._lock_strategy_activations(connection)
+            row = connection.execute(
+                "SELECT * FROM evolution_experiments WHERE id = %s FOR UPDATE",
+                (experiment.id,),
+            ).fetchone()
+            if row is None:
+                raise ConflictError("evolution experiment does not exist")
+            current = _evolution_experiment(row)
+            if (
+                experiment.baseline_id != current.baseline_id
+                or experiment.candidate_id != current.candidate_id
+                or experiment.created_at != current.created_at
+                or transition.experiment_id != current.id
+                or transition.from_stage is not current.stage
+                or transition.to_stage is not experiment.stage
+                or transition.transitioned_at != experiment.updated_at
+            ):
+                raise ConflictError("experiment transition evidence is inconsistent")
+            expected = current.transition(experiment.stage, transition.transitioned_at)
+            if experiment != expected:
+                raise ConflictError("experiment transition does not match current state")
+            self._validate_experiment_activation(
+                connection, current, experiment, transition, activation
+            )
+            updated = connection.execute(
+                """
+                UPDATE evolution_experiments
+                SET stage = %s, updated_at = %s
+                WHERE id = %s AND stage = %s
+                RETURNING id
+                """,
+                (
+                    experiment.stage.value,
+                    experiment.updated_at,
+                    experiment.id,
+                    current.stage.value,
+                ),
+            ).fetchone()
+            if updated is None:
+                raise ConflictError("evolution experiment changed concurrently")
+            self._insert_experiment_transition(connection, transition)
+            if activation is not None:
+                self._insert_strategy_activation(connection, activation)
+
+    def _validate_experiment_activation(
+        self,
+        connection: DbConnection,
+        current: EvolutionExperiment,
+        updated: EvolutionExperiment,
+        transition: ExperimentTransition,
+        activation: StrategyActivation | None,
+    ) -> None:
+        promotion = (
+            current.stage is ExperimentStage.CANARY and updated.stage is ExperimentStage.PROMOTED
+        )
+        rollback = (
+            current.stage is ExperimentStage.PROMOTED
+            and updated.stage is ExperimentStage.ROLLED_BACK
+        )
+        if not promotion and not rollback:
+            if activation is not None:
+                raise ConflictError("this experiment transition cannot activate a strategy")
+            return
+        if activation is None:
+            raise ConflictError("strategy activation evidence is missing or duplicated")
+        expected_kind = (
+            StrategyActivationKind.PROMOTION if promotion else StrategyActivationKind.ROLLBACK
+        )
+        expected_target = current.candidate_id if promotion else current.baseline_id
+        expected_previous = current.baseline_id if promotion else current.candidate_id
+        active_row = self._active_strategy_row(connection)
+        active = _strategy(active_row) if active_row is not None else None
+        target_exists = connection.execute(
+            "SELECT 1 FROM strategy_snapshots WHERE id = %s",
+            (expected_target,),
+        ).fetchone()
+        if (
+            activation.kind is not expected_kind
+            or activation.strategy_id != expected_target
+            or activation.previous_strategy_id != expected_previous
+            or activation.experiment_id != current.id
+            or activation.activated_at != transition.transitioned_at
+            or activation.reason != transition.reason
+            or active is None
+            or active.id != expected_previous
+            or target_exists is None
+        ):
+            raise ConflictError("strategy activation does not match experiment state")
+
+    def _insert_experiment_transition(
+        self,
+        connection: DbConnection,
+        transition: ExperimentTransition,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO evolution_experiment_transitions (
+                id, experiment_id, from_stage, to_stage,
+                transitioned_at, reason, evidence_ref,
+                idempotency_key, request_fingerprint
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                transition.id,
+                transition.experiment_id,
+                transition.from_stage.value if transition.from_stage is not None else None,
+                transition.to_stage.value,
+                transition.transitioned_at,
+                transition.reason,
+                transition.evidence_ref,
+                transition.idempotency_key,
+                transition.request_fingerprint,
+            ),
+        )
+
+    def _insert_strategy_activation(
+        self,
+        connection: DbConnection,
+        activation: StrategyActivation,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO strategy_activations (
+                id, strategy_id, previous_strategy_id, kind,
+                activated_at, reason, experiment_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                activation.id,
+                activation.strategy_id,
+                activation.previous_strategy_id,
+                activation.kind.value,
+                activation.activated_at,
+                activation.reason,
+                activation.experiment_id,
+            ),
+        )
+
+    def _lock_strategy_activations(self, connection: DbConnection) -> None:
+        connection.execute(
+            "SELECT pg_advisory_xact_lock(%s)",
+            (_STRATEGY_ACTIVATION_LOCK_ID,),
+        )
+
+    @contextmanager
+    def _translate_evolution_conflicts(self) -> Iterator[None]:
+        try:
+            yield
+        except (CheckViolation, ForeignKeyViolation, UniqueViolation) as error:
+            raise ConflictError("evolution persistence conflict") from error
+
+    def _active_strategy_row(self, connection: DbConnection) -> DbRow | None:
+        return connection.execute(
+            """
+            SELECT strategy.*
+            FROM strategy_activations AS activation
+            JOIN strategy_snapshots AS strategy ON strategy.id = activation.strategy_id
+            ORDER BY activation.sequence DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    def _save_strategy(
+        self,
+        connection: DbConnection,
+        strategy: StrategySnapshot,
+    ) -> None:
         weights = {
             "semantic": strategy.weights.semantic,
             "context": strategy.weights.context,
@@ -775,40 +1130,49 @@ class PostgresMemoryStore:
             "utility": strategy.weights.utility,
             "recency": strategy.weights.recency,
         }
-        with self._connection() as connection:
-            inserted = connection.execute(
-                """
-                INSERT INTO strategy_snapshots (
-                    id, version, weights, min_score, recency_half_life_days,
-                    created_at, parent_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (id) DO NOTHING
-                RETURNING id
-                """,
-                (
-                    strategy.id,
-                    strategy.version,
-                    Jsonb(weights),
-                    strategy.min_score,
-                    strategy.recency_half_life_days,
-                    strategy.created_at,
-                    strategy.parent_id,
-                ),
+        existing = connection.execute(
+            "SELECT * FROM strategy_snapshots WHERE id = %s",
+            (strategy.id,),
+        ).fetchone()
+        if existing is not None:
+            if _strategy(existing) != strategy:
+                raise ConflictError("strategy id already belongs to a different snapshot")
+            return
+        if strategy.parent_id is None:
+            if strategy.version != 1:
+                raise ConflictError("root strategy version must be 1")
+        else:
+            parent = connection.execute(
+                "SELECT version FROM strategy_snapshots WHERE id = %s",
+                (strategy.parent_id,),
             ).fetchone()
-            if inserted is not None:
-                return
-            existing = connection.execute(
+            if parent is None or strategy.version != parent["version"] + 1:
+                raise ConflictError("strategy parent and version are inconsistent")
+        inserted = connection.execute(
+            """
+            INSERT INTO strategy_snapshots (
+                id, version, weights, min_score, recency_half_life_days,
+                created_at, parent_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
+            """,
+            (
+                strategy.id,
+                strategy.version,
+                Jsonb(weights),
+                strategy.min_score,
+                strategy.recency_half_life_days,
+                strategy.created_at,
+                strategy.parent_id,
+            ),
+        ).fetchone()
+        if inserted is None:
+            concurrent = connection.execute(
                 "SELECT * FROM strategy_snapshots WHERE id = %s",
                 (strategy.id,),
             ).fetchone()
-            if existing is None or (
-                existing["version"] != strategy.version
-                or existing["weights"] != weights
-                or existing["min_score"] != strategy.min_score
-                or existing["recency_half_life_days"] != strategy.recency_half_life_days
-                or existing["created_at"] != strategy.created_at
-                or existing["parent_id"] != strategy.parent_id
-            ):
+            if concurrent is None or _strategy(concurrent) != strategy:
                 raise ConflictError("strategy id already belongs to a different snapshot")
 
     def _revision_outbox(
@@ -919,6 +1283,69 @@ _AS_OF_SNAPSHOT_SELECT = """
 """
 
 
+def _strategy(row: DbRow) -> StrategySnapshot:
+    raw_weights = row["weights"]
+    if not isinstance(raw_weights, dict):
+        raise ConflictError("stored strategy weights are not an object")
+    try:
+        weights = RetrievalWeights(
+            semantic=float(raw_weights["semantic"]),
+            context=float(raw_weights["context"]),
+            belief=float(raw_weights["belief"]),
+            utility=float(raw_weights["utility"]),
+            recency=float(raw_weights["recency"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ConflictError("stored strategy weights are invalid") from error
+    return StrategySnapshot(
+        id=row["id"],
+        version=row["version"],
+        weights=weights,
+        min_score=row["min_score"],
+        recency_half_life_days=row["recency_half_life_days"],
+        created_at=row["created_at"],
+        parent_id=row["parent_id"],
+    )
+
+
+def _strategy_activation(row: DbRow) -> StrategyActivation:
+    return StrategyActivation(
+        id=row["id"],
+        strategy_id=row["strategy_id"],
+        previous_strategy_id=row["previous_strategy_id"],
+        kind=StrategyActivationKind(row["kind"]),
+        activated_at=row["activated_at"],
+        reason=row["reason"],
+        experiment_id=row["experiment_id"],
+    )
+
+
+def _evolution_experiment(row: DbRow) -> EvolutionExperiment:
+    return EvolutionExperiment(
+        id=row["id"],
+        baseline_id=row["baseline_id"],
+        candidate_id=row["candidate_id"],
+        stage=ExperimentStage(row["stage"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _experiment_transition(row: DbRow) -> ExperimentTransition:
+    raw_from_stage = row["from_stage"]
+    return ExperimentTransition(
+        id=row["id"],
+        experiment_id=row["experiment_id"],
+        from_stage=(ExperimentStage(raw_from_stage) if raw_from_stage is not None else None),
+        to_stage=ExperimentStage(row["to_stage"]),
+        transitioned_at=row["transitioned_at"],
+        reason=row["reason"],
+        evidence_ref=row["evidence_ref"],
+        idempotency_key=row["idempotency_key"],
+        request_fingerprint=row["request_fingerprint"],
+    )
+
+
 def _observation(row: DbRow) -> Observation:
     metadata_value = row["metadata"]
     metadata = tuple((str(item[0]), str(item[1])) for item in metadata_value)
@@ -1019,6 +1446,14 @@ def _recalled_item(row: DbRow) -> RecalledItem:
             belief=float(raw_breakdown["belief"]),
             utility=float(raw_breakdown["utility"]),
             recency=float(raw_breakdown["recency"]),
+            lexical=(
+                float(raw_breakdown["lexical"])
+                if raw_breakdown.get("lexical") is not None
+                else None
+            ),
+            vector=(
+                float(raw_breakdown["vector"]) if raw_breakdown.get("vector") is not None else None
+            ),
         ),
         evidence_ids=_uuid_tuple(row["evidence_ids"]),
     )

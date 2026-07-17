@@ -20,6 +20,7 @@ from evolvable_memory.domain.common import (
     NotFoundError,
     Scope,
 )
+from evolvable_memory.domain.evidence import Candidate
 from evolvable_memory.domain.experience import OutcomeKind
 
 NOW = datetime(2026, 7, 14, 4, 0, tzinfo=UTC)
@@ -62,6 +63,70 @@ def test_preference_ingestion_is_idempotent(harness: Harness) -> None:
     assert replay.revision_id == first.revision_id
     assert harness.store.observation_count == 1
     assert harness.store.transition_count == 1
+
+
+def test_in_memory_transaction_rolls_back_a_partially_applied_use_case(
+    harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_update_candidate = harness.store.update_candidate
+
+    def fail_after_memory_write(_candidate: Candidate) -> None:
+        raise RuntimeError("force rollback after memory write")
+
+    monkeypatch.setattr(harness.store, "update_candidate", fail_after_memory_write)
+
+    with pytest.raises(RuntimeError, match="force rollback"):
+        harness.app.remember_preference(preference())
+
+    assert harness.store.observation_count == 0
+    assert harness.store.transition_count == 0
+    assert harness.app.list_preferences(ALICE) == ()
+
+    monkeypatch.setattr(harness.store, "update_candidate", original_update_candidate)
+    recovered = harness.app.remember_preference(preference())
+    assert recovered.idempotent_replay is False
+
+
+def test_in_memory_nested_transaction_rolls_back_only_the_failed_savepoint(
+    harness: Harness,
+) -> None:
+    with harness.store.transaction():
+        first = harness.app.remember_preference(preference())
+        with (
+            pytest.raises(RuntimeError, match="inner rollback"),
+            harness.store.transaction(),
+        ):
+            harness.app.remember_preference(
+                preference(
+                    idempotency_key="nested:second-evidence",
+                    confidence=0.9,
+                )
+            )
+            raise RuntimeError("inner rollback")
+
+        assert [item.id for item in harness.app.history(ALICE, first.record_id)] == [
+            first.revision_id
+        ]
+
+    assert harness.store.observation_count == 1
+    assert harness.store.transition_count == 1
+
+
+def test_in_memory_outer_transaction_rolls_back_successful_nested_work(
+    harness: Harness,
+) -> None:
+    with pytest.raises(RuntimeError, match="outer rollback"), harness.store.transaction():
+        harness.app.remember_preference(preference())
+        with harness.store.transaction():
+            harness.app.remember_preference(
+                preference(idempotency_key="nested:committed-inner", confidence=0.9)
+            )
+        raise RuntimeError("outer rollback")
+
+    assert harness.store.observation_count == 0
+    assert harness.store.transition_count == 0
+    assert harness.app.list_preferences(ALICE) == ()
 
 
 def test_idempotency_key_cannot_hide_different_input(harness: Harness) -> None:
@@ -637,6 +702,46 @@ def test_attributable_outcome_updates_contextual_utility_once(harness: Harness) 
     assert first.utility.mean == pytest.approx(2 / 3)
     assert replay.utility == first.utility
     assert harness.store.outcome_count == 1
+
+
+def test_out_of_order_outcomes_keep_current_utility_time_monotonic(
+    harness: Harness,
+) -> None:
+    memory = harness.app.remember_preference(preference())
+    trace = harness.app.recall(RecallMemory(scope=ALICE, query="decaf coffee", context=EVENING))
+    harness.clock.advance(days=2)
+    latest_outcome_at = harness.clock.now()
+    harness.app.record_outcome(
+        RecordOutcome(
+            scope=ALICE,
+            trace_id=trace.id,
+            revision_id=memory.revision_id,
+            kind=OutcomeKind.HELPFUL,
+            idempotency_key="outcome:latest-business-time",
+            occurred_at=latest_outcome_at,
+        )
+    )
+    harness.clock.advance(seconds=1)
+    late_arrival = harness.app.record_outcome(
+        RecordOutcome(
+            scope=ALICE,
+            trace_id=trace.id,
+            revision_id=memory.revision_id,
+            kind=OutcomeKind.HARMFUL,
+            idempotency_key="outcome:late-arrival",
+            occurred_at=latest_outcome_at - timedelta(days=1),
+        )
+    )
+
+    historical = harness.store.utility_for_as_of(
+        ALICE,
+        memory.revision_id,
+        EVENING,
+        known_at=harness.clock.now(),
+    )
+    assert late_arrival.utility.last_outcome_at == latest_outcome_at
+    assert historical.last_outcome_at == latest_outcome_at
+    assert late_arrival.utility == historical
 
 
 def test_outcome_idempotency_normalizes_text_and_rejects_a_changed_note(

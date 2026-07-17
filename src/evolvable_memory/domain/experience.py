@@ -21,6 +21,8 @@ class ScoreBreakdown:
     belief: float
     utility: float
     recency: float
+    lexical: float | None = None
+    vector: float | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -29,8 +31,10 @@ class ScoreBreakdown:
             ("belief", self.belief),
             ("utility", self.utility),
             ("recency", self.recency),
+            ("lexical", self.lexical),
+            ("vector", self.vector),
         ):
-            if not 0.0 <= value <= 1.0:
+            if value is not None and not 0.0 <= value <= 1.0:
                 raise DomainError(f"{name} score must be between 0 and 1")
 
 
@@ -166,10 +170,15 @@ class UtilityEstimate:
             raise DomainError("success must be between 0 and 1")
         if weight <= 0.0:
             raise DomainError("utility update weight must be positive")
+        outcome_at = require_utc(at, "utility outcome time")
         return UtilityEstimate(
             revision_id=self.revision_id,
             context_fingerprint=self.context_fingerprint,
             positive_weight=self.positive_weight + (success * weight),
             negative_weight=self.negative_weight + ((1.0 - success) * weight),
-            last_outcome_at=at,
+            last_outcome_at=(
+                outcome_at
+                if self.last_outcome_at is None
+                else max(self.last_outcome_at, outcome_at)
+            ),
         )

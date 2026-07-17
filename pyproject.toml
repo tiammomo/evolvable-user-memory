@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evolvable-user-memory"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Evidence-grounded, outcome-aware, evolvable memory service for AI applications"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
     "alembic>=1.15,<2",
     "fastapi>=0.115,<1",
+    "pymilvus>=2.6.12,<2.7",
     "psycopg[binary,pool]>=3.2,<4",
     "pydantic>=2.10,<3",
     "pyjwt[crypto]>=2.10,<3",
@@ -45,6 +46,10 @@ evolvable-memory = "evolvable_memory.main:run"
 evolvable-memory-eval = "evolvable_memory.evaluation.cli:run"
 evolvable-memory-frontend = "evolvable_memory.frontend:run"
 evolvable-memory-migrate = "evolvable_memory.migrate:run"
+evolvable-memory-projector = "evolvable_memory.projector:run"
+
+[tool.hatch.version]
+path = "src/evolvable_memory/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evolvable_memory"]
@@ -62,8 +67,10 @@ branch = true
 source = ["evolvable_memory"]
 omit = [
     "src/evolvable_memory/adapters/postgres.py",
+    "src/evolvable_memory/adapters/projection_outbox.py",
     "src/evolvable_memory/migrate.py",
     "src/evolvable_memory/migrations/*",
+    "src/evolvable_memory/projector.py",
 ]
 
 [tool.coverage.report]
@@ -91,4 +98,8 @@ plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 module = "uvicorn.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pymilvus.*"
 ignore_missing_imports = true

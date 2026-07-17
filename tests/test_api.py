@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import Harness
+from evolvable_memory import __version__
 from evolvable_memory.api.app import create_app
 from evolvable_memory.api.schemas import (
     MAX_CONTEXT_FACETS,
@@ -17,6 +18,7 @@ from evolvable_memory.api.schemas import (
     MAX_MEMORY_VALUE_LENGTH,
     MAX_NOTE_LENGTH,
     MAX_QUERY_LENGTH,
+    MAX_SCOPE_ID_LENGTH,
 )
 from evolvable_memory.config import Settings
 
@@ -213,6 +215,89 @@ def test_http_recall_exposes_bitemporal_boundaries_and_fails_closed(
     assert future_known.json()["error"] == "DomainError"
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/preferences",
+            {
+                "tenant_id": "tenant-a",
+                "subject_id": "alice",
+                "source": "conversation",
+                "idempotency_key": "naive-preference",
+                "key": "drink.preference",
+                "value": "coffee",
+                "evidence_text": "I prefer coffee",
+                "occurred_at": "2026-07-14T04:00:00",
+            },
+        ),
+        (
+            "/v1/preferences/00000000-0000-0000-0000-000000000001/corrections",
+            {
+                "tenant_id": "tenant-a",
+                "subject_id": "alice",
+                "source": "explicit-feedback",
+                "idempotency_key": "naive-correction",
+                "value": "tea",
+                "evidence_text": "I switched to tea",
+                "reason": "user correction",
+                "occurred_at": "2026-07-14T04:00:00",
+            },
+        ),
+        (
+            "/v1/outcomes",
+            {
+                "tenant_id": "tenant-a",
+                "subject_id": "alice",
+                "trace_id": "00000000-0000-0000-0000-000000000001",
+                "revision_id": "00000000-0000-0000-0000-000000000002",
+                "kind": "helpful",
+                "idempotency_key": "naive-outcome",
+                "occurred_at": "2026-07-14T04:00:00",
+            },
+        ),
+    ],
+)
+def test_http_rejects_naive_occurred_at(
+    harness: Harness,
+    path: str,
+    payload: dict[str, object],
+) -> None:
+    response = TestClient(create_app(harness.app, clock=harness.clock)).post(
+        path,
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-1] == "occurred_at"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/preferences",
+        "/v1/preferences/00000000-0000-0000-0000-000000000001/revisions",
+    ],
+)
+@pytest.mark.parametrize("field", ["tenant_id", "subject_id"])
+@pytest.mark.parametrize("invalid_scope", ["   ", "x" * (MAX_SCOPE_ID_LENGTH + 1)])
+def test_http_get_scope_queries_enforce_shared_bounds(
+    harness: Harness,
+    path: str,
+    field: str,
+    invalid_scope: str,
+) -> None:
+    params = {"tenant_id": "tenant-a", "subject_id": "alice", field: invalid_scope}
+
+    response = TestClient(create_app(harness.app, clock=harness.clock)).get(
+        path,
+        params=params,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-1] == field
+
+
 def test_http_rejects_oversized_text_and_context_inputs(harness: Harness) -> None:
     client = TestClient(create_app(harness.app, clock=harness.clock))
     preference_payload = {
@@ -287,13 +372,26 @@ def test_health(harness: Harness) -> None:
     client = TestClient(create_app(harness.app, clock=harness.clock))
     assert client.get("/health").json() == {
         "status": "ok",
-        "version": "0.1.0",
+        "version": __version__,
         "storage": "memory",
         "auth_mode": "development",
         "scope_source": "request",
+        "projection": "disabled",
     }
     assert client.get("/livez").json() == {"status": "ok"}
     assert client.get("/readyz").json() == {"status": "ready", "storage": "memory"}
+
+
+def test_readiness_returns_typed_unavailable_response(
+    harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(harness.app, "is_ready", lambda: False)
+
+    response = TestClient(create_app(harness.app, clock=harness.clock)).get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready", "storage": "memory"}
 
 
 def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harness) -> None:
@@ -303,8 +401,10 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
     schema = client.get("/openapi.json").json()
 
     assert service.status_code == 200
+    assert service.json()["version"] == __version__
     assert service.json()["frontend_url"] == "http://127.0.0.1:33009"
     assert service.json()["production_ready"] is False
+    assert schema["info"]["version"] == __version__
     assert "/v1/preferences" in schema["paths"]
     assert schema["paths"]["/v1/recall"]["post"]["summary"] == "执行上下文记忆召回"
     bearer = schema["components"]["securitySchemes"]["OAuth2AccessToken"]
@@ -328,6 +428,66 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
     assert recall_schema["properties"]["known_at"]["anyOf"][0]["format"] == "date-time"
     recall_response = schema["components"]["schemas"]["RecallResponse"]
     assert {"valid_at", "known_at"} <= set(recall_response["required"])
+
+
+def test_openapi_documents_scope_bounds_timestamps_and_route_errors(
+    harness: Harness,
+) -> None:
+    schema = TestClient(create_app(harness.app, clock=harness.clock)).get("/openapi.json").json()
+
+    for model_name in (
+        "PreferenceWriteRequest",
+        "PreferenceCorrectionRequest",
+        "OutcomeWriteRequest",
+    ):
+        occurred_at = schema["components"]["schemas"][model_name]["properties"]["occurred_at"]
+        assert occurred_at["anyOf"][0]["format"] == "date-time"
+
+    for path in (
+        "/v1/preferences",
+        "/v1/preferences/{record_id}/revisions",
+    ):
+        parameters = {
+            parameter["name"]: parameter for parameter in schema["paths"][path]["get"]["parameters"]
+        }
+        for field in ("tenant_id", "subject_id"):
+            assert parameters[field]["schema"]["minLength"] == 1
+            assert parameters[field]["schema"]["maxLength"] == MAX_SCOPE_ID_LENGTH
+
+    expected_errors = {
+        ("/v1/preferences", "post"): {400, 401, 403, 404, 409, 413},
+        ("/v1/preferences", "get"): {401, 403, 404},
+        ("/v1/preferences/{record_id}/corrections", "post"): {
+            400,
+            401,
+            403,
+            404,
+            409,
+            413,
+        },
+        ("/v1/preferences/{record_id}/revisions", "get"): {401, 403, 404},
+        ("/v1/recall", "post"): {400, 401, 403, 404, 413},
+        ("/v1/outcomes", "post"): {400, 401, 403, 404, 409, 413},
+    }
+    for (path, method), error_codes in expected_errors.items():
+        responses = schema["paths"][path][method]["responses"]
+        for error_code in error_codes:
+            response_schema = responses[str(error_code)]["content"]["application/json"]["schema"]
+            assert response_schema["$ref"] == "#/components/schemas/ErrorResponse"
+
+    outcome_unprocessable = schema["paths"]["/v1/outcomes"]["post"]["responses"]["422"]
+    assert {
+        candidate["$ref"]
+        for candidate in outcome_unprocessable["content"]["application/json"]["schema"]["oneOf"]
+    } == {
+        "#/components/schemas/ErrorResponse",
+        "#/components/schemas/HTTPValidationError",
+    }
+
+    readiness = schema["paths"]["/readyz"]["get"]["responses"]
+    for code in ("200", "503"):
+        response_schema = readiness[code]["content"]["application/json"]["schema"]
+        assert response_schema["$ref"] == "#/components/schemas/ReadinessResponse"
 
 
 def test_frontend_origin_is_allowed_by_cors(harness: Harness) -> None:

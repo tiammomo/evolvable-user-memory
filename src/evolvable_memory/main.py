@@ -6,7 +6,7 @@ from typing import Any
 import uvicorn
 from uvicorn.config import LOGGING_CONFIG
 
-from evolvable_memory.api.app import app
+from evolvable_memory.bootstrap import build_api_application
 from evolvable_memory.config import Settings
 
 
@@ -22,6 +22,7 @@ def _runtime_logging_config(level: str) -> dict[str, Any]:
         "evolvable_memory.access",
         "evolvable_memory.authorization",
         "evolvable_memory.error",
+        "evolvable_memory.projection",
     ):
         config["loggers"][logger_name] = {
             "handlers": ["emf_json"],
@@ -33,8 +34,9 @@ def _runtime_logging_config(level: str) -> dict[str, Any]:
 
 def run() -> None:
     settings = Settings.from_environment()
+    application = build_api_application(settings)
     uvicorn.run(
-        app,
+        application,
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level.lower(),

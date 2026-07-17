@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
+from threading import Lock
+from typing import Any
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Request, Security, status
+from fastapi import Depends, FastAPI, Request, Response, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.types import ASGIApp, Receive, Send
+from starlette.types import Scope as AsgiScope
 
+from evolvable_memory import __version__
 from evolvable_memory.adapters.authorization import (
     LoggingAuthorizationAuditSink,
     RolePolicyAuthorizer,
@@ -27,9 +32,11 @@ from evolvable_memory.api.schemas import (
     PreferenceSummaryResponse,
     PreferenceWriteRequest,
     PurposeText,
+    ReadinessResponse,
     RecallRequest,
     RecallResponse,
     RevisionResponse,
+    ScopeId,
     ServiceInfoResponse,
 )
 from evolvable_memory.api.security import (
@@ -58,6 +65,7 @@ from evolvable_memory.application.security import (
     InvocationContext,
 )
 from evolvable_memory.application.service import MemoryApplication
+from evolvable_memory.composition import build_recall_projection
 from evolvable_memory.config import Settings
 from evolvable_memory.domain.common import (
     AttributionError,
@@ -95,6 +103,40 @@ _BEARER = HTTPBearer(
     ),
 )
 _BEARER_DEPENDENCY = Security(_BEARER)
+
+_ERROR_DESCRIPTIONS = {
+    status.HTTP_400_BAD_REQUEST: "请求违反领域规则。",
+    status.HTTP_401_UNAUTHORIZED: "访问令牌缺失或无效。",
+    status.HTTP_403_FORBIDDEN: "调用方无权执行该操作或使用该处理目的。",
+    status.HTTP_404_NOT_FOUND: "资源不存在, 或其存在性因作用域隔离而被隐藏。",
+    status.HTTP_409_CONFLICT: "幂等键、乐观并发条件或当前状态发生冲突。",
+    status.HTTP_413_CONTENT_TOO_LARGE: "请求体超过服务端配置的大小限制。",
+}
+
+
+def _error_responses(*codes: int) -> dict[int | str, dict[str, Any]]:
+    return {
+        code: {
+            "model": ErrorResponse,
+            "description": _ERROR_DESCRIPTIONS[code],
+        }
+        for code in codes
+    }
+
+
+_OUTCOME_UNPROCESSABLE_RESPONSE: dict[str, Any] = {
+    "description": "请求结构校验失败, 或 revision 无法归因到指定 RecallTrace。",
+    "content": {
+        "application/json": {
+            "schema": {
+                "oneOf": [
+                    {"$ref": "#/components/schemas/HTTPValidationError"},
+                    {"$ref": "#/components/schemas/ErrorResponse"},
+                ]
+            }
+        }
+    },
+}
 
 
 def create_app(
@@ -137,7 +179,7 @@ def create_app(
 
     app = FastAPI(
         title="Evolvable User Memory",
-        version="0.1.0",
+        version=__version__,
         description=(
             "一套证据驱动、结果感知的上下文记忆服务。\n\n"
             "推荐体验顺序: **写入偏好 → 查看当前记忆 → 召回 → 提交结果 → 修正并查看历史**。\n\n"
@@ -147,6 +189,11 @@ def create_app(
                 else (
                     "当前使用 PostgreSQL 权威存储; 仍需完整权限治理、隐私治理"
                     "和生产运维后才能接入真实数据。"
+                    + (
+                        " Milvus 作为可重建的语义召回投影, 最终可见性仍由 PostgreSQL 判定。"
+                        if runtime.projection_mode == "milvus"
+                        else ""
+                    )
                 )
             )
         ),
@@ -239,7 +286,7 @@ def create_app(
     def service_info() -> ServiceInfoResponse:
         return ServiceInfoResponse(
             name="Evolvable User Memory",
-            version="0.1.0",
+            version=__version__,
             status="ok",
             storage=runtime.store,
             auth_mode=runtime.auth_mode,
@@ -261,23 +308,34 @@ def create_app(
     def health() -> dict[str, str]:
         return {
             "status": "ok",
-            "version": "0.1.0",
+            "version": __version__,
             "storage": runtime.store,
             "auth_mode": runtime.auth_mode,
             "scope_source": ("request" if runtime.auth_mode == "development" else "access_token"),
+            "projection": service.projection_status,
         }
 
     @app.get("/livez", tags=["operations"], summary="检查进程存活状态")
     def livez() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/readyz", tags=["operations"], summary="检查依赖就绪状态")
-    def readyz() -> JSONResponse:
-        ready = service.is_ready()
-        return JSONResponse(
-            status_code=status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "ready" if ready else "not_ready", "storage": runtime.store},
-        )
+    @app.get(
+        "/readyz",
+        response_model=ReadinessResponse,
+        responses={
+            status.HTTP_503_SERVICE_UNAVAILABLE: {
+                "model": ReadinessResponse,
+                "description": "权威存储或其他必要依赖尚未就绪。",
+            }
+        },
+        tags=["operations"],
+        summary="检查依赖就绪状态",
+    )
+    def readyz(response: Response) -> ReadinessResponse:
+        if service.is_ready():
+            return ReadinessResponse(status="ready", storage=runtime.store)
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return ReadinessResponse(status="not_ready", storage=runtime.store)
 
     @app.post(
         "/v1/preferences",
@@ -289,6 +347,7 @@ def create_app(
             "保存不可变 Observation 与 EvidenceSpan, 并创建或追加偏好修订。"
             "相同作用域和幂等键的安全重试不会重复写入。"
         ),
+        responses=_error_responses(400, 401, 403, 404, 409, 413),
     )
     def remember_preference(
         payload: PreferenceWriteRequest,
@@ -319,6 +378,7 @@ def create_app(
         tags=["memory"],
         summary="修正一条偏好",
         description="追加新修订并保留旧版本; 不会原地覆盖历史。",
+        responses=_error_responses(400, 401, 403, 404, 409, 413),
     )
     def correct_preference(
         record_id: UUID,
@@ -349,11 +409,12 @@ def create_app(
         tags=["memory"],
         summary="列出当前有效偏好",
         description="只返回指定租户和用户作用域内每条偏好的当前有效修订。",
+        responses=_error_responses(401, 403, 404),
     )
     def list_preferences(
         http_request: Request,
-        tenant_id: str,
-        subject_id: str,
+        tenant_id: ScopeId,
+        subject_id: ScopeId,
         actor: ActorContext = actor_dependency,
         purpose: PurposeText = "personalization",
     ) -> list[PreferenceSummaryResponse]:
@@ -370,12 +431,13 @@ def create_app(
         tags=["memory"],
         summary="读取偏好修订历史",
         description="按修订序号返回完整的不可变版本链。",
+        responses=_error_responses(401, 403, 404),
     )
     def preference_history(
         record_id: UUID,
         http_request: Request,
-        tenant_id: str,
-        subject_id: str,
+        tenant_id: ScopeId,
+        subject_id: ScopeId,
         actor: ActorContext = actor_dependency,
         purpose: PurposeText = "personalization",
     ) -> list[RevisionResponse]:
@@ -398,6 +460,7 @@ def create_app(
             "召回使用当前不可变策略快照。本身不会修改信念或效用。"
             "业务结果应通过 /v1/outcomes 回传。"
         ),
+        responses=_error_responses(400, 401, 403, 404, 413),
     )
     def recall(
         payload: RecallRequest,
@@ -428,6 +491,10 @@ def create_app(
             "Outcome 必须引用一次召回的 trace_id, 且 revision_id 必须存在于该 Trace。"
             "这是一条记忆学习上下文效用的唯一入口。"
         ),
+        responses={
+            **_error_responses(400, 401, 403, 404, 409, 413),
+            status.HTTP_422_UNPROCESSABLE_CONTENT: _OUTCOME_UNPROCESSABLE_RESPONSE,
+        },
     )
     def record_outcome(
         payload: OutcomeWriteRequest,
@@ -462,10 +529,18 @@ def _build_application(settings: Settings, clock: Clock) -> MemoryApplication:
             settings.database_url,
             min_size=settings.database_pool_min_size,
             max_size=settings.database_pool_max_size,
+            readiness_timeout=settings.database_readiness_timeout_seconds,
         )
     else:
         store = InMemoryMemoryStore()
-    return MemoryApplication(store=store, clock=clock, ids=Uuid4Generator())
+    return MemoryApplication(
+        store=store,
+        clock=clock,
+        ids=Uuid4Generator(),
+        recall_projection=build_recall_projection(settings),
+        projection_required=settings.projection_required,
+        projection_search_oversample=settings.projection_search_oversample,
+    )
 
 
 def _build_identity_resolver(settings: Settings) -> IdentityResolver:
@@ -500,4 +575,37 @@ def _occurred_at(value: datetime | None, clock: Clock) -> datetime:
     return value if value is not None else clock.now()
 
 
-app = create_app()
+class _LazyCompatibilityApplication:
+    """Preserve ``api.app:app`` without composing infrastructure at import time."""
+
+    def __init__(self, factory: Callable[[], FastAPI]) -> None:
+        self._factory = factory
+        self._application: FastAPI | None = None
+        self._lock = Lock()
+
+    def _load(self) -> FastAPI:
+        application = self._application
+        if application is not None:
+            return application
+        with self._lock:
+            application = self._application
+            if application is None:
+                application = self._factory()
+                self._application = application
+        return application
+
+    async def __call__(
+        self,
+        scope: AsgiScope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        await self._load()(scope, receive, send)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+# Compatibility for deployments that still use ``evolvable_memory.api.app:app``.
+# The actual service is composed on the first ASGI use, never during module import.
+app: ASGIApp = _LazyCompatibilityApplication(create_app)

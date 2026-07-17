@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
@@ -105,7 +105,7 @@ class PreferenceWriteRequest(ApiModel):
         default="personalization",
         description="受控处理目的。生产授权必须显式允许该目的。",
     )
-    occurred_at: datetime | None = Field(
+    occurred_at: AwareDatetime | None = Field(
         default=None,
         description="证据实际发生时间; 省略时使用服务端当前 UTC 时间。",
     )
@@ -137,7 +137,7 @@ class PreferenceCorrectionRequest(ApiModel):
     evidence_text: EvidenceText
     reason: ReasonText
     purpose: PurposeText = "personalization"
-    occurred_at: datetime | None = None
+    occurred_at: AwareDatetime | None = None
     expected_revision_id: UUID | None = Field(
         default=None,
         description="可选的乐观并发条件; 当前修订不匹配时返回 409。",
@@ -251,6 +251,8 @@ class ScoreResponse(ApiModel):
     belief: float
     utility: float
     recency: float
+    lexical: float | None = None
+    vector: float | None = None
 
 
 class RecallItemResponse(ApiModel):
@@ -302,6 +304,8 @@ class RecallResponse(ApiModel):
                         belief=item.breakdown.belief,
                         utility=item.breakdown.utility,
                         recency=item.breakdown.recency,
+                        lexical=item.breakdown.lexical,
+                        vector=item.breakdown.vector,
                     ),
                     evidence_ids=list(item.evidence_ids),
                 )
@@ -317,7 +321,7 @@ class OutcomeWriteRequest(ApiModel):
     revision_id: UUID
     kind: OutcomeKind
     idempotency_key: IdempotencyKey
-    occurred_at: datetime | None = None
+    occurred_at: AwareDatetime | None = None
     weight: OutcomeWeight = 1.0
     note: NoteText | None = None
     purpose: PurposeText = "personalization"
@@ -407,6 +411,11 @@ class ErrorResponse(ApiModel):
     error: str
     detail: str
     request_id: str | None = None
+
+
+class ReadinessResponse(ApiModel):
+    status: Literal["ready", "not_ready"]
+    storage: str
 
 
 class ServiceInfoResponse(ApiModel):

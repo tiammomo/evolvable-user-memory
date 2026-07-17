@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -16,13 +16,20 @@ from evolvable_memory.application.evaluation import (
     CorrectionReplayCase,
     DeterministicReplayEvaluator,
     EvaluationDataset,
+    ExpectedUtility,
     HardGatePolicy,
     MemoryReference,
+    OutcomeReplayCase,
     RecallReplayCase,
     WriteReplayCase,
 )
 from evolvable_memory.domain.common import ContextSignature, DomainError, Scope
-from evolvable_memory.domain.experience import RecalledItem, RecallTrace, ScoreBreakdown
+from evolvable_memory.domain.experience import (
+    OutcomeKind,
+    RecalledItem,
+    RecallTrace,
+    ScoreBreakdown,
+)
 
 NOW = datetime(2026, 7, 14, 4, 0, tzinfo=UTC)
 ALICE = Scope("tenant-a", "alice")
@@ -40,6 +47,7 @@ def _write(
     idempotency_key: str | None = None,
     expected_sequence: int | None = None,
     expected_idempotent_replay: bool | None = None,
+    run_at: datetime | None = None,
 ) -> WriteReplayCase:
     return WriteReplayCase(
         case_id=case_id,
@@ -56,6 +64,7 @@ def _write(
         ),
         expected_sequence=expected_sequence,
         expected_idempotent_replay=expected_idempotent_replay,
+        run_at=run_at,
     )
 
 
@@ -67,6 +76,7 @@ def _correction(
     idempotency_key: str | None = None,
     expected_sequence: int | None = 2,
     expected_idempotent_replay: bool | None = False,
+    run_at: datetime | None = None,
 ) -> CorrectionReplayCase:
     return CorrectionReplayCase(
         case_id=case_id,
@@ -80,6 +90,7 @@ def _correction(
         occurred_at=NOW,
         expected_sequence=expected_sequence,
         expected_idempotent_replay=expected_idempotent_replay,
+        run_at=run_at,
     )
 
 
@@ -164,6 +175,135 @@ def test_dataset_rejects_ambiguous_or_unreplayable_cases() -> None:
                 ),
             ),
         )
+
+
+def test_schema_v2_requires_a_monotonic_timeline_and_controllable_clock(
+    harness: Harness,
+) -> None:
+    with pytest.raises(DomainError, match="requires run_at"):
+        EvaluationDataset(
+            name="missing-timeline",
+            version="v1",
+            schema_version=2,
+            cases=(_write("write"),),
+        )
+
+    with pytest.raises(DomainError, match="non-decreasing"):
+        EvaluationDataset(
+            name="rewinding-timeline",
+            version="v1",
+            schema_version=2,
+            cases=(
+                _write("first", run_at=NOW),
+                _write("second", run_at=NOW - timedelta(seconds=1)),
+            ),
+        )
+
+    dataset = EvaluationDataset(
+        name="controlled-timeline",
+        version="v1",
+        schema_version=2,
+        cases=(_write("write", run_at=NOW),),
+    )
+    with pytest.raises(DomainError, match="controllable clock"):
+        DeterministicReplayEvaluator(harness.app).evaluate(dataset)
+
+    report = DeterministicReplayEvaluator(harness.app, clock=harness.clock).evaluate(dataset)
+    assert report.metrics.write_case_count == 1
+    assert report.metrics.outcome_case_count == 0
+    assert report.metrics.execution_failure_count == 0
+
+
+def test_timeline_replay_turns_utility_assertion_mismatches_into_execution_failures(
+    harness: Harness,
+) -> None:
+    memory = MemoryReference.from_case("write")
+    dataset = EvaluationDataset(
+        name="utility-assertion",
+        version="v1",
+        schema_version=2,
+        recall_k=1,
+        cases=(
+            _write("write", run_at=NOW),
+            RecallReplayCase(
+                case_id="recall",
+                command=RecallMemory(
+                    scope=ALICE,
+                    query="decaf coffee",
+                    context=EVENING,
+                    limit=1,
+                ),
+                relevant=(memory,),
+                expected_utilities=(ExpectedUtility(memory=memory, mean=0.25),),
+                run_at=NOW,
+            ),
+        ),
+    )
+
+    report = DeterministicReplayEvaluator(harness.app, clock=harness.clock).evaluate(dataset)
+
+    assert report.cases[1].error == "recalled utility did not match expectation"
+    assert report.metrics.recall_at_k == 1.0
+    assert report.metrics.execution_failure_count == 1
+    assert report.gates.violations == ("execution_failures",)
+
+
+def test_timeline_replay_enforces_outcome_idempotency_and_utility_expectations(
+    harness: Harness,
+) -> None:
+    memory = MemoryReference.from_case("write")
+    dataset = EvaluationDataset(
+        name="outcome-assertion",
+        version="v1",
+        schema_version=2,
+        recall_k=1,
+        cases=(
+            _write("write", run_at=NOW),
+            RecallReplayCase(
+                case_id="recall",
+                command=RecallMemory(
+                    scope=ALICE,
+                    query="decaf coffee",
+                    context=EVENING,
+                    limit=1,
+                ),
+                relevant=(memory,),
+                run_at=NOW,
+            ),
+            OutcomeReplayCase(
+                case_id="outcome",
+                trace_case_id="recall",
+                memory=memory,
+                scope=ALICE,
+                kind=OutcomeKind.HELPFUL,
+                idempotency_key="outcome:1",
+                occurred_at=NOW + timedelta(seconds=1),
+                expected_utility_mean=0.5,
+                expected_idempotent_replay=False,
+                run_at=NOW + timedelta(seconds=1),
+            ),
+            OutcomeReplayCase(
+                case_id="outcome-replay",
+                trace_case_id="recall",
+                memory=memory,
+                scope=ALICE,
+                kind=OutcomeKind.HELPFUL,
+                idempotency_key="outcome:1",
+                occurred_at=NOW + timedelta(seconds=1),
+                expected_utility_mean=2 / 3,
+                expected_idempotent_replay=False,
+                run_at=NOW + timedelta(seconds=2),
+            ),
+        ),
+    )
+
+    report = DeterministicReplayEvaluator(harness.app, clock=harness.clock).evaluate(dataset)
+
+    assert report.cases[2].error == "outcome utility did not match expectation"
+    assert report.cases[3].error == "expected idempotent_replay False, received True"
+    assert report.metrics.outcome_case_count == 2
+    assert report.metrics.execution_failure_count == 2
+    assert report.gates.violations == ("execution_failures",)
 
 
 def test_replay_exercises_write_and_correction_idempotency(harness: Harness) -> None:

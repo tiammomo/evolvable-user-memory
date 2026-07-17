@@ -13,15 +13,22 @@ from evolvable_memory.application.commands import RecallMemory, RememberPreferen
 from evolvable_memory.application.evaluation import (
     CorrectionReplayCase,
     EvaluationDataset,
+    ExpectedRecallRejection,
+    ExpectedUtility,
     MemoryReference,
+    OutcomeReplayCase,
     RecallReplayCase,
     ReplayCase,
     WriteReplayCase,
 )
 from evolvable_memory.domain.common import ContextSignature, DomainError, Scope
+from evolvable_memory.domain.experience import OutcomeKind
 
-_SCHEMA_VERSION = 1
-_BUILTIN_DATASETS = {"smoke-v1": "smoke-v1.json"}
+_SCHEMA_VERSIONS = {1, 2}
+_BUILTIN_DATASETS = {
+    "smoke-v1": "smoke-v1.json",
+    "temporal-v1": "temporal-v1.json",
+}
 
 
 class DatasetValidationError(ValueError):
@@ -97,11 +104,11 @@ def _parse_dataset(raw: dict[str, object]) -> EvaluationDataset:
         allowed={"schema_version", "name", "version", "recall_k", "cases"},
     )
     schema_version = _integer(raw["schema_version"], "dataset.schema_version")
-    if schema_version != _SCHEMA_VERSION:
+    if schema_version not in _SCHEMA_VERSIONS:
         raise DatasetValidationError("unsupported dataset schema_version")
     recall_k = _integer(raw["recall_k"], "dataset.recall_k")
     cases = tuple(
-        _parse_case(case, index=index, recall_k=recall_k)
+        _parse_case(case, index=index, recall_k=recall_k, schema_version=schema_version)
         for index, case in enumerate(_array(raw["cases"], "dataset.cases"))
     )
     return EvaluationDataset(
@@ -109,22 +116,35 @@ def _parse_dataset(raw: dict[str, object]) -> EvaluationDataset:
         version=_text(raw["version"], "dataset.version"),
         recall_k=recall_k,
         cases=cases,
+        schema_version=schema_version,
     )
 
 
-def _parse_case(raw: object, *, index: int, recall_k: int) -> ReplayCase:
+def _parse_case(
+    raw: object,
+    *,
+    index: int,
+    recall_k: int,
+    schema_version: int,
+) -> ReplayCase:
     value = _object(raw, f"dataset.cases[{index}]")
     case_type = _text(value.get("type"), f"dataset.cases[{index}].type")
     if case_type == "write":
-        return _parse_write(value, index)
+        return _parse_write(value, index, schema_version)
     if case_type == "correction":
-        return _parse_correction(value, index)
+        return _parse_correction(value, index, schema_version)
     if case_type == "recall":
-        return _parse_recall(value, index, recall_k)
+        return _parse_recall(value, index, recall_k, schema_version)
+    if case_type == "outcome" and schema_version == 2:
+        return _parse_outcome(value, index)
     raise DatasetValidationError(f"dataset.cases[{index}].type is unsupported")
 
 
-def _parse_write(raw: dict[str, object], index: int) -> WriteReplayCase:
+def _parse_write(
+    raw: dict[str, object],
+    index: int,
+    schema_version: int,
+) -> WriteReplayCase:
     path = f"dataset.cases[{index}]"
     required = {
         "type",
@@ -139,6 +159,8 @@ def _parse_write(raw: dict[str, object], index: int) -> WriteReplayCase:
         "confidence",
         "occurred_at",
     }
+    timeline = {"run_at"} if schema_version == 2 else set()
+    required |= timeline
     _fields(raw, path=path, required=required, allowed=required | {"expected"})
     sequence, idempotent = _preference_expectation(raw.get("expected"), f"{path}.expected")
     return WriteReplayCase(
@@ -156,10 +178,15 @@ def _parse_write(raw: dict[str, object], index: int) -> WriteReplayCase:
         ),
         expected_sequence=sequence,
         expected_idempotent_replay=idempotent,
+        run_at=_optional_datetime(raw.get("run_at"), f"{path}.run_at"),
     )
 
 
-def _parse_correction(raw: dict[str, object], index: int) -> CorrectionReplayCase:
+def _parse_correction(
+    raw: dict[str, object],
+    index: int,
+    schema_version: int,
+) -> CorrectionReplayCase:
     path = f"dataset.cases[{index}]"
     required = {
         "type",
@@ -173,6 +200,8 @@ def _parse_correction(raw: dict[str, object], index: int) -> CorrectionReplayCas
         "reason",
         "occurred_at",
     }
+    if schema_version == 2:
+        required.add("run_at")
     allowed = required | {"enforce_expected_revision", "expected"}
     _fields(raw, path=path, required=required, allowed=allowed)
     sequence, idempotent = _preference_expectation(raw.get("expected"), f"{path}.expected")
@@ -192,6 +221,7 @@ def _parse_correction(raw: dict[str, object], index: int) -> CorrectionReplayCas
         enforce_expected_revision=enforce_expected_revision,
         expected_sequence=sequence,
         expected_idempotent_replay=idempotent,
+        run_at=_optional_datetime(raw.get("run_at"), f"{path}.run_at"),
     )
 
 
@@ -199,9 +229,12 @@ def _parse_recall(
     raw: dict[str, object],
     index: int,
     recall_k: int,
+    schema_version: int,
 ) -> RecallReplayCase:
     path = f"dataset.cases[{index}]"
     required = {"type", "id", "scope", "query", "context", "limit", "expected"}
+    if schema_version == 2:
+        required.add("run_at")
     _fields(
         raw,
         path=path,
@@ -216,7 +249,8 @@ def _parse_recall(
         expected,
         path=f"{path}.expected",
         required={"relevant", "forbidden", "abstain"},
-        allowed={"relevant", "forbidden", "abstain"},
+        allowed={"relevant", "forbidden", "abstain"}
+        | ({"utilities", "error"} if schema_version == 2 else set()),
     )
     abstain = expected["abstain"]
     if not isinstance(abstain, bool):
@@ -231,7 +265,29 @@ def _parse_recall(
             _array(expected["forbidden"], f"{path}.expected.forbidden")
         )
     )
-    if not relevant and not forbidden and not abstain:
+    expected_utilities = tuple(
+        _expected_utility(item, f"{path}.expected.utilities[{item_index}]")
+        for item_index, item in enumerate(
+            _array(expected.get("utilities", []), f"{path}.expected.utilities")
+        )
+    )
+    expected_error_raw = expected.get("error")
+    expected_error: ExpectedRecallRejection | None = None
+    if expected_error_raw is not None:
+        expected_error_name = _text(expected_error_raw, f"{path}.expected.error")
+        try:
+            expected_error = ExpectedRecallRejection(expected_error_name)
+        except ValueError as error:
+            raise DatasetValidationError(
+                f"{path}.expected.error is an unsupported recall rejection"
+            ) from error
+    if (
+        not relevant
+        and not forbidden
+        and not abstain
+        and not expected_utilities
+        and not expected_error
+    ):
         raise DatasetValidationError(f"{path}.expected must contain an evaluation label")
     return RecallReplayCase(
         case_id=_text(raw["id"], f"{path}.id"),
@@ -246,6 +302,73 @@ def _parse_recall(
         relevant=relevant,
         forbidden=forbidden,
         expect_abstention=abstain,
+        expected_utilities=expected_utilities,
+        expected_error=expected_error,
+        run_at=_optional_datetime(raw.get("run_at"), f"{path}.run_at"),
+    )
+
+
+def _parse_outcome(raw: dict[str, object], index: int) -> OutcomeReplayCase:
+    path = f"dataset.cases[{index}]"
+    required = {
+        "type",
+        "id",
+        "trace",
+        "memory",
+        "scope",
+        "kind",
+        "idempotency_key",
+        "occurred_at",
+        "run_at",
+        "expected",
+    }
+    _fields(raw, path=path, required=required, allowed=required | {"weight", "note"})
+    expected = _object(raw["expected"], f"{path}.expected")
+    _fields(
+        expected,
+        path=f"{path}.expected",
+        required={"utility_mean", "idempotent_replay"},
+        allowed={"utility_mean", "idempotent_replay"},
+    )
+    idempotent = expected["idempotent_replay"]
+    if not isinstance(idempotent, bool):
+        raise DatasetValidationError(f"{path}.expected.idempotent_replay must be a boolean")
+    kind_raw = _text(raw["kind"], f"{path}.kind")
+    try:
+        kind = OutcomeKind(kind_raw)
+    except ValueError as error:
+        raise DatasetValidationError(f"{path}.kind is unsupported") from error
+    note_raw = raw.get("note")
+    return OutcomeReplayCase(
+        case_id=_text(raw["id"], f"{path}.id"),
+        trace_case_id=_text(raw["trace"], f"{path}.trace"),
+        memory=_reference(raw["memory"], f"{path}.memory"),
+        scope=_scope(raw["scope"], f"{path}.scope"),
+        kind=kind,
+        idempotency_key=_text(raw["idempotency_key"], f"{path}.idempotency_key"),
+        occurred_at=_datetime(raw["occurred_at"], f"{path}.occurred_at"),
+        weight=_number(raw.get("weight", 1.0), f"{path}.weight"),
+        note=_text(note_raw, f"{path}.note") if note_raw is not None else None,
+        expected_utility_mean=_number(
+            expected["utility_mean"],
+            f"{path}.expected.utility_mean",
+        ),
+        expected_idempotent_replay=idempotent,
+        run_at=_datetime(raw["run_at"], f"{path}.run_at"),
+    )
+
+
+def _expected_utility(raw: object, path: str) -> ExpectedUtility:
+    value = _object(raw, path)
+    _fields(
+        value,
+        path=path,
+        required={"memory", "mean"},
+        allowed={"memory", "mean"},
+    )
+    return ExpectedUtility(
+        memory=_reference(value["memory"], f"{path}.memory"),
+        mean=_number(value["mean"], f"{path}.mean"),
     )
 
 

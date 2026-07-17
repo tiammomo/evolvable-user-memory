@@ -6,7 +6,7 @@ from enum import StrEnum
 from math import isclose
 from uuid import UUID
 
-from evolvable_memory.domain.common import DomainError, require_utc
+from evolvable_memory.domain.common import DomainError, require_text, require_utc
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +43,44 @@ class StrategySnapshot:
         if not 1.0 <= self.recency_half_life_days <= 3650.0:
             raise DomainError("recency half-life must be in [1, 3650] days")
         object.__setattr__(self, "created_at", require_utc(self.created_at, "created_at"))
+
+
+class StrategyActivationKind(StrEnum):
+    BOOTSTRAP = "bootstrap"
+    PROMOTION = "promotion"
+    ROLLBACK = "rollback"
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyActivation:
+    """Append-only evidence that a registered strategy became authoritative."""
+
+    id: UUID
+    strategy_id: UUID
+    kind: StrategyActivationKind
+    activated_at: datetime
+    reason: str
+    previous_strategy_id: UUID | None = None
+    experiment_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, StrategyActivationKind):
+            raise DomainError("strategy activation kind is invalid")
+        object.__setattr__(
+            self,
+            "activated_at",
+            require_utc(self.activated_at, "activated_at"),
+        )
+        object.__setattr__(self, "reason", require_text(self.reason, "activation reason"))
+        if self.previous_strategy_id == self.strategy_id:
+            raise DomainError("strategy activation must change the active strategy")
+        if self.kind is StrategyActivationKind.BOOTSTRAP:
+            if self.previous_strategy_id is not None or self.experiment_id is not None:
+                raise DomainError(
+                    "bootstrap activation cannot reference prior strategy or experiment"
+                )
+        elif self.previous_strategy_id is None or self.experiment_id is None:
+            raise DomainError("promotion and rollback require prior strategy and experiment")
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +126,98 @@ class ExperimentStage(StrEnum):
     ROLLED_BACK = "rolled_back"
 
 
+class GateDecision(StrEnum):
+    PASS = "pass"
+    REJECT = "reject"
+    ROLLBACK = "rollback"
+
+
+_EXPERIMENT_TRANSITIONS: dict[ExperimentStage, frozenset[ExperimentStage]] = {
+    ExperimentStage.PROPOSED: frozenset({ExperimentStage.OFFLINE_PASSED, ExperimentStage.REJECTED}),
+    ExperimentStage.OFFLINE_PASSED: frozenset({ExperimentStage.SHADOW, ExperimentStage.REJECTED}),
+    ExperimentStage.SHADOW: frozenset({ExperimentStage.CANARY, ExperimentStage.ROLLED_BACK}),
+    ExperimentStage.CANARY: frozenset({ExperimentStage.PROMOTED, ExperimentStage.ROLLED_BACK}),
+    ExperimentStage.PROMOTED: frozenset({ExperimentStage.ROLLED_BACK}),
+}
+
+
+def _require_sha256(value: str, field: str) -> str:
+    digest = require_text(value, field).lower()
+    if len(digest) != 64:
+        raise DomainError(f"{field} must be a SHA-256 hex digest")
+    try:
+        int(digest, 16)
+    except ValueError as error:
+        raise DomainError(f"{field} must be a SHA-256 hex digest") from error
+    return digest
+
+
+@dataclass(frozen=True, slots=True)
+class GateReceipt:
+    """Signed, short-lived authority to traverse one experiment stage edge."""
+
+    id: UUID
+    experiment_id: UUID
+    baseline_id: UUID
+    candidate_id: UUID
+    from_stage: ExperimentStage
+    to_stage: ExperimentStage
+    decision: GateDecision
+    artifact_ref: str
+    artifact_sha256: str
+    issuer: str
+    key_id: str
+    issued_at: datetime
+    expires_at: datetime
+    hard_gates_passed: bool
+    reason: str
+    signature: str
+
+    def __post_init__(self) -> None:
+        if self.baseline_id == self.candidate_id:
+            raise DomainError("gate receipt candidate must differ from baseline")
+        if not isinstance(self.from_stage, ExperimentStage) or not isinstance(
+            self.to_stage, ExperimentStage
+        ):
+            raise DomainError("gate receipt stage is invalid")
+        if self.to_stage not in _EXPERIMENT_TRANSITIONS.get(self.from_stage, frozenset()):
+            raise DomainError("gate receipt must authorize a legal experiment transition")
+        if not isinstance(self.decision, GateDecision):
+            raise DomainError("gate receipt decision is invalid")
+        if not isinstance(self.hard_gates_passed, bool):
+            raise DomainError("gate receipt hard_gates_passed must be boolean")
+        object.__setattr__(
+            self,
+            "artifact_ref",
+            require_text(self.artifact_ref, "gate receipt artifact_ref"),
+        )
+        object.__setattr__(
+            self,
+            "artifact_sha256",
+            _require_sha256(self.artifact_sha256, "gate receipt artifact_sha256"),
+        )
+        object.__setattr__(self, "issuer", require_text(self.issuer, "gate receipt issuer"))
+        object.__setattr__(self, "key_id", require_text(self.key_id, "gate receipt key_id"))
+        object.__setattr__(
+            self,
+            "issued_at",
+            require_utc(self.issued_at, "gate receipt issued_at"),
+        )
+        object.__setattr__(
+            self,
+            "expires_at",
+            require_utc(self.expires_at, "gate receipt expires_at"),
+        )
+        if self.expires_at <= self.issued_at:
+            raise DomainError("gate receipt expires_at must follow issued_at")
+        object.__setattr__(self, "reason", require_text(self.reason, "gate receipt reason"))
+        object.__setattr__(
+            self,
+            "signature",
+            _require_sha256(self.signature, "gate receipt signature"),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class EvolutionExperiment:
     id: UUID
@@ -98,31 +228,74 @@ class EvolutionExperiment:
     updated_at: datetime
 
     def __post_init__(self) -> None:
+        if self.baseline_id == self.candidate_id:
+            raise DomainError("experiment candidate must differ from baseline")
+        if not isinstance(self.stage, ExperimentStage):
+            raise DomainError("experiment stage is invalid")
         object.__setattr__(self, "created_at", require_utc(self.created_at, "created_at"))
         object.__setattr__(self, "updated_at", require_utc(self.updated_at, "updated_at"))
+        if self.updated_at < self.created_at:
+            raise DomainError("experiment updated_at must not precede created_at")
 
     def transition(self, target: ExperimentStage, at: datetime) -> EvolutionExperiment:
-        allowed = {
-            ExperimentStage.PROPOSED: {
-                ExperimentStage.OFFLINE_PASSED,
-                ExperimentStage.REJECTED,
-            },
-            ExperimentStage.OFFLINE_PASSED: {
-                ExperimentStage.SHADOW,
-                ExperimentStage.REJECTED,
-            },
-            ExperimentStage.SHADOW: {
-                ExperimentStage.CANARY,
-                ExperimentStage.ROLLED_BACK,
-            },
-            ExperimentStage.CANARY: {
-                ExperimentStage.PROMOTED,
-                ExperimentStage.ROLLED_BACK,
-            },
-        }
-        if target not in allowed.get(self.stage, set()):
+        transitioned_at = require_utc(at, "experiment transition time")
+        if transitioned_at < self.updated_at:
+            raise DomainError("experiment transition time must be non-decreasing")
+        if target not in _EXPERIMENT_TRANSITIONS.get(self.stage, frozenset()):
             raise DomainError(f"illegal experiment transition: {self.stage} -> {target}")
-        return replace(self, stage=target, updated_at=at)
+        return replace(self, stage=target, updated_at=transitioned_at)
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentTransition:
+    """Append-only evidence for creating or advancing one experiment."""
+
+    id: UUID
+    experiment_id: UUID
+    to_stage: ExperimentStage
+    transitioned_at: datetime
+    reason: str
+    evidence_ref: str
+    idempotency_key: str
+    request_fingerprint: str
+    from_stage: ExperimentStage | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.to_stage, ExperimentStage) or (
+            self.from_stage is not None and not isinstance(self.from_stage, ExperimentStage)
+        ):
+            raise DomainError("experiment transition stage is invalid")
+        object.__setattr__(
+            self,
+            "transitioned_at",
+            require_utc(self.transitioned_at, "transitioned_at"),
+        )
+        object.__setattr__(self, "reason", require_text(self.reason, "transition reason"))
+        object.__setattr__(
+            self,
+            "evidence_ref",
+            require_text(self.evidence_ref, "transition evidence_ref"),
+        )
+        object.__setattr__(
+            self,
+            "idempotency_key",
+            require_text(self.idempotency_key, "transition idempotency_key"),
+        )
+        object.__setattr__(
+            self,
+            "request_fingerprint",
+            _require_sha256(
+                self.request_fingerprint,
+                "transition request_fingerprint",
+            ),
+        )
+        if self.from_stage is None:
+            if self.to_stage is not ExperimentStage.PROPOSED:
+                raise DomainError("experiment creation must transition to proposed")
+        elif self.to_stage not in _EXPERIMENT_TRANSITIONS.get(self.from_stage, frozenset()):
+            raise DomainError(
+                f"illegal experiment transition evidence: {self.from_stage} -> {self.to_stage}"
+            )
 
 
 class PolicyEvolution:

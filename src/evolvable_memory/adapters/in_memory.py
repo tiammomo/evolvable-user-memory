@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from copy import deepcopy
 from datetime import datetime
 from threading import RLock
 from types import TracebackType
@@ -8,7 +9,14 @@ from uuid import UUID
 
 from evolvable_memory.domain.common import ConflictError, ContextSignature, Scope
 from evolvable_memory.domain.evidence import Candidate, EvidenceSpan, Observation
-from evolvable_memory.domain.evolution import StrategySnapshot
+from evolvable_memory.domain.evolution import (
+    EvolutionExperiment,
+    ExperimentStage,
+    ExperimentTransition,
+    StrategyActivation,
+    StrategyActivationKind,
+    StrategySnapshot,
+)
 from evolvable_memory.domain.experience import OutcomeEvent, RecallTrace, UtilityEstimate
 from evolvable_memory.domain.memory import (
     MemoryRecord,
@@ -17,13 +25,44 @@ from evolvable_memory.domain.memory import (
     RevisionTransition,
 )
 
+_TRANSACTIONAL_STATE = (
+    "_observations",
+    "_observation_keys",
+    "_evidence",
+    "_candidates",
+    "_candidate_by_observation",
+    "_records",
+    "_record_identity",
+    "_revisions",
+    "_revision_ids_by_record",
+    "_active_revision",
+    "_transitions",
+    "_traces",
+    "_outcomes",
+    "_outcome_keys",
+    "_utilities",
+    "_strategies",
+    "_strategy_activations",
+    "_experiments",
+    "_experiment_transitions",
+    "_experiment_transition_ids",
+    "_experiment_transition_keys",
+)
+
 
 class _LockedTransaction(AbstractContextManager[None]):
-    def __init__(self, lock: RLock) -> None:
-        self._lock = lock
+    def __init__(self, store: InMemoryMemoryStore) -> None:
+        self._store = store
 
     def __enter__(self) -> None:
-        self._lock.acquire()
+        self._store._lock.acquire()
+        try:
+            self._store._transaction_snapshots.append(
+                self._store._snapshot_transaction_state_unlocked()
+            )
+        except BaseException:
+            self._store._lock.release()
+            raise
 
     def __exit__(
         self,
@@ -31,7 +70,12 @@ class _LockedTransaction(AbstractContextManager[None]):
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        self._lock.release()
+        try:
+            snapshot = self._store._transaction_snapshots.pop()
+            if exc_type is not None:
+                self._store._restore_transaction_state_unlocked(snapshot)
+        finally:
+            self._store._lock.release()
 
 
 class InMemoryMemoryStore:
@@ -55,6 +99,12 @@ class InMemoryMemoryStore:
         self._outcome_keys: dict[tuple[Scope, str], UUID] = {}
         self._utilities: dict[tuple[Scope, UUID, str], UtilityEstimate] = {}
         self._strategies: dict[UUID, StrategySnapshot] = {}
+        self._strategy_activations: list[StrategyActivation] = []
+        self._experiments: dict[UUID, EvolutionExperiment] = {}
+        self._experiment_transitions: dict[UUID, list[ExperimentTransition]] = {}
+        self._experiment_transition_ids: set[UUID] = set()
+        self._experiment_transition_keys: dict[str, ExperimentTransition] = {}
+        self._transaction_snapshots: list[dict[str, object]] = []
 
     def close(self) -> None:
         """The in-process adapter owns no external resources."""
@@ -64,13 +114,195 @@ class InMemoryMemoryStore:
 
     def save_strategy(self, strategy: StrategySnapshot) -> None:
         with self._lock:
-            existing = self._strategies.get(strategy.id)
-            if existing is not None and existing != strategy:
+            self._save_strategy_unlocked(strategy)
+
+    def strategy(self, strategy_id: UUID) -> StrategySnapshot | None:
+        with self._lock:
+            return self._strategies.get(strategy_id)
+
+    def ensure_active_strategy(
+        self,
+        strategy: StrategySnapshot,
+        activation: StrategyActivation,
+    ) -> StrategySnapshot:
+        with self._lock:
+            active = self._active_strategy_unlocked()
+            if active is not None:
+                return active
+            if (
+                activation.kind is not StrategyActivationKind.BOOTSTRAP
+                or activation.strategy_id != strategy.id
+                or strategy.parent_id is not None
+                or strategy.version != 1
+            ):
+                raise ConflictError("initial active strategy requires a root bootstrap activation")
+            self._save_strategy_unlocked(strategy)
+            self._strategy_activations.append(activation)
+            return strategy
+
+    def active_strategy(self) -> StrategySnapshot | None:
+        with self._lock:
+            return self._active_strategy_unlocked()
+
+    def strategy_activation_history(self) -> tuple[StrategyActivation, ...]:
+        with self._lock:
+            return tuple(self._strategy_activations)
+
+    def register_evolution_experiment(
+        self,
+        candidate: StrategySnapshot,
+        experiment: EvolutionExperiment,
+        transition: ExperimentTransition,
+    ) -> None:
+        with self._lock:
+            active = self._active_strategy_unlocked()
+            if active is None or active.id != experiment.baseline_id:
+                raise ConflictError("experiment baseline is not the active strategy")
+            if (
+                candidate.id != experiment.candidate_id
+                or candidate.parent_id != active.id
+                or candidate.version != active.version + 1
+            ):
+                raise ConflictError("experiment candidate does not extend the active baseline")
+            if experiment.id in self._experiments:
+                raise ConflictError("evolution experiment already exists")
+            if (
+                experiment.stage is not ExperimentStage.PROPOSED
+                or experiment.created_at != experiment.updated_at
+                or transition.id in self._experiment_transition_ids
+                or transition.idempotency_key in self._experiment_transition_keys
+                or transition.experiment_id != experiment.id
+                or transition.from_stage is not None
+                or transition.to_stage is not ExperimentStage.PROPOSED
+                or transition.transitioned_at != experiment.created_at
+            ):
+                raise ConflictError("experiment creation evidence is inconsistent")
+            self._save_strategy_unlocked(candidate)
+            self._experiments[experiment.id] = experiment
+            self._experiment_transitions[experiment.id] = [transition]
+            self._experiment_transition_ids.add(transition.id)
+            self._experiment_transition_keys[transition.idempotency_key] = transition
+
+    def evolution_experiment(self, experiment_id: UUID) -> EvolutionExperiment | None:
+        with self._lock:
+            return self._experiments.get(experiment_id)
+
+    def experiment_transition_history(
+        self,
+        experiment_id: UUID,
+    ) -> tuple[ExperimentTransition, ...]:
+        with self._lock:
+            return tuple(self._experiment_transitions.get(experiment_id, ()))
+
+    def experiment_transition_by_idempotency(
+        self,
+        idempotency_key: str,
+    ) -> ExperimentTransition | None:
+        with self._lock:
+            return self._experiment_transition_keys.get(idempotency_key.strip())
+
+    def advance_evolution_experiment(
+        self,
+        experiment: EvolutionExperiment,
+        transition: ExperimentTransition,
+        activation: StrategyActivation | None = None,
+    ) -> None:
+        with self._lock:
+            current = self._experiments.get(experiment.id)
+            if current is None:
+                raise ConflictError("evolution experiment does not exist")
+            if (
+                experiment.baseline_id != current.baseline_id
+                or experiment.candidate_id != current.candidate_id
+                or experiment.created_at != current.created_at
+                or transition.id in self._experiment_transition_ids
+                or transition.idempotency_key in self._experiment_transition_keys
+                or transition.experiment_id != current.id
+                or transition.from_stage is not current.stage
+                or transition.to_stage is not experiment.stage
+                or transition.transitioned_at != experiment.updated_at
+            ):
+                raise ConflictError("experiment transition evidence is inconsistent")
+            expected = current.transition(experiment.stage, transition.transitioned_at)
+            if experiment != expected:
+                raise ConflictError("experiment transition does not match current state")
+            self._validate_activation_unlocked(current, experiment, transition, activation)
+            if activation is not None:
+                self._strategy_activations.append(activation)
+            self._experiments[experiment.id] = experiment
+            self._experiment_transitions[experiment.id].append(transition)
+            self._experiment_transition_ids.add(transition.id)
+            self._experiment_transition_keys[transition.idempotency_key] = transition
+
+    def _validate_activation_unlocked(
+        self,
+        current: EvolutionExperiment,
+        updated: EvolutionExperiment,
+        transition: ExperimentTransition,
+        activation: StrategyActivation | None,
+    ) -> None:
+        promotion = (
+            current.stage is ExperimentStage.CANARY and updated.stage is ExperimentStage.PROMOTED
+        )
+        rollback = (
+            current.stage is ExperimentStage.PROMOTED
+            and updated.stage is ExperimentStage.ROLLED_BACK
+        )
+        if not promotion and not rollback:
+            if activation is not None:
+                raise ConflictError("this experiment transition cannot activate a strategy")
+            return
+        if activation is None or activation.id in {item.id for item in self._strategy_activations}:
+            raise ConflictError("strategy activation evidence is missing or duplicated")
+        expected_kind = (
+            StrategyActivationKind.PROMOTION if promotion else StrategyActivationKind.ROLLBACK
+        )
+        expected_target = current.candidate_id if promotion else current.baseline_id
+        expected_previous = current.baseline_id if promotion else current.candidate_id
+        active = self._active_strategy_unlocked()
+        if (
+            activation.kind is not expected_kind
+            or activation.strategy_id != expected_target
+            or activation.previous_strategy_id != expected_previous
+            or activation.experiment_id != current.id
+            or activation.activated_at != transition.transitioned_at
+            or activation.reason != transition.reason
+            or active is None
+            or active.id != expected_previous
+            or expected_target not in self._strategies
+        ):
+            raise ConflictError("strategy activation does not match experiment state")
+
+    def _save_strategy_unlocked(self, strategy: StrategySnapshot) -> None:
+        existing = self._strategies.get(strategy.id)
+        if existing is not None:
+            if existing != strategy:
                 raise ConflictError("strategy id already belongs to a different snapshot")
-            self._strategies[strategy.id] = strategy
+            return
+        if strategy.parent_id is None:
+            if strategy.version != 1:
+                raise ConflictError("root strategy version must be 1")
+        else:
+            parent = self._strategies.get(strategy.parent_id)
+            if parent is None or strategy.version != parent.version + 1:
+                raise ConflictError("strategy parent and version are inconsistent")
+        self._strategies[strategy.id] = strategy
+
+    def _active_strategy_unlocked(self) -> StrategySnapshot | None:
+        if not self._strategy_activations:
+            return None
+        strategy_id = self._strategy_activations[-1].strategy_id
+        return self._strategies[strategy_id]
 
     def transaction(self) -> AbstractContextManager[None]:
-        return _LockedTransaction(self._lock)
+        return _LockedTransaction(self)
+
+    def _snapshot_transaction_state_unlocked(self) -> dict[str, object]:
+        return {name: deepcopy(getattr(self, name)) for name in _TRANSACTIONAL_STATE}
+
+    def _restore_transaction_state_unlocked(self, snapshot: dict[str, object]) -> None:
+        for name in _TRANSACTIONAL_STATE:
+            setattr(self, name, snapshot[name])
 
     def observation_by_idempotency(self, scope: Scope, idempotency_key: str) -> Observation | None:
         with self._lock:
