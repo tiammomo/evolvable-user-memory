@@ -22,9 +22,17 @@
 - `evolvable-memory-eval` 评测入口与内置 synthetic `smoke-v1`，覆盖 Recall@k、MRR、更新、拒答、forbidden/Scope 隔离和执行失败硬门禁；CI 保存最小化报告，并从构建后的 wheel 验证资源，报告不输出 evidence/value。
 - `POST /v1/recall` 的可选 `valid_at` / `known_at` 双时间历史状态投影；Revision 与 Outcome 按系统知识时间过滤，时效评分以业务有效时间为参照，Trace item 冻结命中修订的有效/记录时间。
 - PostgreSQL `0003_bitemporal_recall` 迁移、双时间索引与约束，以及内存/PostgreSQL 一致的历史状态与历史效用重建。
+- schema v2 `builtin:temporal-v1` 确定性时间线评测，覆盖迟到修正、未来生效 Revision、Outcome 归因/幂等、知识时间前后 Utility、Scope 隔离和未来 `known_at` 拒绝；CI 与 wheel 资源门禁同时运行 smoke/temporal 数据集。
+- PostgreSQL `0004_active_strategy_registry` 与内存等价实现：不可变策略谱系、append-only bootstrap 激活记录、并发单初始化、跨重启活动策略复用，以及候选注册不自动激活的隔离边界。
+- PostgreSQL `0005_evolution_experiments` 与可信内部 `EvolutionApplication`：幂等提案/阶段推进、请求指纹冲突、持久化实验和 append-only 证据历史、合法阶段数据库守卫，以及晋升/回滚与活动策略原子切换。
+- HMAC-SHA256 Gate Receipt 门禁：阶段推进绑定实验/策略身份、唯一阶段边、决策、硬门禁、外部产物摘要、issuer/key ID 与有效期；拒绝篡改、未知密钥、错绑和过期凭证，同时保留成功请求过期后的精确幂等重放。
+- Milvus 2.6 可重建向量投影、离线 hash 与 OpenAI-compatible embedding 适配器，以及 PostgreSQL 最终 Scope/双时间复核的词法/向量混合召回。
+- `0006_milvus_projection_queue`、独立 projector CLI，以及支持租约抢占、指数退避、死信、游标、幂等 upsert 和全量重建的 Revision outbox 消费链。
+- 默认 Compose 的 etcd、MinIO、Milvus 和 projector 服务；Milvus 故障时 API 自动退回词法召回，并在健康信息中显示投影降级状态。
 
 ### Changed
 
+- 以包内 `__version__` 作为发行包、OpenAPI、服务发现与健康检查的统一版本来源，避免发布时版本漂移。
 - 改善前端字体、色彩、响应式布局、焦点状态和新人操作反馈。
 - 扩充 README、快速开始和前端指南，使页面流程与实际状态边界一致。
 - 修复 Scope 切换时的旧请求/旧响应污染，并让一次逻辑写入在网络重试时复用幂等键。

@@ -11,16 +11,22 @@
 - 带证据、上下文和置信度的偏好写入；
 - 不可变修订、当前记忆列表和修订历史；
 - 可选 `valid_at` / `known_at` 的双时间历史状态投影，以及冻结双时间和命中修订时间的 RecallTrace；
-- 可解释的词法/上下文召回，以及按 `known_at` 重建的 Outcome Utility 与按 `valid_at` 计算的 Recency；
+- 可解释的词法/Milvus 向量/上下文混合召回，以及按 `known_at` 重建的 Outcome Utility 与按 `valid_at` 计算的 Recency；
 - 可归因 Outcome、独立业务/系统时间和上下文 Utility 更新；
 - 有界策略提案与合法实验状态转换；
-- 隔离运行的 `builtin:smoke-v1` synthetic retrieval/invariant 评测，以及 Recall@k、MRR、更新、拒答、forbidden/Scope 隔离和执行失败硬门禁；
+- 不可变策略快照注册、append-only 活动策略 bootstrap 历史、并发启动单激活，以及跨重启复用权威活动策略；候选注册不会自动晋升；
+- 幂等演化提案、持久化实验当前状态与 append-only 转换证据；`CANARY → PROMOTED` 和已晋升回滚与活动策略切换同事务提交，竞争候选失败不留下半状态；
+- 隔离运行的 `builtin:smoke-v1` retrieval/invariant 与 schema v2 `builtin:temporal-v1` 双时间/Outcome synthetic 评测，以及 Recall@k、MRR、更新、历史 Utility、预期领域拒绝、forbidden/Scope 隔离和执行失败硬门禁；
 - PostgreSQL 权威存储、版本化迁移、数据库 Scope/幂等/修订/归因约束和本机 Compose 启动链；
 - Observation 摄入、Revision 变更和 Outcome 记录与不含原始证据正文的 outbox 事件同事务写入；
-- `/livez`、存储依赖 `/readyz` 和前端动态存储方式展示；
+- Milvus Revision outbox 消费、租约/重试/死信/游标/重建、哈希化 Scope partition key、PostgreSQL 最终可见性复核和词法故障降级；
+- `/livez`、带独立短超时的存储依赖 `/readyz`、PostgreSQL 池连接终止与完整网络中断/恢复验证，以及前端动态存储方式展示；
 - Scope 切换状态清理、旧请求取消/旧响应隔离，以及前后端 Scope/幂等正确性修复；
+- 前后端共同使用 `EMF_PUBLIC_API_URL`，静态服务动态下发浏览器运行配置并同步约束 CSP，不再依赖 HTML 硬编码 API 端口；
+- 新手闭环进度按 Scope 保存在浏览器，切换后可独立恢复，并以当前记忆状态纠正失效进度；
 - 本地开发身份、RFC 9068 风格 JWT 校验、按 action/tenant/subject/purpose 默认拒绝的 application 权限执行点，以及伪名化 allow/deny 审计；
-- Chromium 主流程、响应式布局、键盘操作和 Scope 迟到响应的真实浏览器 E2E；
+- 内存/PostgreSQL 双存储矩阵下的 Chromium 主流程、响应式布局、键盘操作和 Scope 迟到响应 E2E；
+- axe-core 对工作台首页、引导、写入、列表、召回和修正弹窗可见状态的自动化无障碍审计；
 - Python 质量门禁、3.12–3.14 测试矩阵、内置评测及 wheel 资源验证、发行包和容器构建 CI；
 - Web 工作台、OpenAPI、示例脚本和分层文档。
 
@@ -32,11 +38,7 @@
 
 目标是让新人稳定复现闭环，并防止前端或交付层破坏已有领域不变量。
 
-- 扩展浏览器 E2E 到 PostgreSQL 模式、依赖故障恢复和自动化无障碍审计；
-- 统一运行时前后端地址配置，减少修改端口时的手工同步；
-- 持久化按 Scope 恢复新人闭环进度；
 - 增加可重复的演示数据初始化与安全清理流程。
-- 扩充双时间测试与代表性回放集，覆盖迟到修正、未来生效事实、旧 Outcome 迁移近似和时间边界拒答。
 
 完成门槛：主闭环可重复执行，Scope 切换不保留或误渲染旧用户数据，质量门禁在干净环境自动通过。
 
@@ -44,7 +46,7 @@
 
 - PostgreSQL 故障注入、迁移回滚、备份恢复和容量验证；
 - 持续验证现有数据库级 Scope、幂等键、修订序号、单活动修订和 Trace 归因约束；
-- 消费现有同事务 outbox，并增加可重放发布状态和投影游标；
+- 将 Milvus 专用消费扩展为通用可重放发布状态、授权运维控制面、删除屏障和积压 SLO；
 - IdP 成员/角色生命周期、撤销与临时授权、增强认证、权限管理 API/UI 和有效权限模拟；
 - PostgreSQL 非 owner 应用角色、事务级可信 Scope 与强制 RLS；
 - 将当前伪名化运行时授权审计接入独立防篡改存储、保留和告警；
@@ -53,10 +55,10 @@
 
 完成门槛：满足[威胁模型](docs/threat-model.md)的生产安全门禁；故障恢复后权威状态与审计链完整；任何跨 Scope 或未归因更新都被应用层和数据库双重拒绝。
 
-## 规划：混合检索与可解释评估
+## 规划：检索质量与可解释评估
 
-- 从 outbox 构建可丢弃、可确定性重建的 embedding、关键词、图和摘要投影；
-- 混合候选生成、重排与明确的投影延迟降级策略；
+- 在现有 Milvus embedding 投影之外增加关键词、图和摘要投影，并验证跨模型重建/切换；
+- 扩展现有混合候选与词法降级，加入生产级重排、投影延迟指标和质量门禁；
 - 展示证据来源、匹配原因、评分分量和无结果诊断；
 - 在内置 smoke 之外，建立经过许可审查、包含隔离、危险召回、修正与空结果样本的代表性离线回放集；
 - 建立策略注册时间、投影版本和历史效用快照合同，使 historical state projection 可逐步演进为受控的完整历史策略 replay；
@@ -66,7 +68,7 @@
 
 ## 探索：受控策略演化
 
-- 不可变策略注册表、基线与候选版本管理；
+- 基线/候选自动比较、外部评测产物摘要复核、非对称 Gate Receipt 与独立审计存储、真实影子/灰度路由和受授权的策略控制面；
 - 离线回放、影子评估、小流量灰度、停止条件和自动回滚；
 - 失败诊断与有界提案编排；
 - 策略质量、成本、隔离和审计护栏控制面。
@@ -86,6 +88,6 @@
 - 不因召回或曝光次数自动强化 Belief 或 Utility；
 - 不允许模型或演化引擎自行放宽治理规则；
 - 在生产信任边界完成前，不宣称多租户生产就绪。
-- 不把 `builtin:smoke-v1` 包装成 LongMemEval、LoCoMo、SOTA 或真实业务质量证明。
+- 不把 `builtin:smoke-v1` / `builtin:temporal-v1` 包装成 LongMemEval、LoCoMo、SOTA、完整历史策略 replay 或真实业务质量证明。
 
 隐私生命周期和威胁模型文档只定义设计与验收标准；在对应测试、运行流程和证据完成前，不把它们列为已实现能力。

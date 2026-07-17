@@ -56,7 +56,7 @@ curl http://127.0.0.1:38089/health
 期望响应：
 
 ```json
-{"status":"ok","version":"0.1.0","storage":"memory","auth_mode":"development","scope_source":"request"}
+{"status":"ok","version":"0.1.0","storage":"memory","auth_mode":"development","scope_source":"request","projection":"disabled"}
 ```
 
 还可以访问：

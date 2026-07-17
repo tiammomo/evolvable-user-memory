@@ -37,6 +37,17 @@ curl http://127.0.0.1:38089/health
 
 如果直接打开了本地 `index.html` 文件，请改用 `http://127.0.0.1:33009`，不要使用 `file://`。
 
+## `/readyz` 返回 503
+
+先比较进程存活与依赖就绪：
+
+```bash
+curl -i http://127.0.0.1:38089/livez
+curl -i http://127.0.0.1:38089/readyz
+```
+
+若 `/livez` 为 `200` 而 `/readyz` 为 `503`，API 进程仍存活，但当前存储不可用。PostgreSQL 模式应检查数据库网络、凭据、连接上限和服务日志。`EMF_DATABASE_READINESS_TIMEOUT_SECONDS` 只控制探针等待连接池的时间（默认 1 秒），调大它不能修复数据库故障，也不应被用来掩盖持续不可用。
+
 ## 端口已被占用
 
 Linux 下查看监听进程：
@@ -48,14 +59,21 @@ ss -ltnp '( sport = :33009 or sport = :38089 )'
 停止旧进程，或通过环境变量修改端口：
 
 ```bash
-EMF_PORT=39000 uv run evolvable-memory
-EMF_FRONTEND_PORT=34000 uv run evolvable-memory-frontend
+EMF_PORT=39000 \
+EMF_FRONTEND_URL=http://127.0.0.1:34000 \
+EMF_PUBLIC_API_URL=http://127.0.0.1:39000 \
+EMF_CORS_ORIGINS=http://127.0.0.1:34000 \
+uv run evolvable-memory
+
+EMF_FRONTEND_PORT=34000 \
+EMF_PUBLIC_API_URL=http://127.0.0.1:39000 \
+uv run evolvable-memory-frontend
 ```
 
-如果修改端口，当前版本还需要同步调整：
+如果修改端口，请检查：
 
-- `index.html` 中的 `api-port`。
-- 后端环境变量 `EMF_PUBLIC_API_URL` 和 `EMF_CORS_ORIGINS`；其中 CORS Origin 必须是完整的前端协议、主机与端口。
+- 前后端进程是否读取了相同的 `EMF_PUBLIC_API_URL`；可访问前端 `/runtime-config.js` 核对浏览器实际使用的地址。
+- 后端 `EMF_CORS_ORIGINS` 是否包含完整且精确的前端协议、主机与端口。
 
 默认端口能避免这项额外配置，推荐新人保持默认值。
 

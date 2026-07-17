@@ -112,7 +112,7 @@ Pydantic 请求校验错误使用 FastAPI 标准的 `422` 结构。
 
 ### `GET /readyz`
 
-检查当前存储是否可用。内存模式在应用正常运行时返回 `200`；PostgreSQL 模式会检查数据库连接。依赖不可用时返回 `503` 和 `not_ready`，适合作为容器或编排器的就绪探针。
+检查当前存储是否可用。内存模式在应用正常运行时返回 `200`；PostgreSQL 模式会检查数据库连接。依赖不可用时返回 `503` 和 `not_ready`，适合作为容器或编排器的就绪探针。PostgreSQL 连接池获取使用独立的 `EMF_DATABASE_READINESS_TIMEOUT_SECONDS` 上限（默认 1 秒），不会把该短超时施加到普通业务事务。
 
 ### `POST /v1/preferences`
 

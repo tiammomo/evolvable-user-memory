@@ -30,7 +30,7 @@
 | Outcome 与 note | PostgreSQL 权威状态 | 业务/系统时间、结果及自由文本可能敏感 | 可归因、最小化 note、独立保留策略 |
 | UtilityEstimate | PostgreSQL 权威状态 | 从行为推断出的效用画像 | 随源 Revision 与 Scope 清理或重新计算 |
 | outbox event | PostgreSQL | 含 Scope、标识和事件元数据 | 不含原始证据正文、受控消费、随生命周期清理 |
-| embedding/graph/摘要投影 | 尚未实现 | 难以逐项定位、可能跨 Scope 泄漏 | 可定位、可重建、可验证清理、游标可追踪 |
+| Milvus embedding 投影 | 已实现（哈希 Scope、revision 定位、可重建） | 向量语义泄漏、删除链尚未闭环 | 可验证清理、删除屏障、积压与游标可追踪 |
 | 前端状态与缓存 | 浏览器内存；未来可能增加缓存 | Scope 切换后的残留 | Scope 切换立即清理，不持久化敏感正文 |
 | 日志、指标、追踪 | 部署环境 | 二次复制和长期泄漏 | 默认无原始证据、明确保留期和访问控制 |
 | 备份与恢复副本 | 部署环境 | 在线删除后仍可恢复 | 过期策略、恢复后重放删除屏障、可审计演练 |
@@ -139,7 +139,7 @@ Scope 内双时间 Revision 与 Outcome 选择
 
 ## 6. 与 outbox、投影和备份的关系
 
-当前只实现了 PostgreSQL 同事务 outbox 写入，尚无消费者或独立投影。未来实现必须满足：
+当前已实现 PostgreSQL 同事务 outbox 写入和 Milvus 独立投影，但删除/抑制生命周期尚未接入 projector。继续实现必须满足：
 
 - 普通领域事件与生命周期事件按每个 Scope/aggregate 有可验证顺序；
 - 消费者幂等，重复投递不会恢复被抑制或删除的数据；

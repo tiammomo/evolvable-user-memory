@@ -26,10 +26,11 @@
 
 1. [开发指南](development.md)
 2. [架构说明](architecture.md)
-3. [记忆评测指南](evaluation.md)
-4. [演化安全模型](evolution-safety.md)
-5. [贡献指南](../CONTRIBUTING.md)
-6. [路线图](../ROADMAP.md)
+3. [ADR-0001：按依赖层与记忆平面渐进整理代码](adr/0001-layer-and-plane-boundaries.md)
+4. [记忆评测指南](evaluation.md)
+5. [演化安全模型](evolution-safety.md)
+6. [贡献指南](../CONTRIBUTING.md)
+7. [路线图](../ROADMAP.md)
 
 重点保持 `api/adapters → application → domain` 的依赖方向和五个平面的语义边界。
 
@@ -40,19 +41,20 @@
 3. [架构说明](architecture.md)中的固定 relevance admission
 4. [路线图](../ROADMAP.md)中的混合检索与受控演化
 
-先用 `builtin:smoke-v1` 检查 retrieval/invariant 回归，再讨论候选策略。该 synthetic smoke 不是论文 benchmark 或策略晋升的充分证据。
+先用 `builtin:smoke-v1` 检查 retrieval/invariant 回归，再用 `builtin:temporal-v1` 检查双时间与 Outcome 知识时间回归。两个 synthetic 契约集都不是论文 benchmark 或策略晋升的充分证据。
 
 ### 部署与安全维护者
 
 1. [部署与运行指南](deployment.md)
-2. [安全政策](../SECURITY.md)
-3. [身份与权限设计](authorization.md)
-4. [威胁模型](threat-model.md)
-5. [隐私生命周期设计](privacy-lifecycle.md)
-6. [架构说明](architecture.md)中的 Scope 与持久化边界
-7. [路线图](../ROADMAP.md)
+2. [Milvus 投影指南](milvus-projection.md)
+3. [安全政策](../SECURITY.md)
+4. [身份与权限设计](authorization.md)
+5. [威胁模型](threat-model.md)
+6. [隐私生命周期设计](privacy-lifecycle.md)
+7. [架构说明](architecture.md)中的 Scope 与持久化边界
+8. [路线图](../ROADMAP.md)
 
-当前容器仅用于本机开发评估。PostgreSQL 权威存储、迁移、数据库约束、同事务 outbox 和 JWT 授权基线已经实现；生产化前仍必须补齐权限治理控制面、数据库 RLS、隐私生命周期执行、outbox 消费/投影、故障恢复和可观测性 SLO。
+当前容器仅用于本机开发评估。PostgreSQL 权威存储、迁移、数据库约束、同事务 outbox、Milvus 投影 worker 和 JWT 授权基线已经实现；生产化前仍必须补齐权限治理控制面、数据库 RLS、隐私生命周期执行、受控重放/删除屏障、故障恢复和可观测性 SLO。
 
 ## 当前版本地图
 
@@ -61,17 +63,17 @@
 | 上下文偏好写入 | 已实现 | 前端“写入记忆”或 `POST /v1/preferences` |
 | 当前记忆列表 | 已实现 | 前端“当前记忆”或 `GET /v1/preferences` |
 | 不可变修订 | 已实现 | 修正弹窗或 corrections API |
-| 词法与上下文召回 | 已实现 | 前端“记忆召回”或 `POST /v1/recall` |
+| 词法/向量与上下文混合召回 | 已实现；Milvus 可降级 | 前端“记忆召回”或 `POST /v1/recall` |
 | 双时间历史状态投影 | 已实现；不是完整历史策略 replay | `POST /v1/recall` 的 `valid_at` / `known_at` |
 | Outcome 效用学习 | 已实现 | 召回结果反馈或 `POST /v1/outcomes` |
 | 有界策略提案 | 领域模型已实现 | `domain/evolution.py` |
-| synthetic retrieval/invariant 评测 | 已实现（最小 smoke） | [记忆评测指南](evaluation.md) |
+| synthetic retrieval/invariant 与双时间评测 | 已实现（smoke-v1 / temporal-v1） | [记忆评测指南](evaluation.md) |
 | PostgreSQL 持久化与迁移 | 已实现（开发预览） | [部署指南](deployment.md) |
 | 数据库 Scope/幂等/修订/归因约束 | 已实现（仍需故障与并发加固） | [架构说明](architecture.md) |
-| 同事务 outbox 写入 | 已实现；消费者未实现 | [部署指南](deployment.md) |
+| 同事务 outbox 写入 | 已实现 | [部署指南](deployment.md) |
 | 前端动态存储提示与 Scope 旧响应隔离 | 已实现 | [前端工作台指南](frontend-guide.md) |
-| embedding / graph 投影 | 未实现 | [路线图](../ROADMAP.md) |
-| outbox 消费、重放与投影游标 | 未实现 | [路线图](../ROADMAP.md) |
+| Milvus embedding 投影 | 已实现（开发预览） | [Milvus 投影指南](milvus-projection.md) |
+| Milvus 消费、重试、死信、游标与重建 | 已实现；远程受控重放未实现 | [Milvus 投影指南](milvus-projection.md) |
 | JWT 身份与 application 授权执行点 | 已实现（治理基线） | [身份与权限设计](authorization.md) |
 | 角色管理、撤销、临时授权和数据库 RLS | 未实现 | [身份与权限设计](authorization.md) |
 | 同意、保留、抑制、删除与证明 | 仅有设计，未实现 | [隐私生命周期设计](privacy-lifecycle.md) |
@@ -93,5 +95,8 @@
 | OutcomeEvent | 引用 RecallTrace 的真实业务结果；区分业务发生时间与系统记录时间 |
 | UtilityEstimate | 某修订在某上下文中的结果效用估计 |
 | StrategySnapshot | 不可变、可回滚的检索策略参数快照 |
+| StrategyActivation | 某个已注册策略成为活动策略的不可变记录；注册候选本身不产生激活 |
+| EvolutionExperiment | 候选从提案到离线、影子、灰度、晋升或回滚的持久化当前状态 |
+| ExperimentTransition | 带幂等键、请求指纹和外部证据引用的 append-only 阶段变化记录 |
 | historical state projection | 按双时间重建 Revision/Outcome 状态，再用执行时 StrategySnapshot 召回；不等于完整历史策略重放 |
 | Hard gate | 不能被平均质量分抵消的通过条件；失败时评测命令返回非零 |

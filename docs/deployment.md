@@ -2,7 +2,7 @@
 
 本指南覆盖本机开发、Docker Compose 评估和未来生产部署前的检查项。
 
-> 当前 `0.1.x` 已提供 PostgreSQL 适配器，以及 JWT 身份和 application 授权基线；请求中的 Scope 在 JWT 模式下只是目标选择器，必须由可信 grant 覆盖。项目仍缺完整权限治理、隐私治理和生产运维基线。以下容器配置用于本机演示和集成验证，不是生产部署模板。不要暴露到公网或写入真实敏感数据。
+> 当前 `0.1.x` 已提供 PostgreSQL 权威存储、Milvus 可重建投影，以及 JWT 身份和 application 授权基线；请求中的 Scope 在 JWT 模式下只是目标选择器，必须由可信 grant 覆盖。项目仍缺完整权限治理、隐私治理和生产运维基线。以下容器配置用于本机演示和集成验证，不是生产部署模板。不要暴露到公网或写入真实敏感数据。
 
 ## 选择运行方式
 
@@ -20,7 +20,7 @@
 
 - Docker Engine；
 - Docker Compose v2（使用 `docker compose` 命令）；
-- 本机端口 `33009` 和 `38089` 未被占用。
+- 本机端口 `33009`、`38089`、`19530` 和 `19091` 未被占用。
 
 如果已经用 `uv` 启动了两个服务，请先在对应终端按 `Ctrl+C`，避免端口冲突。
 
@@ -34,16 +34,19 @@ docker compose up --build -d
 Compose 会按依赖关系启动：
 
 - `postgres`：仅位于 Compose 内部网络，数据保存在命名 volume；
+- `etcd`、`minio`、`milvus`：Milvus 2.6 standalone 依赖与向量投影存储；
 - `migrate`：等待数据库健康后执行一次 `evolvable-memory-migrate`；
-- `backend`：迁移成功后，以 PostgreSQL 权威存储启动 FastAPI；
+- `projector`：租约消费 Revision outbox，生成 embedding 并幂等写入 Milvus；
+- `backend`：迁移和 Milvus 健康后，以 PostgreSQL 权威存储和可降级混合召回启动 FastAPI；
 - `frontend`：后端健康后启动静态工作台。
 
 应用镜像中的迁移、后端和前端进程都以非 root、只读根文件系统运行。宿主入口为：
 
 - `backend`：FastAPI，发布到 <http://127.0.0.1:38089>；
 - `frontend`：静态工作台，发布到 <http://127.0.0.1:33009>。
+- `milvus`：SDK 发布到 `127.0.0.1:19530`，健康端点发布到 `127.0.0.1:19091`。
 
-前端在用户浏览器中通过当前 hostname 的 `38089` 端口访问后端。因此这套 Compose 配置面向本机 `localhost`/`127.0.0.1` 体验；它不代表任意域名部署已经完成 CORS 和运行时地址配置。
+前端服务从 `EMF_PUBLIC_API_URL` 动态下发浏览器 API 地址，默认连接 `http://127.0.0.1:38089`。这套 Compose 配置仍只面向本机体验；域名部署必须为前后端进程设置相同的浏览器可达 API 地址，并完成 TLS、反向代理和 CORS 配置。
 
 ### 3. 检查状态
 
@@ -57,7 +60,7 @@ curl -I http://127.0.0.1:33009/
 健康接口会说明当前存储，依赖就绪接口会真实检查存储连接：
 
 ```json
-{"status":"ok","version":"0.1.0","storage":"postgres","auth_mode":"development","scope_source":"request"}
+{"status":"ok","version":"0.1.0","storage":"postgres","auth_mode":"development","scope_source":"request","projection":"enabled"}
 {"status":"ready","storage":"postgres"}
 ```
 
@@ -69,7 +72,7 @@ curl -I http://127.0.0.1:33009/
 ### 4. 查看日志
 
 ```bash
-docker compose logs -f postgres migrate backend frontend
+docker compose logs -f postgres milvus migrate projector backend frontend
 ```
 
 不要把真实原始证据复制到 Issue 或公开日志。应用访问日志只记录 request ID、方法、路由模板、状态、耗时和字节数，不记录 body 或 query string；项目后端入口也关闭了 Uvicorn 默认的 request-line 日志。反向代理、Ingress、自定义进程管理器、调试中间件和调用方必须遵守同一规则，不要重新记录完整 URL、query 或正文。
@@ -80,13 +83,13 @@ docker compose logs -f postgres migrate backend frontend
 docker compose down
 ```
 
-普通 `docker compose down` 会停止并删除容器和网络，但保留 `postgres-data` 命名 volume；再次启动后记忆仍在。只有确认不再需要本机演示数据时才执行：
+普通 `docker compose down` 会停止并删除容器和网络，但保留 PostgreSQL、Milvus、etcd 和 MinIO 命名 volume；再次启动后权威记忆与投影仍在。只有确认不再需要本机演示数据时才执行：
 
 ```bash
 docker compose down --volumes
 ```
 
-该命令会永久删除 Compose 中的 PostgreSQL 数据。
+该命令会永久删除 Compose 中的 PostgreSQL 权威数据和全部 Milvus 投影数据。
 
 ### 使用显式内存模式
 
@@ -127,6 +130,7 @@ docker run --rm --name emf-backend \
 docker run --rm --name emf-frontend \
   -e EMF_FRONTEND_HOST=0.0.0.0 \
   -e EMF_FRONTEND_PORT=33009 \
+  -e EMF_PUBLIC_API_URL=http://127.0.0.1:38089 \
   -p 127.0.0.1:33009:33009 \
   evolvable-user-memory:local \
   evolvable-memory-frontend
@@ -146,6 +150,13 @@ docker run --rm --name emf-frontend \
 | `EMF_DATABASE_URL` | Compose 内部 URL | PostgreSQL 连接串；`EMF_STORE=postgres` 时必填 |
 | `EMF_DATABASE_POOL_MIN_SIZE` | `1` | 最小连接池大小 |
 | `EMF_DATABASE_POOL_MAX_SIZE` | `10` | 最大连接池大小 |
+| `EMF_DATABASE_READINESS_TIMEOUT_SECONDS` | `1.0` | `/readyz` 专用连接池等待上限，范围 0.05–30 秒 |
+| `EMF_PROJECTION_MODE` | `milvus` | 默认 Compose 启用 Milvus；内存 Compose 显式禁用 |
+| `EMF_PROJECTION_REQUIRED` | `false` | 为 false 时 Milvus 故障降级到词法召回，不影响 PostgreSQL readiness |
+| `EMF_MILVUS_URI` | `http://milvus:19530` | Compose 网络中的 Milvus 地址 |
+| `EMF_MILVUS_COLLECTION` | `evolvable_memory_v1` | 可重建 collection 名称 |
+| `EMF_EMBEDDING_PROVIDER` | `hash` | 默认离线确定性基线；也支持 `openai_compatible` |
+| `EMF_EMBEDDING_DIMENSIONS` | `384` | collection 向量维度 |
 | `EMF_MAX_REQUEST_BODY_BYTES` | `1048576` | 应用层请求体上限；同时检查声明长度和实际流量 |
 | `EMF_AUTH_MODE` | `development` | Compose 本机身份；生产必须改为 `jwt` |
 | `EMF_AUTH_JWT_ISSUER` | 空 | JWT issuer；`jwt` 模式必填 |
@@ -155,7 +166,7 @@ docker run --rm --name emf-frontend \
 | `EMF_AUTH_REQUIRED_SCOPE` | `memory` | token 必须包含的 OAuth scope |
 | `EMF_AUTH_AUDIT_HMAC_KEY` | 空 | 授权审计引用密钥；`jwt` 模式至少 32 字符 |
 | `EMF_FRONTEND_URL` | `http://127.0.0.1:33009` | 服务发现返回的前端入口 |
-| `EMF_PUBLIC_API_URL` | `http://127.0.0.1:38089` | 服务发现和文档链接使用的外部 API 地址 |
+| `EMF_PUBLIC_API_URL` | `http://127.0.0.1:38089` | 服务发现、前端请求和前端 CSP 共用的浏览器可达 API 基础地址 |
 | `EMF_CORS_ORIGINS` | 两个本机前端 Origin | 逗号分隔的精确允许来源 |
 | `EMF_FRONTEND_HOST` | `0.0.0.0` | 前端容器监听地址 |
 | `EMF_FRONTEND_PORT` | `33009` | 前端容器端口 |
@@ -209,7 +220,7 @@ uv run evolvable-memory
 
 - 迁移升级/回滚、备份恢复和故障注入；
 - 数据库级 Scope、幂等、修订和归因约束的故障与并发验证；
-- 现有同事务 outbox 的消费、重放、投影恢复和生产连接池容量；
+- Milvus outbox 消费、受控重放、投影恢复和生产连接池容量；
 - 隔离、并发冲突、数据库中断和重启恢复测试。
 
 进展顺序见 [路线图](../ROADMAP.md)。
@@ -236,7 +247,7 @@ ss -ltnp '( sport = :33009 or sport = :38089 )'
 docker compose ps
 ```
 
-停止旧的本机进程或 Compose 项目后重试。当前前端 API 端口和后端开发 CORS 有固定默认值，不建议只修改一侧端口。
+停止旧的本机进程或 Compose 项目后重试。修改后端浏览器可达地址时，为前后端进程设置相同的 `EMF_PUBLIC_API_URL`；修改前端 Origin 时同时更新后端 `EMF_CORS_ORIGINS`。
 
 ### 容器健康检查失败
 

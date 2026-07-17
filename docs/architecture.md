@@ -34,7 +34,7 @@ MemoryApplication
 ## 3. 代码依赖
 
 ```text
-api / adapters  →  application  →  domain
+bootstrap  →  api / adapters  →  application  →  domain
 ```
 
 ### Domain
@@ -52,6 +52,12 @@ api / adapters  →  application  →  domain
 ### API
 
 校验传输数据、映射命令和响应、生成 OpenAPI，不承载领域状态转换。
+
+### Bootstrap
+
+`bootstrap/api.py` 是显式进程组合根。CLI 读取并验证配置后在这里创建 API 应用；单独导入 `create_app` 或历史 ASGI `app` 不会连接 PostgreSQL，兼容 `app` 只在第一次 ASGI 使用时惰性组装。
+
+依赖护栏、五平面与后续拆包顺序已经固化在 [ADR-0001](adr/0001-layer-and-plane-boundaries.md)；结构调整采用兼容外观渐进迁移，不做一次性重写。
 
 ## 4. 五个平面
 
@@ -120,9 +126,17 @@ api / adapters  →  application  →  domain
 
 ### Evolution：演化平面
 
-检索权重、阈值和时效参数保存在不可变 `StrategySnapshot` 中。
+检索权重、阈值和时效参数保存在不可变 `StrategySnapshot` 中。根策略和子策略形成只增不改的谱系；父策略必须已存在，子版本必须连续。
 
 `PolicyEvolution` 根据失败诊断提出有界子快照，每次只允许很小的权重变化。提案不是自动晋升；离线回放、影子、灰度和回滚由未来适配器编排。
+
+默认运行通过 append-only `StrategyActivation` 历史解析权威活动策略。首次启动只允许原子 `bootstrap`；并发实例和进程重启复用同一快照。显式注入候选用于隔离评测时只注册并固定该候选，不改变活动策略。
+
+可信内部 `EvolutionApplication` 以幂等请求指纹创建候选和 `EvolutionExperiment`，并追加不可变 `ExperimentTransition`。阶段推进必须提供 HMAC-SHA256 `GateReceipt`；它把受信任 issuer/key、实验与策略身份、唯一阶段边、门禁决策、产物引用/摘要和有效期绑定到签名，应用拒绝篡改、过期、错绑及硬门禁未通过的正向推进。阶段状态使用 compare-and-set 更新；`CANARY → PROMOTED` 与候选激活、`PROMOTED → ROLLED_BACK` 与基线恢复分别在同一存储事务完成。
+
+当前只验证 Receipt 声明，没有抓取外部产物并重新计算 `artifact_sha256`，完整 Receipt 也尚未作为独立审计对象持久化；提案诊断引用仍未签名。真实 shadow/canary 路由和授权后的 HTTP 控制面同样未实现。
+
+当前活动策略是部署级全局配置，不属于某个 tenant 或 subject。未来若增加 cohort/tenant 策略分配，必须显式建模分配 Scope、授权、冲突和 Trace 归因，不能把数据 Scope 偷渡进全局策略表。
 
 演化永远不能修改身份、授权、Scope 隔离、删除、保留、抑制或审计规则。
 
@@ -277,9 +291,13 @@ JWT identity adapter
 
 `0003_bitemporal_recall` 为 Trace 增加双时间边界、为 Trace item 增加命中修订时间快照，并为 Outcome 增加系统 `recorded_at`。迁移会从权威 Revision 回填旧 item 时间，并尽量保持旧 Trace 已冻结结果仍满足新边界。旧 Outcome 在原 Schema 中没有真实摄入时间，因此只能以 `min(occurred_at, migration time)` best-effort 回填 `recorded_at`；迁移前 Outcome 的历史 Utility 不能被解释为精确的系统知识审计。
 
-这里的“outbox 已实现”仅指事件行与权威变更原子落库；当前没有消费者、发布确认、受控重放或投影游标，因此不能把 outbox 表中的未发布行视为已经送达下游。
+`0004_active_strategy_registry` 增加 append-only `strategy_activations`。当前活动策略按数据库生成的单调 sequence 选择最后一条记录；初始化使用事务级 advisory lock，确保并发启动只产生一个根策略和一次 bootstrap。迁移不会猜测旧快照中哪一个曾是活动策略，升级后的第一次应用启动会创建新的、明确可归因的默认根策略。
 
-向量和图存储未来只能消费投影事件。当前数据库约束与适配器事务共同保证：
+`0005_evolution_experiments` 增加实验当前状态和 append-only 转换证据。数据库触发器拒绝非法阶段、删除实验以及修改/删除转换历史；应用适配器进一步验证候选谱系、活动基线、转换请求指纹和激活证据，并把阶段更新、历史追加及策略切换放在同一事务。
+
+Milvus projector 消费 Revision outbox，使用独立 `projection_jobs` receipt 实现租约、重试、死信、幂等 upsert、游标与全量重建。outbox 的全局 `published_at` 仍不表示所有下游已经处理；通用发布确认、授权后的受控重放与删除屏障尚未实现。
+
+Milvus 和未来图存储只能消费投影事件，不能反向写入权威 Revision。Milvus 候选必须由 PostgreSQL 按真实 Scope 和双时间最终复核。当前数据库约束与适配器事务共同保证：
 
 `0002_scope_integrity` 把 Candidate、修订链、Trace item 和策略版本的跨表引用绑定到一致的 record、Scope 或不可变策略身份；`0003_bitemporal_recall` 进一步把 Trace item 冻结的修订时间绑定到同一权威 Revision，并约束 `known_at <= created_at`。
 
@@ -289,6 +307,7 @@ JWT identity adapter
 - 活动 revision 外键必须指向同一 record 和 Scope，因此每条 record 只有一个活动指针。
 - Candidate、修订链与 Trace item 的 revision 必须同时匹配 record 和 Scope。
 - RecallTrace 的策略 ID 与版本必须引用同一个不可变 StrategySnapshot。
+- 活动策略记录必须引用已注册快照；bootstrap 不得伪造前一策略或实验，promotion/rollback 必须携带前一策略和实验 ID。
 - RecallTrace 的双时间边界和 item 修订时间通过数据库非空、检查、唯一键与复合外键保持一致。
 - Outcome 的 Trace 与 revision 归因完整性。
 
@@ -298,9 +317,10 @@ JWT identity adapter
 
 - 成员/角色治理控制面、撤销/临时授权与数据库 RLS
 - 删除证明、保留与抑制策略
-- 异步 outbox 消费者、投影游标与重放控制
-- embedding、图和摘要检索器
+- 通用 outbox 发布、授权后的重放控制、删除屏障与积压 SLO
+- 图和摘要检索器，以及生产级 embedding 质量门禁
 - 代表性离线回放数据集、影子路由与灰度控制面
+- 外部评测产物获取与内容摘要复核、非对称签名/独立 Receipt 审计存储、真实 shadow/canary 路由，以及受授权的策略控制面/API
 - 按历史 StrategySnapshot、投影版本与运行环境执行的完整历史策略 replay
 - 生产监控、审计存储和 SLO
 

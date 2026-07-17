@@ -29,6 +29,7 @@ uv run pytest
 - [ ] 正常路径、隔离、幂等和错误路径有测试。
 - [ ] API Schema 包含字段说明和可执行示例。
 - [ ] 前端动态用户内容没有通过 `innerHTML` 拼接。
+- [ ] 前端可见状态通过 `npm ci` 后的 axe-core Chromium 审计，并保留人工键盘检查。
 - [ ] README 或对应文档已更新。
 
 ## 提交前门禁
@@ -39,9 +40,19 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy
 uv build
+uv run evolvable-memory-eval run --dataset builtin:smoke-v1
+uv run evolvable-memory-eval run --dataset builtin:temporal-v1
 ```
 
 所有检查必须通过。覆盖率不能低于 85%。
+
+修改前端时还应运行：
+
+```bash
+npm ci
+uv run playwright install chromium
+uv run pytest tests/test_frontend_e2e.py --no-cov
+```
 
 ## 安全问题
 
