@@ -1,5 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="18" fill="#153f37"/>
-  <path d="M32 13C19.3 13 9 22.2 9 33.5 9 40 12.5 46 18 49.7V59l9.2-5.7c1.6.3 3.2.4 4.8.4 12.7 0 23-9.2 23-20.4S44.7 13 32 13Z" fill="#d8f06a"/>
-  <path d="M22 29h20M22 35h14" fill="none" stroke="#153f37" stroke-width="4" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Evolvable Memory">
+  <defs>
+    <linearGradient id="memory-surface" x1="9" y1="7" x2="55" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#343b7a" />
+      <stop offset="1" stop-color="#232852" />
+    </linearGradient>
+    <linearGradient id="evolution-path" x1="38" y1="48" x2="52" y2="16" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f5a08f" />
+      <stop offset="1" stop-color="#f36f62" />
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="17" fill="url(#memory-surface)" />
+  <rect x="3" y="3" width="58" height="58" rx="16" fill="none" stroke="#ffffff" stroke-opacity=".12" />
+  <path d="M17 20h24M17 31h18M17 42h13" fill="none" stroke="#f7f3e8" stroke-width="5" stroke-linecap="round" />
+  <path d="M39 47c7.2-4.2 11.3-10.3 11.3-17.2 0-4.8-1.9-9.1-5.2-12.5" fill="none" stroke="url(#evolution-path)" stroke-width="4.5" stroke-linecap="round" />
+  <circle cx="39" cy="47" r="4.5" fill="#f5a08f" />
+  <circle cx="45.2" cy="17.3" r="4.5" fill="#f36f62" />
 </svg>

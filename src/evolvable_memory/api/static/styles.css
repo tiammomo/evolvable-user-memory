@@ -130,19 +130,16 @@ svg {
   width: 38px;
   height: 38px;
   place-items: center;
-  border-radius: 12px;
-  color: var(--forest);
-  background: var(--lime);
-  box-shadow: 0 8px 24px rgba(210, 236, 88, 0.15);
+  overflow: hidden;
+  border-radius: 11px;
+  background: transparent;
+  box-shadow: 0 9px 24px rgba(23, 29, 67, 0.24);
 }
 
-.brand-mark svg {
-  width: 25px;
-  fill: none;
-  stroke: currentcolor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 2.2;
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .brand > span:last-child {
@@ -606,7 +603,9 @@ svg {
 }
 
 @keyframes view-in {
-  from { opacity: 0; transform: translateY(6px); }
+  /* Keep text fully opaque throughout navigation so transient states retain
+     WCAG contrast while the panel settles into place. */
+  from { transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
 
@@ -2156,7 +2155,7 @@ svg {
   box-shadow: var(--shadow-sm);
 }
 
-@keyframes result-in { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+@keyframes result-in { from { transform: translateY(7px); } to { transform: none; } }
 
 .rank-badge {
   display: grid;
@@ -2829,10 +2828,10 @@ svg {
   --lime: #f7d889;
   --lime-soft: #fff5d8;
   --info: #6589ce;
-  --success: #4f968e;
+  --success: #35736d;
   --warning: #b86f4f;
-  --danger: #b94f68;
-  --violet: #8067b3;
+  --danger: #ad435c;
+  --violet: #6f579f;
   --focus: #5269bd;
   --shadow-sm: 0 8px 26px rgba(63, 81, 141, 0.065);
   --shadow-md: 0 16px 42px rgba(63, 81, 141, 0.1);
@@ -2885,9 +2884,8 @@ body::before {
 }
 
 .brand-mark {
-  color: #3f518d;
-  background: linear-gradient(145deg, #fff1ad, #f7d889 55%, #f6c8b6);
-  box-shadow: 0 10px 28px rgba(215, 164, 79, 0.22);
+  background: transparent;
+  box-shadow: 0 10px 28px rgba(45, 52, 112, 0.24);
 }
 
 .brand strong {

@@ -98,6 +98,10 @@ def test_frontend_guards_scope_changes_and_idempotent_retries() -> None:
     assert "trapMobileMenuFocus" in script
     assert 'response.headers.get("x-request-id")' in script
     assert "this.requestId = this.bodyRequestId || this.responseRequestId" in script
+    assert "processing_suppressed:" in script
+    assert "已被隐私抑制" in script
+    assert "processing_not_granted:" in script
+    assert "ProcessingGrant" in script
     assert "journeyStorageKey" in script
     assert "persistJourney(state.scope, state.journey)" in script
     assert "state.journey = readJourney(state.scope)" in script

@@ -1,0 +1,21 @@
+{
+  "name": "Evolvable Memory · 记忆工作台",
+  "short_name": "Memory",
+  "description": "可追溯、可治理、可演化的用户记忆工作台",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f7f6fd",
+  "theme_color": "#2b3269",
+  "icons": [
+    {
+      "src": "./icons/memory-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "./icons/memory-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

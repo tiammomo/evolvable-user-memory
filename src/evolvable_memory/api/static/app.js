@@ -211,7 +211,14 @@ function getScope() {
 function describeError(error) {
   if (error instanceof ApiError) {
     const requestReference = error.requestId ? `（请求号 ${shortId(error.requestId)}）` : "";
-    return `${error.message}${requestReference}`;
+    const governanceGuidance = {
+      processing_suppressed:
+        "当前租户 / 用户作用域已被隐私抑制，不允许继续读写。请切换到新的用户作用域；本地开发模式也可重启后端清除临时抑制，但已删除的记忆不会恢复。",
+      processing_not_granted:
+        "当前租户 / 用户作用域没有用于 personalization 的有效 ProcessingGrant，请先由治理管理员签发或恢复授权。",
+    };
+    const message = governanceGuidance[error.message] || error.message;
+    return `${message}${requestReference}`;
   }
   if (error instanceof Error) return error.message;
   return "发生了未知错误";
@@ -1384,6 +1391,11 @@ function bindEvents() {
     renderOnboardingStep();
   });
   $("#onboarding-next").addEventListener("click", advanceOnboarding);
+  $("#onboarding-dialog").addEventListener("cancel", () => {
+    if (localStorage.getItem(ONBOARDING_STORAGE_KEY) !== "complete") {
+      sessionStorage.setItem(ONBOARDING_DISMISSED_KEY, "true");
+    }
+  });
   $("#onboarding-dialog").addEventListener("close", () => {
     if (localStorage.getItem(ONBOARDING_STORAGE_KEY) !== "complete") {
       sessionStorage.setItem(ONBOARDING_DISMISSED_KEY, "true");

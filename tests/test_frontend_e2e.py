@@ -317,6 +317,46 @@ def test_api_errors_show_a_short_correlated_request_reference(
         context.close()
 
 
+def test_suppressed_scope_explains_the_privacy_fence_and_recovery_boundary(
+    chromium_browser: Browser,
+    running_console: RunningConsole,
+) -> None:
+    context = chromium_browser.new_context(viewport={"width": 1366, "height": 900})
+    page = context.new_page()
+
+    def reject_preferences(route: Route) -> None:
+        if route.request.method == "OPTIONS":
+            route.continue_()
+            return
+        route.fulfill(
+            status=403,
+            headers={
+                "access-control-allow-origin": running_console.frontend_url,
+                "access-control-expose-headers": "X-Request-ID",
+                "content-type": "application/json",
+                "x-request-id": "suppressed-scope-request-1234",
+            },
+            body=json.dumps(
+                {
+                    "detail": "processing_suppressed",
+                    "error": "ProcessingDeniedError",
+                    "request_id": "suppressed-scope-request-1234",
+                }
+            ),
+        )
+
+    page.route("**/v1/preferences?**", reject_preferences)
+    try:
+        _open_console(page, running_console)
+        page.locator('[data-view="memories"]').click()
+        expect(page.locator("#memory-library .empty-results p")).to_contain_text("已被隐私抑制")
+        expect(page.locator("#memory-library .empty-results p")).to_contain_text(
+            "已删除的记忆不会恢复"
+        )
+    finally:
+        context.close()
+
+
 def test_visible_workbench_states_pass_automated_accessibility_audit(
     chromium_browser: Browser,
     running_console: RunningConsole,
