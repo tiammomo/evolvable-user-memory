@@ -2314,7 +2314,10 @@ svg {
 .onboarding-modal[open] { animation: onboarding-in 240ms ease both; }
 
 @keyframes onboarding-in {
-  from { opacity: 0; transform: translateY(12px) scale(0.985); }
+  /* Keep dialog content opaque while it moves into place. Fading the whole
+     subtree blends text with the backdrop and transiently breaks WCAG
+     contrast for assistive audits and fast keyboard navigation. */
+  from { transform: translateY(12px) scale(0.985); }
 }
 
 .onboarding-shell {
