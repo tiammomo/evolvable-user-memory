@@ -12,6 +12,7 @@ from evolvable_memory.domain.common import (
     require_utc,
 )
 from evolvable_memory.domain.experience import (
+    MemoryUsage,
     OutcomeEvent,
     OutcomeKind,
     RecallTrace,
@@ -121,6 +122,7 @@ class RecordOutcome:
     kind: OutcomeKind
     idempotency_key: str
     occurred_at: datetime
+    usage_id: UUID | None = None
     weight: float = 1.0
     note: str | None = None
 
@@ -155,6 +157,35 @@ class ProjectRecallContext:
 
 
 @dataclass(frozen=True, slots=True)
+class RecordMemoryUsage:
+    scope: Scope
+    trace_id: UUID
+    algorithm: ContextCompressionAlgorithm
+    budget_characters: int
+    source_projection_sha256: str
+    delivered_context_sha256: str
+    revision_ids: tuple[UUID, ...]
+    idempotency_key: str
+    occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.algorithm, ContextCompressionAlgorithm):
+            raise DomainError("context compression algorithm is invalid")
+        if not 64 <= self.budget_characters <= 100_000:
+            raise DomainError("projection budget must be in [64, 100000] characters")
+        object.__setattr__(
+            self,
+            "idempotency_key",
+            require_text(self.idempotency_key, "idempotency_key"),
+        )
+        object.__setattr__(
+            self,
+            "occurred_at",
+            require_utc(self.occurred_at, "occurred_at"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PreferenceResult:
     observation_id: UUID
     candidate_id: UUID
@@ -168,6 +199,12 @@ class PreferenceResult:
 class OutcomeResult:
     outcome: OutcomeEvent
     utility: UtilityEstimate
+    idempotent_replay: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryUsageResult:
+    usage: MemoryUsage
     idempotent_replay: bool
 
 

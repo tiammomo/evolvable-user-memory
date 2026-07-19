@@ -12,6 +12,18 @@ from evolvable_memory.domain.common import (
     require_text,
     require_utc,
 )
+from evolvable_memory.domain.projection import ContextCompressionAlgorithm
+
+
+def _require_sha256(value: str, field: str) -> str:
+    digest = require_text(value, field).lower()
+    if len(digest) != 64:
+        raise DomainError(f"{field} must be a SHA-256 hex digest")
+    try:
+        int(digest, 16)
+    except ValueError as error:
+        raise DomainError(f"{field} must be a SHA-256 hex digest") from error
+    return digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +109,50 @@ class RecallTrace:
                 raise DomainError("recalled revision was not known at known_at")
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryUsage:
+    """Immutable evidence that a bounded recall projection reached a consumer."""
+
+    id: UUID
+    scope: Scope
+    trace_id: UUID
+    algorithm: ContextCompressionAlgorithm
+    budget_characters: int
+    source_projection_sha256: str
+    delivered_context_sha256: str
+    revision_ids: tuple[UUID, ...]
+    idempotency_key: str
+    occurred_at: datetime
+    recorded_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.algorithm, ContextCompressionAlgorithm):
+            raise DomainError("memory usage projection algorithm is invalid")
+        if not 64 <= self.budget_characters <= 100_000:
+            raise DomainError("memory usage projection budget must be in [64, 100000]")
+        object.__setattr__(
+            self,
+            "source_projection_sha256",
+            _require_sha256(self.source_projection_sha256, "source_projection_sha256"),
+        )
+        object.__setattr__(
+            self,
+            "delivered_context_sha256",
+            _require_sha256(self.delivered_context_sha256, "delivered_context_sha256"),
+        )
+        if not self.revision_ids:
+            raise DomainError("memory usage must cite at least one revision")
+        if len(set(self.revision_ids)) != len(self.revision_ids):
+            raise DomainError("memory usage revisions must be distinct")
+        object.__setattr__(
+            self,
+            "idempotency_key",
+            require_text(self.idempotency_key, "usage idempotency_key"),
+        )
+        object.__setattr__(self, "occurred_at", require_utc(self.occurred_at, "occurred_at"))
+        object.__setattr__(self, "recorded_at", require_utc(self.recorded_at, "recorded_at"))
+
+
 class OutcomeKind(StrEnum):
     HELPFUL = "helpful"
     ACCEPTED = "accepted"
@@ -121,6 +177,7 @@ class OutcomeEvent:
     idempotency_key: str
     occurred_at: datetime
     recorded_at: datetime
+    usage_id: UUID | None = None
     weight: float = 1.0
     note: str | None = None
 

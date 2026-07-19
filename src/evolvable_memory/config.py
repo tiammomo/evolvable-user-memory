@@ -90,6 +90,11 @@ class Settings:
     auth_jwt_algorithms: tuple[str, ...] = ("RS256",)
     auth_required_scope: str = "memory"
     auth_audit_hmac_key: str | None = None
+    auth_audit_sink: str = "log"
+    governance_mode: str = "development"
+    governance_hmac_key: str | None = None
+    governance_pseudonym_key_id: str = "governance-v1"
+    privacy_policy_version: str = "privacy-v1"
     frontend_url: str = "http://127.0.0.1:33009"
     public_api_url: str = "http://127.0.0.1:38089"
     cors_origins: tuple[str, ...] = (
@@ -168,6 +173,10 @@ class Settings:
             jwks_url = self.auth_jwt_jwks_url
             if issuer is None or audience is None or jwks_url is None:
                 raise DomainError("JWT authentication requires issuer, audience, and JWKS URL")
+            _validate_http_url(issuer, "auth_jwt_issuer")
+            _validate_http_url(jwks_url, "auth_jwt_jwks_url")
+            if not audience.strip() or audience != audience.strip():
+                raise DomainError("JWT authentication requires a valid audience")
             allowed_algorithms = {
                 "RS256",
                 "RS384",
@@ -190,6 +199,29 @@ class Settings:
                     raise DomainError("production JWT JWKS URL must use HTTPS")
         if not self.auth_required_scope.strip():
             raise DomainError("auth_required_scope must not be blank")
+        if self.auth_audit_sink not in {"log", "postgres"}:
+            raise DomainError("auth_audit_sink must be either 'log' or 'postgres'")
+        if self.auth_audit_sink == "postgres":
+            if self.store != "postgres":
+                raise DomainError("persistent authorization audit requires EMF_STORE=postgres")
+            if self.auth_audit_hmac_key is None or len(self.auth_audit_hmac_key) < 32:
+                raise DomainError("persistent authorization audit requires a 32-character HMAC key")
+        if self.governance_mode not in {"development", "postgres"}:
+            raise DomainError("governance_mode must be either 'development' or 'postgres'")
+        if self.governance_mode == "postgres":
+            if self.store != "postgres":
+                raise DomainError("persistent privacy governance requires EMF_STORE=postgres")
+            if self.governance_hmac_key is None or len(self.governance_hmac_key) < 32:
+                raise DomainError("persistent privacy governance requires a 32-character HMAC key")
+        if not self.governance_pseudonym_key_id.strip():
+            raise DomainError("governance_pseudonym_key_id must not be blank")
+        if not self.privacy_policy_version.strip():
+            raise DomainError("privacy_policy_version must not be blank")
+        if self.environment in {"staging", "production"}:
+            if self.auth_audit_sink != "postgres":
+                raise DomainError("persistent authorization audit is required in production")
+            if self.governance_mode != "postgres":
+                raise DomainError("persistent privacy governance is required in production")
         _validate_http_url(self.frontend_url, "frontend_url")
         _validate_http_url(self.public_api_url, "public_api_url")
         if not self.cors_origins:
@@ -255,6 +287,13 @@ class Settings:
             ),
             auth_required_scope=os.getenv("EMF_AUTH_REQUIRED_SCOPE", "memory"),
             auth_audit_hmac_key=os.getenv("EMF_AUTH_AUDIT_HMAC_KEY"),
+            auth_audit_sink=os.getenv("EMF_AUTH_AUDIT_SINK", "log").lower(),
+            governance_mode=os.getenv("EMF_GOVERNANCE_MODE", "development").lower(),
+            governance_hmac_key=os.getenv("EMF_GOVERNANCE_HMAC_KEY"),
+            governance_pseudonym_key_id=os.getenv(
+                "EMF_GOVERNANCE_PSEUDONYM_KEY_ID", "governance-v1"
+            ),
+            privacy_policy_version=os.getenv("EMF_PRIVACY_POLICY_VERSION", "privacy-v1"),
             frontend_url=os.getenv("EMF_FRONTEND_URL", "http://127.0.0.1:33009"),
             public_api_url=os.getenv("EMF_PUBLIC_API_URL", "http://127.0.0.1:38089"),
             cors_origins=tuple(

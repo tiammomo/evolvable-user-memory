@@ -9,9 +9,12 @@ import socket
 from threading import Event
 from uuid import uuid4
 
+from evolvable_memory.adapters.in_memory_governance import DevelopmentBypassPrivacyGovernance
 from evolvable_memory.adapters.milvus import MilvusMemoryProjection
+from evolvable_memory.adapters.postgres_governance import PostgresPrivacyGovernance
 from evolvable_memory.adapters.projection_outbox import PostgresProjectionEventSource
 from evolvable_memory.adapters.system import SystemClock
+from evolvable_memory.application.ports import PrivacyGovernancePort
 from evolvable_memory.application.projection import (
     MemoryProjectionWorker,
     ProjectionWorkerSettings,
@@ -45,6 +48,20 @@ def _build_worker(settings: Settings) -> MemoryProjectionWorker:
         readiness_timeout=settings.database_readiness_timeout_seconds,
     )
     worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
+    governance: PrivacyGovernancePort
+    if settings.governance_mode == "postgres":
+        if settings.governance_hmac_key is None:
+            raise DomainError("EMF_GOVERNANCE_HMAC_KEY is required by the projection worker")
+        governance = PostgresPrivacyGovernance(
+            settings.database_url,
+            hmac_key=settings.governance_hmac_key.encode(),
+            pseudonym_key_id=settings.governance_pseudonym_key_id,
+            min_size=1,
+            max_size=min(4, settings.database_pool_max_size),
+            readiness_timeout=settings.database_readiness_timeout_seconds,
+        )
+    else:
+        governance = DevelopmentBypassPrivacyGovernance()
     return MemoryProjectionWorker(
         source=source,
         sink=projection,
@@ -58,6 +75,7 @@ def _build_worker(settings: Settings) -> MemoryProjectionWorker:
             retry_max_seconds=settings.projection_worker_retry_max_seconds,
             max_attempts=settings.projection_worker_max_attempts,
         ),
+        governance=governance,
     )
 
 

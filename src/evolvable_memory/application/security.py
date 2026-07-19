@@ -30,6 +30,7 @@ class MemoryAction(StrEnum):
     BELIEF_READ_HISTORY = "belief.read_history"
     BELIEF_CORRECT = "belief.correct"
     EXPERIENCE_TRACE_READ = "experience.trace_read"
+    EXPERIENCE_USAGE_WRITE = "experience.usage_write"
     EXPERIENCE_OUTCOME_WRITE = "experience.outcome_write"
     EXPERIENCE_UTILITY_READ = "experience.utility_read"
     PROJECTION_RECALL = "projection.recall"
@@ -58,6 +59,7 @@ _ACTION_PLANES: dict[MemoryAction, MemoryPlane] = {
     MemoryAction.BELIEF_READ_HISTORY: MemoryPlane.BELIEF,
     MemoryAction.BELIEF_CORRECT: MemoryPlane.BELIEF,
     MemoryAction.EXPERIENCE_TRACE_READ: MemoryPlane.EXPERIENCE,
+    MemoryAction.EXPERIENCE_USAGE_WRITE: MemoryPlane.EXPERIENCE,
     MemoryAction.EXPERIENCE_OUTCOME_WRITE: MemoryPlane.EXPERIENCE,
     MemoryAction.EXPERIENCE_UTILITY_READ: MemoryPlane.EXPERIENCE,
     MemoryAction.PROJECTION_RECALL: MemoryPlane.PROJECTION,

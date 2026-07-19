@@ -7,12 +7,14 @@ from uuid import UUID
 
 from evolvable_memory.application.commands import (
     CorrectPreference,
+    MemoryUsageResult,
     OutcomeResult,
     PreferenceResult,
     ProjectRecallContext,
     RecallContextResult,
     RecallMemory,
     RecallResult,
+    RecordMemoryUsage,
     RecordOutcome,
     RememberPreference,
 )
@@ -45,11 +47,13 @@ from evolvable_memory.domain.evolution import (
     StrategySnapshot,
 )
 from evolvable_memory.domain.experience import (
+    MemoryUsage,
     OutcomeEvent,
     RecalledItem,
     RecallTrace,
     ScoreBreakdown,
 )
+from evolvable_memory.domain.governance import ErasureSummary
 from evolvable_memory.domain.memory import (
     BeliefState,
     MemoryKind,
@@ -144,6 +148,13 @@ class MemoryApplication:
                 self._recall_projection.close()
         finally:
             self._store.close()
+
+    def erase_scope(self, scope: Scope) -> ErasureSummary:
+        deleted = 0
+        if self._recall_projection is not None:
+            deleted = self._recall_projection.delete_scope(scope)
+        summary = self._store.erase_scope(scope)
+        return summary.with_projection_documents(deleted)
 
     def remember_preference(self, command: RememberPreference) -> PreferenceResult:
         with self._store.transaction():
@@ -415,7 +426,15 @@ class MemoryApplication:
             trace = self._store.trace(command.scope, command.trace_id)
             if trace is None:
                 raise NotFoundError("recall trace not found in scope")
-            if not any(item.revision_id == command.revision_id for item in trace.items):
+            if command.usage_id is not None:
+                usage = self._store.usage(command.scope, command.usage_id)
+                if usage is None:
+                    raise NotFoundError("memory usage not found in scope")
+                if usage.trace_id != command.trace_id:
+                    raise AttributionError("memory usage does not belong to the supplied trace")
+                if command.revision_id not in usage.revision_ids:
+                    raise AttributionError("revision was not present in the supplied memory usage")
+            elif not any(item.revision_id == command.revision_id for item in trace.items):
                 raise AttributionError("revision was not present in the supplied recall trace")
 
             outcome = OutcomeEvent(
@@ -427,6 +446,7 @@ class MemoryApplication:
                 idempotency_key=command.idempotency_key,
                 occurred_at=command.occurred_at,
                 recorded_at=self._clock.now(),
+                usage_id=command.usage_id,
                 weight=command.weight,
                 note=command.note,
             )
@@ -438,6 +458,42 @@ class MemoryApplication:
                 utility=utility,
                 idempotent_replay=not created,
             )
+
+    def record_usage(self, command: RecordMemoryUsage) -> MemoryUsageResult:
+        with self._store.transaction():
+            trace = self._store.trace(command.scope, command.trace_id)
+            if trace is None:
+                raise NotFoundError("recall trace not found in scope")
+            projection = self._context_compressor.project(
+                trace,
+                algorithm=command.algorithm,
+                budget_characters=command.budget_characters,
+            )
+            if projection.projection_sha256 != command.source_projection_sha256.lower():
+                raise AttributionError("source projection digest does not match the recall trace")
+            projected_revision_ids = set(projection.source_revision_ids)
+            if not command.revision_ids or not set(command.revision_ids) <= projected_revision_ids:
+                raise AttributionError(
+                    "memory usage cited a revision outside the source projection"
+                )
+            now = self._clock.now()
+            if command.occurred_at > now:
+                raise DomainError("memory usage occurred_at must not be in the future")
+            usage = MemoryUsage(
+                id=self._ids.new(),
+                scope=command.scope,
+                trace_id=command.trace_id,
+                algorithm=command.algorithm,
+                budget_characters=command.budget_characters,
+                source_projection_sha256=command.source_projection_sha256,
+                delivered_context_sha256=command.delivered_context_sha256,
+                revision_ids=command.revision_ids,
+                idempotency_key=command.idempotency_key,
+                occurred_at=command.occurred_at,
+                recorded_at=now,
+            )
+            stored, created = self._store.save_usage(usage)
+            return MemoryUsageResult(usage=stored, idempotent_replay=not created)
 
     def project_recall_context(self, command: ProjectRecallContext) -> RecallContextResult:
         trace = self._store.trace(command.scope, command.trace_id)

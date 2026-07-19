@@ -67,6 +67,7 @@ branch = true
 source = ["evolvable_memory"]
 omit = [
     "src/evolvable_memory/adapters/postgres.py",
+    "src/evolvable_memory/adapters/postgres_governance.py",
     "src/evolvable_memory/adapters/projection_outbox.py",
     "src/evolvable_memory/migrate.py",
     "src/evolvable_memory/migrations/*",

@@ -38,6 +38,8 @@ class _MilvusClientLike(Protocol):
 
     def search(self, collection_name: str, data: list[list[float]], **kwargs: object) -> Any: ...
 
+    def delete(self, collection_name: str, **kwargs: object) -> Any: ...
+
     def drop_collection(self, collection_name: str, **kwargs: object) -> None: ...
 
     def close(self) -> None: ...
@@ -156,6 +158,24 @@ class MilvusMemoryProjection:
                 extra={"error_type": type(exc).__name__},
             )
             return ProjectionSearchResult(available=False, reason=type(exc).__name__)
+
+    def delete_scope(self, scope: Scope) -> int:
+        client = self._connect()
+        self._ensure_collection(client)
+        expression = (
+            f'tenant_hash == "{_scope_hash(scope.tenant_id)}" and '
+            f'subject_hash == "{_scope_hash(scope.subject_id)}"'
+        )
+        result = client.delete(
+            collection_name=self._collection_name,
+            filter=expression,
+            timeout=self._timeout_seconds,
+        )
+        if isinstance(result, dict):
+            raw_count = result.get("delete_count", 0)
+            return int(raw_count) if isinstance(raw_count, int | float) else 0
+        raw_count = getattr(result, "delete_count", 0)
+        return int(raw_count) if isinstance(raw_count, int | float) else 0
 
     def reset(self) -> None:
         client = self._connect()

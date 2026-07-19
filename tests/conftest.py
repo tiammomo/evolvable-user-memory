@@ -34,9 +34,11 @@ def prepare_postgres_database(database_url: str) -> None:
         connection.execute(
             """
             TRUNCATE TABLE
+                authorization_audit_events, erasure_requests, suppression_fences,
+                processing_grants,
                 evolution_experiment_transitions, strategy_activations,
                 evolution_experiments, outbox_events, utility_estimates,
-                outcomes, recall_trace_items,
+                outcomes, memory_usage_items, memory_usages, recall_trace_items,
                 recall_traces, revision_transitions, candidates, memory_revisions,
                 memory_records, evidence_spans, observations, strategy_snapshots
             CASCADE

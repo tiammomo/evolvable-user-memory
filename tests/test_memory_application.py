@@ -8,7 +8,9 @@ import pytest
 from conftest import Harness
 from evolvable_memory.application.commands import (
     CorrectPreference,
+    ProjectRecallContext,
     RecallMemory,
+    RecordMemoryUsage,
     RecordOutcome,
     RememberPreference,
 )
@@ -22,6 +24,7 @@ from evolvable_memory.domain.common import (
 )
 from evolvable_memory.domain.evidence import Candidate
 from evolvable_memory.domain.experience import OutcomeKind
+from evolvable_memory.domain.projection import ContextCompressionAlgorithm
 
 NOW = datetime(2026, 7, 14, 4, 0, tzinfo=UTC)
 ALICE = Scope("tenant-a", "alice")
@@ -702,6 +705,64 @@ def test_attributable_outcome_updates_contextual_utility_once(harness: Harness) 
     assert first.utility.mean == pytest.approx(2 / 3)
     assert replay.utility == first.utility
     assert harness.store.outcome_count == 1
+
+
+def test_usage_receipt_binds_outcome_to_the_delivered_projection(harness: Harness) -> None:
+    memory = harness.app.remember_preference(preference())
+    trace = harness.app.recall(RecallMemory(scope=ALICE, query="decaf coffee", context=EVENING))
+    projection = harness.app.project_recall_context(
+        ProjectRecallContext(
+            scope=ALICE,
+            trace_id=trace.id,
+            algorithm=ContextCompressionAlgorithm.EXACT_DEDUPLICATED,
+            budget_characters=2_000,
+        )
+    )
+    command = RecordMemoryUsage(
+        scope=ALICE,
+        trace_id=trace.id,
+        algorithm=projection.algorithm,
+        budget_characters=projection.budget_characters,
+        source_projection_sha256=projection.projection_sha256,
+        delivered_context_sha256="a" * 64,
+        revision_ids=(memory.revision_id,),
+        idempotency_key="task-9:usage-1",
+        occurred_at=NOW,
+    )
+
+    first = harness.app.record_usage(command)
+    replay = harness.app.record_usage(command)
+    outcome = harness.app.record_outcome(
+        RecordOutcome(
+            scope=ALICE,
+            trace_id=trace.id,
+            revision_id=memory.revision_id,
+            usage_id=first.usage.id,
+            kind=OutcomeKind.HELPFUL,
+            idempotency_key="task-9:usage-outcome",
+            occurred_at=NOW,
+        )
+    )
+
+    assert first.idempotent_replay is False
+    assert replay.idempotent_replay is True
+    assert replay.usage.id == first.usage.id
+    assert outcome.outcome.usage_id == first.usage.id
+
+    with pytest.raises(AttributionError, match="projection digest"):
+        harness.app.record_usage(
+            RecordMemoryUsage(
+                scope=ALICE,
+                trace_id=trace.id,
+                algorithm=projection.algorithm,
+                budget_characters=projection.budget_characters,
+                source_projection_sha256="b" * 64,
+                delivered_context_sha256="a" * 64,
+                revision_ids=(memory.revision_id,),
+                idempotency_key="task-9:usage-tampered",
+                occurred_at=NOW,
+            )
+        )
 
 
 def test_out_of_order_outcomes_keep_current_utility_time_monotonic(

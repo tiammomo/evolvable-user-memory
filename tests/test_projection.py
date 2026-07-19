@@ -68,6 +68,7 @@ class _FakeMilvusClient:
         self.search_result: object = [[]]
         self.fail_search = False
         self.dimensions = 64
+        self.delete_filter = ""
 
     def has_collection(self, _collection_name: str, **_kwargs: object) -> bool:
         return self.exists
@@ -136,6 +137,11 @@ class _FakeMilvusClient:
         self.search_filter = str(kwargs["filter"])
         return self.search_result
 
+    def delete(self, collection_name: str, **kwargs: object) -> dict[str, int]:
+        assert collection_name == "memory"
+        self.delete_filter = str(kwargs["filter"])
+        return {"delete_count": 2}
+
     def drop_collection(self, _collection_name: str, **_kwargs: object) -> None:
         self.exists = False
 
@@ -187,6 +193,12 @@ def test_milvus_projection_stores_no_raw_memory_and_filters_scope() -> None:
     assert all("secret decaf coffee" not in str(value) for value in client.upserts[0].values())
     assert "value" not in client.upserts[0]
     assert "key" not in client.upserts[0]
+
+    assert projection.delete_scope(ALICE) == 2
+    assert "tenant-a" not in client.delete_filter
+    assert "alice" not in client.delete_filter
+    assert "tenant_hash" in client.delete_filter
+    assert "subject_hash" in client.delete_filter
 
 
 def test_milvus_projection_failure_is_an_explicit_fallback_signal() -> None:

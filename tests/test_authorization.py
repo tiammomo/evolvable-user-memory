@@ -17,6 +17,7 @@ from evolvable_memory.adapters.authorization import (
     LoggingAuthorizationAuditSink,
     RolePolicyAuthorizer,
 )
+from evolvable_memory.adapters.in_memory_governance import InMemoryPrivacyGovernance
 from evolvable_memory.api.app import create_app
 from evolvable_memory.api.security import (
     DevelopmentIdentityResolver,
@@ -387,6 +388,100 @@ def test_authorization_audit_failure_prevents_memory_mutation(harness: Harness) 
     assert response.status_code == 500
     assert response.json()["error"] == "InternalServerError"
     assert harness.app.list_preferences(ALICE_SCOPE) == ()
+
+
+def test_trusted_jwt_roles_keep_grant_management_and_suppression_separate(
+    harness: Harness,
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    resolver = JwtIdentityResolver(
+        issuer="https://identity.example",
+        audience="evolvable-memory-api",
+        algorithms=("RS256",),
+        required_scope="memory",
+        key_provider=StaticSigningKeyProvider(signing_key.public_key()),
+    )
+    client = TestClient(
+        create_app(
+            harness.app,
+            settings=_jwt_settings(),
+            clock=harness.clock,
+            identity_resolver=resolver,
+            privacy_governance=InMemoryPrivacyGovernance(),
+        )
+    )
+
+    def token(role: str, purpose: str) -> str:
+        return _token(
+            signing_key,
+            role=role,
+            claim_overrides={
+                "memory_access": [
+                    {
+                        "tenant_id": "tenant-a",
+                        "subject_ids": ["alice"],
+                        "roles": [role],
+                        "purposes": [purpose],
+                    }
+                ]
+            },
+        )
+
+    admin_headers = {"Authorization": f"Bearer {token('tenant_admin', 'privacy-governance')}"}
+    grant = client.post(
+        "/v1/governance/processing-grants",
+        headers=admin_headers,
+        json={
+            "tenant_id": "tenant-a",
+            "subject_id": "alice",
+            "purposes": ["personalization"],
+            "lawful_basis": "explicit-consent",
+            "idempotency_key": "jwt-governance-grant",
+            "valid_from": "2026-07-01T00:00:00Z",
+            "valid_until": "2026-08-01T00:00:00Z",
+        },
+    )
+    assert grant.status_code == 201
+
+    writer_headers = {"Authorization": f"Bearer {token('memory_operator', 'personalization')}"}
+    written = client.post(
+        "/v1/preferences",
+        headers=writer_headers,
+        json=_preference_payload(),
+    )
+    assert written.status_code == 201
+
+    admin_suppression = client.post(
+        "/v1/governance/suppressions",
+        headers=admin_headers,
+        json={
+            "tenant_id": "tenant-a",
+            "subject_id": "alice",
+            "reason_code": "subject-request",
+            "idempotency_key": "jwt-admin-cannot-suppress",
+        },
+    )
+    assert admin_suppression.status_code == 403
+
+    privacy_headers = {"Authorization": f"Bearer {token('privacy_officer', 'privacy-governance')}"}
+    suppressed = client.post(
+        "/v1/governance/suppressions",
+        headers=privacy_headers,
+        json={
+            "tenant_id": "tenant-a",
+            "subject_id": "alice",
+            "reason_code": "subject-request",
+            "idempotency_key": "jwt-privacy-suppress",
+        },
+    )
+    assert suppressed.status_code == 201
+    blocked_read = client.get(
+        "/v1/preferences",
+        headers=writer_headers,
+        params={"tenant_id": "tenant-a", "subject_id": "alice"},
+    )
+    assert blocked_read.status_code == 403
+    assert blocked_read.json()["detail"] == "processing_suppressed"
 
 
 def test_authorization_audit_log_is_pseudonymous_and_contains_no_resource_values(

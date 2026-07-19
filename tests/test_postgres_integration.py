@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections.abc import Iterator
@@ -16,17 +17,20 @@ from fastapi.testclient import TestClient
 from psycopg.errors import CheckViolation, ForeignKeyViolation
 
 from conftest import FixedClock, SequentialIds, prepare_postgres_database
+from evolvable_memory.adapters.authorization import PostgresAuthorizationAuditSink
 from evolvable_memory.adapters.gate_receipts import (
     HmacGateReceiptSigner,
     HmacGateReceiptVerifier,
 )
 from evolvable_memory.adapters.postgres import PostgresMemoryStore
+from evolvable_memory.adapters.postgres_governance import PostgresPrivacyGovernance
 from evolvable_memory.adapters.system import Uuid4Generator
 from evolvable_memory.api.app import create_app
 from evolvable_memory.application.commands import (
     CorrectPreference,
     ProjectRecallContext,
     RecallMemory,
+    RecordMemoryUsage,
     RecordOutcome,
     RememberPreference,
 )
@@ -244,11 +248,41 @@ def test_postgres_store_persists_the_attributable_memory_loop(postgres_url: str)
             ProjectRecallContext(scope=other_scope, trace_id=trace.id, budget_characters=2_000)
         )
 
+    usage = app.record_usage(
+        RecordMemoryUsage(
+            scope=scope,
+            trace_id=trace.id,
+            algorithm=context_projection.algorithm,
+            budget_characters=context_projection.budget_characters,
+            source_projection_sha256=context_projection.projection_sha256,
+            delivered_context_sha256=sha256(context_projection.content.encode()).hexdigest(),
+            revision_ids=(created.revision_id,),
+            idempotency_key="task-1:usage",
+            occurred_at=clock.now(),
+        )
+    )
+    usage_replay = app.record_usage(
+        RecordMemoryUsage(
+            scope=scope,
+            trace_id=trace.id,
+            algorithm=context_projection.algorithm,
+            budget_characters=context_projection.budget_characters,
+            source_projection_sha256=context_projection.projection_sha256,
+            delivered_context_sha256=sha256(context_projection.content.encode()).hexdigest(),
+            revision_ids=(created.revision_id,),
+            idempotency_key="task-1:usage",
+            occurred_at=clock.now(),
+        )
+    )
+    assert usage_replay.idempotent_replay
+    assert usage_replay.usage.id == usage.usage.id
+
     outcome = app.record_outcome(
         RecordOutcome(
             scope=scope,
             trace_id=trace.id,
             revision_id=created.revision_id,
+            usage_id=usage.usage.id,
             kind=OutcomeKind.HELPFUL,
             idempotency_key="task-1:outcome",
             occurred_at=clock.now(),
@@ -260,6 +294,7 @@ def test_postgres_store_persists_the_attributable_memory_loop(postgres_url: str)
             scope=scope,
             trace_id=trace.id,
             revision_id=created.revision_id,
+            usage_id=usage.usage.id,
             kind=OutcomeKind.HELPFUL,
             idempotency_key="task-1:outcome",
             occurred_at=clock.now(),
@@ -347,12 +382,131 @@ def test_postgres_store_persists_the_attributable_memory_loop(postgres_url: str)
         ProjectRecallContext(scope=scope, trace_id=trace.id, budget_characters=2_000)
     )
     assert persisted_projection == context_projection
+    assert reopened_store.usage(scope, usage.usage.id) == usage.usage
 
     with psycopg.connect(conninfo) as connection:
         outbox_count = connection.execute("SELECT count(*) FROM outbox_events").fetchone()
         assert outbox_count is not None and outbox_count[0] >= 4
     reopened.close()
     assert not reopened.is_ready()
+
+
+def test_postgres_governance_audit_and_erasure_form_a_persistent_closed_loop(
+    postgres_url: str,
+) -> None:
+    hmac_key = b"postgres-governance-test-key-32-bytes-minimum"
+    clock = FixedClock()
+    scope = Scope("tenant-governed", "subject-sensitive")
+    store = PostgresMemoryStore(postgres_url, min_size=1, max_size=2)
+    memory = MemoryApplication(store=store, clock=clock, ids=Uuid4Generator())
+    governance = PostgresPrivacyGovernance(
+        postgres_url,
+        hmac_key=hmac_key,
+        pseudonym_key_id="test-v1",
+        min_size=1,
+        max_size=2,
+    )
+    audit = PostgresAuthorizationAuditSink(
+        postgres_url,
+        hmac_key=hmac_key,
+        pseudonym_key_id="test-v1",
+        min_size=1,
+        max_size=2,
+    )
+    client = TestClient(
+        create_app(
+            memory,
+            settings=Settings(store="postgres", database_url=postgres_url),
+            clock=clock,
+            privacy_governance=governance,
+            authorization_audit=audit,
+        )
+    )
+
+    grant = client.post(
+        "/v1/governance/processing-grants",
+        json={
+            "tenant_id": scope.tenant_id,
+            "subject_id": scope.subject_id,
+            "purposes": ["personalization"],
+            "lawful_basis": "explicit-consent",
+            "idempotency_key": "postgres:grant",
+            "valid_from": "2026-07-01T00:00:00Z",
+        },
+    )
+    assert grant.status_code == 201
+    preference = client.post(
+        "/v1/preferences",
+        json={
+            "tenant_id": scope.tenant_id,
+            "subject_id": scope.subject_id,
+            "source": "conversation",
+            "idempotency_key": "postgres:preference",
+            "key": "drink.preference",
+            "value": "secret decaf coffee",
+            "context": {},
+            "evidence_text": "secret raw evidence",
+        },
+    )
+    assert preference.status_code == 201
+    erased = client.post(
+        "/v1/governance/erasures",
+        json={
+            "tenant_id": scope.tenant_id,
+            "subject_id": scope.subject_id,
+            "reason_code": "subject-request",
+            "idempotency_key": "postgres:erase",
+        },
+    )
+    assert erased.status_code == 201
+    assert erased.json()["status"] == "completed"
+    assert erased.json()["summary"]["observations"] == 1
+
+    conninfo = postgres_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    with psycopg.connect(conninfo, row_factory=psycopg.rows.dict_row) as connection:
+        for table in (
+            "observations",
+            "evidence_spans",
+            "candidates",
+            "memory_records",
+            "memory_revisions",
+            "revision_transitions",
+            "recall_traces",
+            "recall_trace_items",
+            "memory_usage_items",
+            "memory_usages",
+            "outcomes",
+            "utility_estimates",
+            "outbox_events",
+            "projection_jobs",
+        ):
+            row = connection.execute(f"SELECT count(*) AS count FROM {table}").fetchone()
+            assert row is not None and row["count"] == 0
+        audit_rows = connection.execute("SELECT * FROM authorization_audit_events").fetchall()
+        erasure_row = connection.execute("SELECT * FROM erasure_requests").fetchone()
+    assert len(audit_rows) == 3
+    persisted = json.dumps([audit_rows, erasure_row], default=str)
+    assert all(
+        raw not in persisted
+        for raw in (
+            scope.tenant_id,
+            scope.subject_id,
+            "secret decaf coffee",
+            "secret raw evidence",
+        )
+    )
+    with psycopg.connect(conninfo, autocommit=True) as connection:
+        with pytest.raises(CheckViolation, match="authorization audit events are append-only"):
+            connection.execute("UPDATE authorization_audit_events SET reason = 'changed'")
+        with pytest.raises(CheckViolation, match="suppression fences are append-only"):
+            connection.execute("DELETE FROM suppression_fences")
+        with pytest.raises(CheckViolation, match="completed erasure receipts are immutable"):
+            connection.execute("UPDATE erasure_requests SET error_code = 'changed'")
+    assert audit.is_ready()
+    assert governance.is_ready()
+    audit.close()
+    governance.close()
+    memory.close()
 
 
 def test_postgres_out_of_order_outcomes_keep_utility_time_monotonic(

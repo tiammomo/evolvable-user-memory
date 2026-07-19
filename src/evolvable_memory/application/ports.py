@@ -25,9 +25,16 @@ from evolvable_memory.domain.evolution import (
     StrategySnapshot,
 )
 from evolvable_memory.domain.experience import (
+    MemoryUsage,
     OutcomeEvent,
     RecallTrace,
     UtilityEstimate,
+)
+from evolvable_memory.domain.governance import (
+    ErasureRequest,
+    ErasureSummary,
+    ProcessingGrant,
+    SuppressionFence,
 )
 from evolvable_memory.domain.memory import (
     MemoryRecord,
@@ -69,6 +76,8 @@ class RecallProjectionPort(Protocol):
         valid_at: datetime,
         known_at: datetime,
     ) -> ProjectionSearchResult: ...
+
+    def delete_scope(self, scope: Scope) -> int: ...
 
 
 class ProjectionSinkPort(Protocol):
@@ -251,6 +260,10 @@ class MemoryStore(StrategyRegistryPort, Protocol):
 
     def trace(self, scope: Scope, trace_id: UUID) -> RecallTrace | None: ...
 
+    def save_usage(self, usage: MemoryUsage) -> tuple[MemoryUsage, bool]: ...
+
+    def usage(self, scope: Scope, usage_id: UUID) -> MemoryUsage | None: ...
+
     def utility_for(
         self,
         scope: Scope,
@@ -274,3 +287,95 @@ class MemoryStore(StrategyRegistryPort, Protocol):
         outcome: OutcomeEvent,
         context: ContextSignature,
     ) -> tuple[OutcomeEvent, UtilityEstimate, bool]: ...
+
+    def erase_scope(self, scope: Scope) -> ErasureSummary: ...
+
+
+class PrivacyGovernancePort(Protocol):
+    def close(self) -> None: ...
+
+    def is_ready(self) -> bool: ...
+
+    def processing_context(
+        self,
+        scope: Scope,
+        *,
+        purpose: str,
+        at: datetime,
+    ) -> AbstractContextManager[None]: ...
+
+    def projection_context(
+        self,
+        scope: Scope,
+        *,
+        at: datetime,
+    ) -> AbstractContextManager[None]: ...
+
+    def issue_processing_grant(
+        self,
+        *,
+        grant_id: UUID,
+        scope: Scope,
+        purposes: tuple[str, ...],
+        lawful_basis: str,
+        policy_version: str,
+        issued_by: str,
+        idempotency_key: str,
+        valid_from: datetime,
+        valid_until: datetime | None,
+        created_at: datetime,
+    ) -> ProcessingGrant: ...
+
+    def revoke_processing_grant(
+        self,
+        *,
+        scope: Scope,
+        grant_id: UUID,
+        revoked_by: str,
+        revoked_at: datetime,
+    ) -> ProcessingGrant: ...
+
+    def suppress(
+        self,
+        *,
+        fence_id: UUID,
+        scope: Scope,
+        reason_code: str,
+        policy_version: str,
+        requested_by: str,
+        idempotency_key: str,
+        created_at: datetime,
+    ) -> SuppressionFence: ...
+
+    def begin_erasure(
+        self,
+        *,
+        request_id: UUID,
+        fence_id: UUID,
+        scope: Scope,
+        reason_code: str,
+        policy_version: str,
+        requested_by: str,
+        idempotency_key: str,
+        created_at: datetime,
+    ) -> ErasureRequest: ...
+
+    def complete_erasure(
+        self,
+        *,
+        scope: Scope,
+        request_id: UUID,
+        summary: ErasureSummary,
+        handler_results: tuple[tuple[str, str], ...],
+        completed_at: datetime,
+    ) -> ErasureRequest: ...
+
+    def fail_erasure(
+        self,
+        *,
+        scope: Scope,
+        request_id: UUID,
+        error_code: str,
+    ) -> ErasureRequest: ...
+
+    def erasure(self, scope: Scope, request_id: UUID) -> ErasureRequest | None: ...

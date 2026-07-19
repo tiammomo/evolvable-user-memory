@@ -4,6 +4,7 @@ import json
 import logging
 from collections.abc import Iterator
 from datetime import timedelta
+from hashlib import sha256
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from conftest import Harness
 from evolvable_memory import __version__
 from evolvable_memory.api.app import create_app
+from evolvable_memory.api.contract import API_CAPABILITIES, API_CONTRACT, production_blockers
 from evolvable_memory.api.schemas import (
     MAX_CONTEXT_FACETS,
     MAX_CONTEXT_KEY_LENGTH,
@@ -70,6 +72,24 @@ def test_http_vertical_slice(harness: Harness) -> None:
     )
     assert compressed.status_code == 200
     assert compressed.json()["source_revision_ids"] == [memory["revision_id"]]
+    compressed_body = compressed.json()
+
+    usage = client.post(
+        "/v1/usages",
+        json={
+            "tenant_id": "tenant-a",
+            "subject_id": "alice",
+            "trace_id": trace["trace_id"],
+            "algorithm": "ranked-extractive-v1",
+            "max_characters": 2_000,
+            "source_projection_sha256": compressed_body["projection_sha256"],
+            "delivered_context_sha256": sha256(compressed_body["content"].encode()).hexdigest(),
+            "revision_ids": [memory["revision_id"]],
+            "idempotency_key": "api-task-1:usage",
+        },
+    )
+    assert usage.status_code == 201
+    assert usage.json()["revision_ids"] == [memory["revision_id"]]
 
     outcome = client.post(
         "/v1/outcomes",
@@ -78,6 +98,7 @@ def test_http_vertical_slice(harness: Harness) -> None:
             "subject_id": "alice",
             "trace_id": trace["trace_id"],
             "revision_id": memory["revision_id"],
+            "usage_id": usage.json()["usage_id"],
             "kind": "helpful",
             "idempotency_key": "api-task-1:outcome",
         },
@@ -415,8 +436,17 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
 
     assert service.status_code == 200
     assert service.json()["version"] == __version__
+    assert service.json()["api_contract"] == API_CONTRACT
+    assert service.json()["capabilities"] == list(API_CAPABILITIES)
     assert service.json()["frontend_url"] == "http://127.0.0.1:33009"
     assert service.json()["production_ready"] is False
+    assert service.json()["production_blockers"] == [
+        "configuration.persistent-governance",
+        "configuration.durable-audit",
+        "authority.durable-storage",
+        "configuration.trusted-jwt",
+        "runtime.production-profile",
+    ]
     assert schema["info"]["version"] == __version__
     assert "/v1/preferences" in schema["paths"]
     assert schema["paths"]["/v1/recall"]["post"]["summary"] == "执行上下文记忆召回"
@@ -430,6 +460,7 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
         ("/v1/preferences/{record_id}/revisions", "get"),
         ("/v1/recall", "post"),
         ("/v1/recall-contexts", "post"),
+        ("/v1/usages", "post"),
         ("/v1/outcomes", "post"),
     ):
         assert schema["paths"][path][method]["security"] == [{"OAuth2AccessToken": []}]
@@ -447,6 +478,13 @@ def test_service_discovery_and_openapi_explain_the_first_workflow(harness: Harne
     assert compression_schema["properties"]["max_characters"]["maximum"] == 100_000
 
 
+def test_production_blockers_only_clear_runtime_specific_baselines() -> None:
+    assert production_blockers(store="postgres", auth_mode="jwt") == (
+        "configuration.persistent-governance",
+        "configuration.durable-audit",
+    )
+
+
 def test_openapi_documents_scope_bounds_timestamps_and_route_errors(
     harness: Harness,
 ) -> None:
@@ -455,6 +493,7 @@ def test_openapi_documents_scope_bounds_timestamps_and_route_errors(
     for model_name in (
         "PreferenceWriteRequest",
         "PreferenceCorrectionRequest",
+        "MemoryUsageWriteRequest",
         "OutcomeWriteRequest",
     ):
         occurred_at = schema["components"]["schemas"][model_name]["properties"]["occurred_at"]
@@ -485,6 +524,7 @@ def test_openapi_documents_scope_bounds_timestamps_and_route_errors(
         ("/v1/preferences/{record_id}/revisions", "get"): {401, 403, 404},
         ("/v1/recall", "post"): {400, 401, 403, 404, 413},
         ("/v1/recall-contexts", "post"): {400, 401, 403, 404, 413},
+        ("/v1/usages", "post"): {400, 401, 403, 404, 409, 413},
         ("/v1/outcomes", "post"): {400, 401, 403, 404, 409, 413},
     }
     for (path, method), error_codes in expected_errors.items():

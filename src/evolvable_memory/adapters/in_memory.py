@@ -17,7 +17,13 @@ from evolvable_memory.domain.evolution import (
     StrategyActivationKind,
     StrategySnapshot,
 )
-from evolvable_memory.domain.experience import OutcomeEvent, RecallTrace, UtilityEstimate
+from evolvable_memory.domain.experience import (
+    MemoryUsage,
+    OutcomeEvent,
+    RecallTrace,
+    UtilityEstimate,
+)
+from evolvable_memory.domain.governance import ErasureSummary
 from evolvable_memory.domain.memory import (
     MemoryRecord,
     MemoryRevision,
@@ -38,6 +44,8 @@ _TRANSACTIONAL_STATE = (
     "_active_revision",
     "_transitions",
     "_traces",
+    "_usages",
+    "_usage_keys",
     "_outcomes",
     "_outcome_keys",
     "_utilities",
@@ -95,6 +103,8 @@ class InMemoryMemoryStore:
         self._active_revision: dict[UUID, UUID] = {}
         self._transitions: list[RevisionTransition] = []
         self._traces: dict[UUID, RecallTrace] = {}
+        self._usages: dict[UUID, MemoryUsage] = {}
+        self._usage_keys: dict[tuple[Scope, str], UUID] = {}
         self._outcomes: dict[UUID, OutcomeEvent] = {}
         self._outcome_keys: dict[tuple[Scope, str], UUID] = {}
         self._utilities: dict[tuple[Scope, UUID, str], UtilityEstimate] = {}
@@ -470,6 +480,31 @@ class InMemoryMemoryStore:
             trace = self._traces.get(trace_id)
             return trace if trace is not None and trace.scope == scope else None
 
+    def save_usage(self, usage: MemoryUsage) -> tuple[MemoryUsage, bool]:
+        with self._lock:
+            key = (usage.scope, usage.idempotency_key)
+            existing_id = self._usage_keys.get(key)
+            if existing_id is not None:
+                existing = self._usages[existing_id]
+                if (
+                    existing.trace_id != usage.trace_id
+                    or existing.algorithm != usage.algorithm
+                    or existing.budget_characters != usage.budget_characters
+                    or existing.source_projection_sha256 != usage.source_projection_sha256
+                    or existing.delivered_context_sha256 != usage.delivered_context_sha256
+                    or existing.revision_ids != usage.revision_ids
+                ):
+                    raise ConflictError("usage idempotency key was reused with different data")
+                return existing, False
+            self._usages[usage.id] = usage
+            self._usage_keys[key] = usage.id
+            return usage, True
+
+    def usage(self, scope: Scope, usage_id: UUID) -> MemoryUsage | None:
+        with self._lock:
+            usage = self._usages.get(usage_id)
+            return usage if usage is not None and usage.scope == scope else None
+
     def utility_for(
         self,
         scope: Scope,
@@ -534,6 +569,7 @@ class InMemoryMemoryStore:
                 # HTTP retries; compare the stable business payload instead.
                 if (
                     existing.trace_id != outcome.trace_id
+                    or existing.usage_id != outcome.usage_id
                     or existing.revision_id != outcome.revision_id
                     or existing.kind != outcome.kind
                     or existing.weight != outcome.weight
@@ -553,6 +589,87 @@ class InMemoryMemoryStore:
             self._outcome_keys[idempotency] = outcome.id
             self._utilities[(outcome.scope, outcome.revision_id, context.fingerprint)] = updated
             return outcome, updated, True
+
+    def erase_scope(self, scope: Scope) -> ErasureSummary:
+        with self._lock:
+            observation_ids = {
+                item.id for item in self._observations.values() if item.scope == scope
+            }
+            evidence_ids = {
+                item.id
+                for item in self._evidence.values()
+                if item.observation_id in observation_ids
+            }
+            candidate_ids = {item.id for item in self._candidates.values() if item.scope == scope}
+            record_ids = {item.id for item in self._records.values() if item.scope == scope}
+            revision_ids = {
+                revision_id
+                for record_id in record_ids
+                for revision_id in self._revision_ids_by_record.get(record_id, ())
+            }
+            trace_ids = {item.id for item in self._traces.values() if item.scope == scope}
+            recall_trace_items = sum(len(self._traces[item].items) for item in trace_ids)
+            usage_ids = {item.id for item in self._usages.values() if item.scope == scope}
+            usage_item_count = sum(len(self._usages[item].revision_ids) for item in usage_ids)
+            outcome_ids = {item.id for item in self._outcomes.values() if item.scope == scope}
+            utility_keys = {key for key in self._utilities if key[0] == scope}
+            transition_count = sum(
+                transition.record_id in record_ids for transition in self._transitions
+            )
+
+            for observation_id in observation_ids:
+                self._observations.pop(observation_id, None)
+                self._candidate_by_observation.pop(observation_id, None)
+            self._observation_keys = {
+                key: value for key, value in self._observation_keys.items() if key[0] != scope
+            }
+            for evidence_id in evidence_ids:
+                self._evidence.pop(evidence_id, None)
+            for candidate_id in candidate_ids:
+                self._candidates.pop(candidate_id, None)
+            for record_id in record_ids:
+                self._records.pop(record_id, None)
+                self._active_revision.pop(record_id, None)
+                self._revision_ids_by_record.pop(record_id, None)
+            self._record_identity = {
+                key: value for key, value in self._record_identity.items() if key[0] != scope
+            }
+            for revision_id in revision_ids:
+                self._revisions.pop(revision_id, None)
+            self._transitions = [
+                transition
+                for transition in self._transitions
+                if transition.record_id not in record_ids
+            ]
+            for trace_id in trace_ids:
+                self._traces.pop(trace_id, None)
+            for usage_id in usage_ids:
+                self._usages.pop(usage_id, None)
+            self._usage_keys = {
+                key: value for key, value in self._usage_keys.items() if key[0] != scope
+            }
+            for outcome_id in outcome_ids:
+                self._outcomes.pop(outcome_id, None)
+            self._outcome_keys = {
+                key: value for key, value in self._outcome_keys.items() if key[0] != scope
+            }
+            for key in utility_keys:
+                self._utilities.pop(key, None)
+
+            return ErasureSummary(
+                observations=len(observation_ids),
+                evidence_spans=len(evidence_ids),
+                candidates=len(candidate_ids),
+                memory_records=len(record_ids),
+                memory_revisions=len(revision_ids),
+                revision_transitions=transition_count,
+                recall_traces=len(trace_ids),
+                recall_trace_items=recall_trace_items,
+                memory_usages=len(usage_ids),
+                memory_usage_items=usage_item_count,
+                outcomes=len(outcome_ids),
+                utility_estimates=len(utility_keys),
+            )
 
     @property
     def observation_count(self) -> int:

@@ -17,20 +17,31 @@ from starlette.types import Scope as AsgiScope
 from evolvable_memory import __version__
 from evolvable_memory.adapters.authorization import (
     LoggingAuthorizationAuditSink,
+    PostgresAuthorizationAuditSink,
     RolePolicyAuthorizer,
 )
 from evolvable_memory.adapters.in_memory import InMemoryMemoryStore
+from evolvable_memory.adapters.in_memory_governance import DevelopmentBypassPrivacyGovernance
 from evolvable_memory.adapters.postgres import PostgresMemoryStore
+from evolvable_memory.adapters.postgres_governance import PostgresPrivacyGovernance
 from evolvable_memory.adapters.system import SystemClock, Uuid4Generator
+from evolvable_memory.api.contract import API_CAPABILITIES, API_CONTRACT, production_blockers
 from evolvable_memory.api.middleware import ApiRuntimeMiddleware, RequestBodyTooLargeError
 from evolvable_memory.api.schemas import (
+    ErasureResponse,
+    ErasureWriteRequest,
     ErrorResponse,
+    MemoryUsageResponse,
+    MemoryUsageWriteRequest,
     OutcomeResponse,
     OutcomeWriteRequest,
     PreferenceCorrectionRequest,
     PreferenceResponse,
     PreferenceSummaryResponse,
     PreferenceWriteRequest,
+    ProcessingGrantResponse,
+    ProcessingGrantRevocationRequest,
+    ProcessingGrantWriteRequest,
     PurposeText,
     ReadinessResponse,
     RecallContextProjectionRequest,
@@ -40,6 +51,8 @@ from evolvable_memory.api.schemas import (
     RevisionResponse,
     ScopeId,
     ServiceInfoResponse,
+    SuppressionRequest,
+    SuppressionResponse,
 )
 from evolvable_memory.api.security import (
     DevelopmentIdentityResolver,
@@ -52,14 +65,23 @@ from evolvable_memory.application.commands import (
     CorrectPreference,
     ProjectRecallContext,
     RecallMemory,
+    RecordMemoryUsage,
     RecordOutcome,
     RememberPreference,
+)
+from evolvable_memory.application.governance import (
+    EraseSubject,
+    IssueProcessingGrant,
+    PrivacyApplication,
+    RevokeProcessingGrant,
+    SuppressProcessing,
 )
 from evolvable_memory.application.ports import (
     AuthorizationAuditPort,
     AuthorizationPort,
     Clock,
     MemoryStore,
+    PrivacyGovernancePort,
 )
 from evolvable_memory.application.security import (
     ActorContext,
@@ -77,6 +99,10 @@ from evolvable_memory.domain.common import (
     DomainError,
     NotFoundError,
     Scope,
+)
+from evolvable_memory.domain.governance import (
+    GovernanceUnavailableError,
+    ProcessingDeniedError,
 )
 
 _OPENAPI_TAGS = [
@@ -99,6 +125,10 @@ _OPENAPI_TAGS = [
         "name": "experience",
         "description": "记录引用 RecallTrace 的真实结果, 更新上下文效用。",
     },
+    {
+        "name": "governance",
+        "description": "管理可信处理依据、立即抑制、删除编排和最小删除证明。",
+    },
 ]
 _BEARER = HTTPBearer(
     auto_error=False,
@@ -117,6 +147,7 @@ _ERROR_DESCRIPTIONS = {
     status.HTTP_404_NOT_FOUND: "资源不存在, 或其存在性因作用域隔离而被隐藏。",
     status.HTTP_409_CONFLICT: "幂等键、乐观并发条件或当前状态发生冲突。",
     status.HTTP_413_CONTENT_TOO_LARGE: "请求体超过服务端配置的大小限制。",
+    status.HTTP_503_SERVICE_UNAVAILABLE: "必要的治理或持久化依赖不可用。",
 }
 
 
@@ -131,7 +162,7 @@ def _error_responses(*codes: int) -> dict[int | str, dict[str, Any]]:
 
 
 _OUTCOME_UNPROCESSABLE_RESPONSE: dict[str, Any] = {
-    "description": "请求结构校验失败, 或 revision 无法归因到指定 RecallTrace。",
+    "description": "请求结构校验失败, 或 revision/摘要无法归因到指定 Trace/Usage。",
     "content": {
         "application/json": {
             "schema": {
@@ -153,19 +184,29 @@ def create_app(
     authorization: AuthorizationPort | None = None,
     authorization_audit: AuthorizationAuditPort | None = None,
     identity_resolver: IdentityResolver | None = None,
+    privacy_governance: PrivacyGovernancePort | None = None,
 ) -> FastAPI:
     runtime = settings or Settings.from_environment()
     runtime_clock = clock or SystemClock()
     owns_application = application is None
     service = application or _build_application(runtime, runtime_clock)
+    owns_privacy = privacy_governance is None
+    governance = privacy_governance or _build_privacy_governance(runtime)
+    privacy = PrivacyApplication(
+        governance=governance,
+        memory=service,
+        clock=runtime_clock,
+        ids=Uuid4Generator(),
+        policy_version=runtime.privacy_policy_version,
+    )
+    owns_audit = authorization_audit is None
+    audit = authorization_audit or _build_authorization_audit(runtime)
     access = AuthorizedMemoryApplication(
         application=service,
         authorization=authorization or RolePolicyAuthorizer(),
-        audit=authorization_audit
-        or LoggingAuthorizationAuditSink(
-            (runtime.auth_audit_hmac_key or "development-only-audit-key-change-me").encode()
-        ),
+        audit=audit,
         clock=runtime_clock,
+        privacy=privacy,
     )
     identities = identity_resolver or _build_identity_resolver(runtime)
 
@@ -180,8 +221,16 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
-        if owns_application:
-            service.close()
+        try:
+            if owns_audit and hasattr(audit, "close"):
+                audit.close()
+        finally:
+            try:
+                if owns_privacy:
+                    privacy.close()
+            finally:
+                if owns_application:
+                    service.close()
 
     app = FastAPI(
         title="Evolvable User Memory",
@@ -193,8 +242,8 @@ def create_app(
                 "当前运行于进程内存模式, 仅用于开发和语义验证; 重启会清空数据。"
                 if runtime.store == "memory"
                 else (
-                    "当前使用 PostgreSQL 权威存储; 仍需完整权限治理、隐私治理"
-                    "和生产运维后才能接入真实数据。"
+                    "当前使用 PostgreSQL 权威存储, 是否可接入真实数据由服务发现中的"
+                    "生产 blocker、部署审批和外部运维治理共同决定。"
                     + (
                         " Milvus 作为可重建的语义召回投影, 最终可见性仍由 PostgreSQL 判定。"
                         if runtime.projection_mode == "milvus"
@@ -208,6 +257,7 @@ def create_app(
     )
     app.state.memory_application = service
     app.state.authorized_memory_application = access
+    app.state.privacy_application = privacy
     app.state.settings = runtime
     app.add_middleware(
         CORSMiddleware,
@@ -265,6 +315,36 @@ def create_app(
         )
         return JSONResponse(status_code=code, content=body.model_dump(mode="json"))
 
+    @app.exception_handler(ProcessingDeniedError)
+    async def processing_denied_handler(
+        request: Request,
+        exc: ProcessingDeniedError,
+    ) -> JSONResponse:
+        body = ErrorResponse(
+            error="ProcessingDeniedError",
+            detail=exc.reason,
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=body.model_dump(mode="json"),
+        )
+
+    @app.exception_handler(GovernanceUnavailableError)
+    async def governance_unavailable_handler(
+        request: Request,
+        exc: GovernanceUnavailableError,
+    ) -> JSONResponse:
+        body = ErrorResponse(
+            error="GovernanceUnavailableError",
+            detail=str(exc),
+            request_id=getattr(request.state, "request_id", None),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=body.model_dump(mode="json"),
+        )
+
     @app.exception_handler(DomainError)
     async def domain_error_handler(_request: Request, exc: DomainError) -> JSONResponse:
         if isinstance(exc, NotFoundError):
@@ -290,22 +370,34 @@ def create_app(
         description="返回前端、OpenAPI 文档和当前运行边界, 适合首次访问时确认服务。",
     )
     def service_info() -> ServiceInfoResponse:
+        blockers = production_blockers(
+            store=runtime.store,
+            auth_mode=runtime.auth_mode,
+            governance_mode=runtime.governance_mode,
+            governance_ready=privacy.is_ready(),
+            audit_sink=runtime.auth_audit_sink,
+            audit_ready=_dependency_ready(audit),
+            environment=runtime.environment,
+        )
         return ServiceInfoResponse(
             name="Evolvable User Memory",
             version=__version__,
+            api_contract=API_CONTRACT,
+            capabilities=API_CAPABILITIES,
             status="ok",
             storage=runtime.store,
             auth_mode=runtime.auth_mode,
             scope_source="request" if runtime.auth_mode == "development" else "access_token",
             frontend_url=runtime.frontend_url,
             documentation_url=f"{runtime.public_api_url.rstrip('/')}/docs",
-            production_ready=False,
+            production_ready=not blockers,
+            production_blockers=blockers,
             notice=(
                 "Development contract: data is cleared when the backend restarts."
                 if runtime.store == "memory"
                 else (
-                    "PostgreSQL authority and authorization baseline enabled; permission "
-                    "governance and privacy policy remain required."
+                    "PostgreSQL authority enabled; production readiness is derived from "
+                    "trusted JWT, persistent governance, erasure, and audit readiness."
                 )
             ),
         )
@@ -338,7 +430,7 @@ def create_app(
         summary="检查依赖就绪状态",
     )
     def readyz(response: Response) -> ReadinessResponse:
-        if service.is_ready():
+        if service.is_ready() and privacy.is_ready() and _dependency_ready(audit):
             return ReadinessResponse(status="ready", storage=runtime.store)
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return ReadinessResponse(status="not_ready", storage=runtime.store)
@@ -516,13 +608,50 @@ def create_app(
         return RecallContextProjectionResponse.from_projection(projection)
 
     @app.post(
+        "/v1/usages",
+        response_model=MemoryUsageResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["experience"],
+        summary="记录实际进入消费者上下文的记忆",
+        description=(
+            "服务端从不可变 Trace 重建投影并核对摘要, 只接受该投影中的 revision。"
+            "Outcome 可以引用返回的 usage_id, 避免把仅召回但未实际使用的记忆算作效果。"
+        ),
+        responses={
+            **_error_responses(400, 401, 403, 404, 409, 413),
+            status.HTTP_422_UNPROCESSABLE_CONTENT: _OUTCOME_UNPROCESSABLE_RESPONSE,
+        },
+    )
+    def record_memory_usage(
+        payload: MemoryUsageWriteRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
+    ) -> MemoryUsageResponse:
+        result = access.record_usage(
+            _invocation(http_request, actor, payload.purpose),
+            RecordMemoryUsage(
+                scope=Scope(payload.tenant_id, payload.subject_id),
+                trace_id=payload.trace_id,
+                algorithm=payload.algorithm,
+                budget_characters=payload.max_characters,
+                source_projection_sha256=payload.source_projection_sha256,
+                delivered_context_sha256=payload.delivered_context_sha256,
+                revision_ids=tuple(payload.revision_ids),
+                idempotency_key=payload.idempotency_key,
+                occurred_at=_occurred_at(payload.occurred_at, runtime_clock),
+            ),
+        )
+        return MemoryUsageResponse.from_result(result)
+
+    @app.post(
         "/v1/outcomes",
         response_model=OutcomeResponse,
         status_code=status.HTTP_201_CREATED,
         tags=["experience"],
         summary="记录可归因的业务结果",
         description=(
-            "Outcome 必须引用一次召回的 trace_id, 且 revision_id 必须存在于该 Trace。"
+            "Outcome 必须引用一次召回的 trace_id。提供 usage_id 时, revision 必须存在于该次"
+            "实际使用; 兼容旧调用方的无 usage 请求仍按 Trace 校验。"
             "这是一条记忆学习上下文效用的唯一入口。"
         ),
         responses={
@@ -542,6 +671,7 @@ def create_app(
                 scope=scope,
                 trace_id=payload.trace_id,
                 revision_id=payload.revision_id,
+                usage_id=payload.usage_id,
                 kind=payload.kind,
                 idempotency_key=payload.idempotency_key,
                 occurred_at=_occurred_at(payload.occurred_at, runtime_clock),
@@ -550,6 +680,122 @@ def create_app(
             ),
         )
         return OutcomeResponse.from_result(result)
+
+    @app.post(
+        "/v1/governance/processing-grants",
+        response_model=ProcessingGrantResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["governance"],
+        summary="签发受用途约束的处理依据",
+        responses=_error_responses(400, 401, 403, 404, 409, 413, 503),
+    )
+    def issue_processing_grant(
+        payload: ProcessingGrantWriteRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
+    ) -> ProcessingGrantResponse:
+        grant = access.issue_processing_grant(
+            _invocation(http_request, actor, payload.purpose),
+            IssueProcessingGrant(
+                scope=Scope(payload.tenant_id, payload.subject_id),
+                purposes=tuple(payload.purposes),
+                lawful_basis=payload.lawful_basis,
+                idempotency_key=payload.idempotency_key,
+                valid_from=payload.valid_from,
+                valid_until=payload.valid_until,
+            ),
+        )
+        return ProcessingGrantResponse.from_grant(grant)
+
+    @app.post(
+        "/v1/governance/processing-grants/{grant_id}/revocation",
+        response_model=ProcessingGrantResponse,
+        tags=["governance"],
+        summary="撤销处理依据",
+        responses=_error_responses(400, 401, 403, 404, 503),
+    )
+    def revoke_processing_grant(
+        grant_id: UUID,
+        payload: ProcessingGrantRevocationRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
+    ) -> ProcessingGrantResponse:
+        grant = access.revoke_processing_grant(
+            _invocation(http_request, actor, payload.purpose),
+            RevokeProcessingGrant(
+                scope=Scope(payload.tenant_id, payload.subject_id),
+                grant_id=grant_id,
+            ),
+        )
+        return ProcessingGrantResponse.from_grant(grant)
+
+    @app.post(
+        "/v1/governance/suppressions",
+        response_model=SuppressionResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["governance"],
+        summary="立即停止一个 Scope 的全部普通处理",
+        responses=_error_responses(400, 401, 403, 404, 409, 413, 503),
+    )
+    def suppress_processing(
+        payload: SuppressionRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
+    ) -> SuppressionResponse:
+        fence = access.suppress(
+            _invocation(http_request, actor, payload.purpose),
+            SuppressProcessing(
+                scope=Scope(payload.tenant_id, payload.subject_id),
+                reason_code=payload.reason_code,
+                idempotency_key=payload.idempotency_key,
+            ),
+        )
+        return SuppressionResponse.from_fence(fence)
+
+    @app.post(
+        "/v1/governance/erasures",
+        response_model=ErasureResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["governance"],
+        summary="建立抑制屏障并编排完整 Scope 删除",
+        responses=_error_responses(400, 401, 403, 404, 409, 413, 503),
+    )
+    def erase_subject(
+        payload: ErasureWriteRequest,
+        http_request: Request,
+        actor: ActorContext = actor_dependency,
+    ) -> ErasureResponse:
+        request = access.erase(
+            _invocation(http_request, actor, payload.purpose),
+            EraseSubject(
+                scope=Scope(payload.tenant_id, payload.subject_id),
+                reason_code=payload.reason_code,
+                idempotency_key=payload.idempotency_key,
+            ),
+        )
+        return ErasureResponse.from_request(request)
+
+    @app.get(
+        "/v1/governance/erasures/{request_id}",
+        response_model=ErasureResponse,
+        tags=["governance"],
+        summary="读取最小删除证明",
+        responses=_error_responses(401, 403, 404, 503),
+    )
+    def erasure_receipt(
+        request_id: UUID,
+        http_request: Request,
+        tenant_id: ScopeId,
+        subject_id: ScopeId,
+        actor: ActorContext = actor_dependency,
+        purpose: PurposeText = "privacy-governance",
+    ) -> ErasureResponse:
+        request = access.erasure(
+            _invocation(http_request, actor, purpose),
+            Scope(tenant_id, subject_id),
+            request_id,
+        )
+        return ErasureResponse.from_request(request)
 
     return app
 
@@ -575,6 +821,42 @@ def _build_application(settings: Settings, clock: Clock) -> MemoryApplication:
         projection_required=settings.projection_required,
         projection_search_oversample=settings.projection_search_oversample,
     )
+
+
+def _build_privacy_governance(settings: Settings) -> PrivacyGovernancePort:
+    if settings.governance_mode == "development":
+        return DevelopmentBypassPrivacyGovernance()
+    if settings.database_url is None or settings.governance_hmac_key is None:
+        raise RuntimeError("persistent governance settings were not validated")
+    return PostgresPrivacyGovernance(
+        settings.database_url,
+        hmac_key=settings.governance_hmac_key.encode(),
+        pseudonym_key_id=settings.governance_pseudonym_key_id,
+        min_size=settings.database_pool_min_size,
+        max_size=settings.database_pool_max_size,
+        readiness_timeout=settings.database_readiness_timeout_seconds,
+    )
+
+
+def _build_authorization_audit(settings: Settings) -> AuthorizationAuditPort:
+    key = (settings.auth_audit_hmac_key or "development-only-audit-key-change-me").encode()
+    if settings.auth_audit_sink == "log":
+        return LoggingAuthorizationAuditSink(key)
+    if settings.database_url is None:
+        raise RuntimeError("persistent audit settings were not validated")
+    return PostgresAuthorizationAuditSink(
+        settings.database_url,
+        hmac_key=key,
+        pseudonym_key_id=settings.governance_pseudonym_key_id,
+        min_size=settings.database_pool_min_size,
+        max_size=settings.database_pool_max_size,
+        readiness_timeout=settings.database_readiness_timeout_seconds,
+    )
+
+
+def _dependency_ready(dependency: object) -> bool:
+    readiness = getattr(dependency, "is_ready", None)
+    return bool(readiness()) if callable(readiness) else True
 
 
 def _build_identity_resolver(settings: Settings) -> IdentityResolver:

@@ -6,8 +6,17 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
 
-from evolvable_memory.application.commands import OutcomeResult, PreferenceResult
+from evolvable_memory.application.commands import (
+    MemoryUsageResult,
+    OutcomeResult,
+    PreferenceResult,
+)
 from evolvable_memory.domain.experience import OutcomeKind, RecallTrace, UtilityEstimate
+from evolvable_memory.domain.governance import (
+    ErasureRequest,
+    ProcessingGrant,
+    SuppressionFence,
+)
 from evolvable_memory.domain.memory import MemoryRevision, MemorySnapshot
 from evolvable_memory.domain.projection import (
     ContextCompressionAlgorithm,
@@ -30,6 +39,7 @@ MAX_REASON_LENGTH = 2_048
 MAX_QUERY_LENGTH = 4_096
 MAX_NOTE_LENGTH = 4_096
 MAX_PURPOSE_LENGTH = 128
+MAX_POLICY_CODE_LENGTH = 128
 
 ScopeId = Annotated[
     str,
@@ -83,6 +93,14 @@ NoteText = Annotated[
 PurposeText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_PURPOSE_LENGTH),
+]
+PolicyCode = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_POLICY_CODE_LENGTH),
+]
+Sha256Digest = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, pattern=r"^[0-9A-Fa-f]{64}$"),
 ]
 
 
@@ -419,11 +437,71 @@ class RecallContextProjectionResponse(ApiModel):
         )
 
 
+class MemoryUsageWriteRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    trace_id: UUID
+    algorithm: ContextCompressionAlgorithm
+    max_characters: int = Field(ge=64, le=100_000)
+    source_projection_sha256: Sha256Digest
+    delivered_context_sha256: Sha256Digest
+    revision_ids: list[UUID] = Field(min_length=1, max_length=100)
+    idempotency_key: IdempotencyKey
+    occurred_at: AwareDatetime | None = None
+    purpose: PurposeText = "personalization"
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "tenant_id": "demo",
+                "subject_id": "alice",
+                "trace_id": "00000000-0000-0000-0000-000000000101",
+                "algorithm": "exact-deduplicated-v1",
+                "max_characters": 2000,
+                "source_projection_sha256": "a" * 64,
+                "delivered_context_sha256": "b" * 64,
+                "revision_ids": ["00000000-0000-0000-0000-000000000102"],
+                "idempotency_key": "task-9:memory-usage",
+            }
+        },
+    )
+
+
+class MemoryUsageResponse(ApiModel):
+    usage_id: UUID
+    trace_id: UUID
+    algorithm: ContextCompressionAlgorithm
+    max_characters: int
+    source_projection_sha256: str
+    delivered_context_sha256: str
+    revision_ids: list[UUID]
+    occurred_at: datetime
+    recorded_at: datetime
+    idempotent_replay: bool
+
+    @classmethod
+    def from_result(cls, result: MemoryUsageResult) -> MemoryUsageResponse:
+        return cls(
+            usage_id=result.usage.id,
+            trace_id=result.usage.trace_id,
+            algorithm=result.usage.algorithm,
+            max_characters=result.usage.budget_characters,
+            source_projection_sha256=result.usage.source_projection_sha256,
+            delivered_context_sha256=result.usage.delivered_context_sha256,
+            revision_ids=list(result.usage.revision_ids),
+            occurred_at=result.usage.occurred_at,
+            recorded_at=result.usage.recorded_at,
+            idempotent_replay=result.idempotent_replay,
+        )
+
+
 class OutcomeWriteRequest(ApiModel):
     tenant_id: ScopeId
     subject_id: ScopeId
     trace_id: UUID
     revision_id: UUID
+    usage_id: UUID | None = None
     kind: OutcomeKind
     idempotency_key: IdempotencyKey
     occurred_at: AwareDatetime | None = None
@@ -512,6 +590,107 @@ class RevisionResponse(ApiModel):
         )
 
 
+class ProcessingGrantWriteRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    purposes: list[PurposeText] = Field(min_length=1, max_length=16)
+    lawful_basis: PolicyCode
+    idempotency_key: IdempotencyKey
+    valid_from: AwareDatetime
+    valid_until: AwareDatetime | None = None
+    purpose: PurposeText = "privacy-governance"
+
+
+class ProcessingGrantResponse(ApiModel):
+    grant_id: UUID
+    purposes: list[str]
+    lawful_basis: str
+    policy_version: str
+    valid_from: datetime
+    valid_until: datetime | None
+    created_at: datetime
+    revoked_at: datetime | None
+
+    @classmethod
+    def from_grant(cls, grant: ProcessingGrant) -> ProcessingGrantResponse:
+        return cls(
+            grant_id=grant.id,
+            purposes=list(grant.purposes),
+            lawful_basis=grant.lawful_basis,
+            policy_version=grant.policy_version,
+            valid_from=grant.valid_from,
+            valid_until=grant.valid_until,
+            created_at=grant.created_at,
+            revoked_at=grant.revoked_at,
+        )
+
+
+class ProcessingGrantRevocationRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    purpose: PurposeText = "privacy-governance"
+
+
+class SuppressionRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    reason_code: PolicyCode
+    idempotency_key: IdempotencyKey
+    purpose: PurposeText = "privacy-governance"
+
+
+class SuppressionResponse(ApiModel):
+    fence_id: UUID
+    reason_code: str
+    policy_version: str
+    created_at: datetime
+
+    @classmethod
+    def from_fence(cls, fence: SuppressionFence) -> SuppressionResponse:
+        return cls(
+            fence_id=fence.id,
+            reason_code=fence.reason_code,
+            policy_version=fence.policy_version,
+            created_at=fence.created_at,
+        )
+
+
+class ErasureWriteRequest(ApiModel):
+    tenant_id: ScopeId
+    subject_id: ScopeId
+    reason_code: PolicyCode
+    idempotency_key: IdempotencyKey
+    purpose: PurposeText = "privacy-governance"
+
+
+class ErasureResponse(ApiModel):
+    request_id: UUID
+    scope_digest: str
+    policy_version: str
+    reason_code: str
+    status: str
+    created_at: datetime
+    completed_at: datetime | None
+    summary: dict[str, int] | None
+    handler_results: dict[str, str]
+    error_code: str | None
+
+    @classmethod
+    def from_request(cls, request: ErasureRequest) -> ErasureResponse:
+        return cls(
+            request_id=request.id,
+            scope_digest=request.scope_digest,
+            policy_version=request.policy_version,
+            reason_code=request.reason_code,
+            status=request.status.value,
+            created_at=request.created_at,
+            completed_at=request.completed_at,
+            summary=request.summary.as_dict() if request.summary is not None else None,
+            handler_results=dict(request.handler_results),
+            error_code=request.error_code,
+        )
+
+
 class ErrorResponse(ApiModel):
     error: str
     detail: str
@@ -526,6 +705,8 @@ class ReadinessResponse(ApiModel):
 class ServiceInfoResponse(ApiModel):
     name: str
     version: str
+    api_contract: str
+    capabilities: tuple[str, ...]
     status: str
     storage: str
     auth_mode: str
@@ -533,4 +714,5 @@ class ServiceInfoResponse(ApiModel):
     frontend_url: str
     documentation_url: str
     production_ready: bool
+    production_blockers: tuple[str, ...]
     notice: str

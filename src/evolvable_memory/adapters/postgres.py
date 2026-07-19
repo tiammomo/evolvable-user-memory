@@ -32,6 +32,7 @@ from evolvable_memory.domain.evolution import (
     StrategySnapshot,
 )
 from evolvable_memory.domain.experience import (
+    MemoryUsage,
     OutcomeEvent,
     OutcomeKind,
     RecalledItem,
@@ -39,6 +40,7 @@ from evolvable_memory.domain.experience import (
     ScoreBreakdown,
     UtilityEstimate,
 )
+from evolvable_memory.domain.governance import ErasureSummary
 from evolvable_memory.domain.memory import (
     BeliefState,
     MemoryKind,
@@ -47,6 +49,7 @@ from evolvable_memory.domain.memory import (
     MemorySnapshot,
     RevisionTransition,
 )
+from evolvable_memory.domain.projection import ContextCompressionAlgorithm
 
 DbRow = dict[str, Any]
 DbConnection = Connection[DbRow]
@@ -575,6 +578,136 @@ class PostgresMemoryStore:
             created_at=row["created_at"],
         )
 
+    def save_usage(self, usage: MemoryUsage) -> tuple[MemoryUsage, bool]:
+        with self._connection() as connection:
+            existing = self._usage_by_idempotency(connection, usage)
+            if existing is not None:
+                return self._replayed_usage(connection, existing, usage)
+            try:
+                with connection.transaction():
+                    connection.execute(
+                        """
+                        INSERT INTO memory_usages (
+                            id, tenant_id, subject_id, trace_id,
+                            algorithm, budget_characters,
+                            source_projection_sha256, delivered_context_sha256,
+                            idempotency_key, occurred_at, recorded_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            usage.id,
+                            usage.scope.tenant_id,
+                            usage.scope.subject_id,
+                            usage.trace_id,
+                            usage.algorithm.value,
+                            usage.budget_characters,
+                            usage.source_projection_sha256,
+                            usage.delivered_context_sha256,
+                            usage.idempotency_key,
+                            usage.occurred_at,
+                            usage.recorded_at,
+                        ),
+                    )
+                    for ordinal, revision_id in enumerate(usage.revision_ids, start=1):
+                        connection.execute(
+                            """
+                            INSERT INTO memory_usage_items (
+                                usage_id, trace_id, revision_id,
+                                tenant_id, subject_id, ordinal
+                            ) VALUES (%s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                usage.id,
+                                usage.trace_id,
+                                revision_id,
+                                usage.scope.tenant_id,
+                                usage.scope.subject_id,
+                                ordinal,
+                            ),
+                        )
+                    self._append_outbox(
+                        connection,
+                        aggregate_type="memory_usage",
+                        aggregate_id=usage.id,
+                        event_type="memory_usage.recorded",
+                        occurred_at=usage.recorded_at,
+                        payload={
+                            "tenant_id": usage.scope.tenant_id,
+                            "subject_id": usage.scope.subject_id,
+                            "trace_id": str(usage.trace_id),
+                            "algorithm": usage.algorithm.value,
+                            "budget_characters": usage.budget_characters,
+                            "revision_ids": [str(item) for item in usage.revision_ids],
+                            "occurred_at": usage.occurred_at.isoformat(),
+                        },
+                    )
+            except (UniqueViolation, ForeignKeyViolation, CheckViolation):
+                existing = self._usage_by_idempotency(connection, usage)
+                if existing is None:
+                    raise ConflictError("memory usage conflicts with authoritative state") from None
+                return self._replayed_usage(connection, existing, usage)
+        return usage, True
+
+    def usage(self, scope: Scope, usage_id: UUID) -> MemoryUsage | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM memory_usages
+                WHERE id = %s AND tenant_id = %s AND subject_id = %s
+                """,
+                (usage_id, scope.tenant_id, scope.subject_id),
+            ).fetchone()
+            if row is None:
+                return None
+            item_rows = connection.execute(
+                """
+                SELECT revision_id FROM memory_usage_items
+                WHERE usage_id = %s AND tenant_id = %s AND subject_id = %s
+                ORDER BY ordinal
+                """,
+                (usage_id, scope.tenant_id, scope.subject_id),
+            ).fetchall()
+        return _memory_usage(row, item_rows)
+
+    def _usage_by_idempotency(
+        self,
+        connection: DbConnection,
+        usage: MemoryUsage,
+    ) -> DbRow | None:
+        return connection.execute(
+            """
+            SELECT * FROM memory_usages
+            WHERE tenant_id = %s AND subject_id = %s AND idempotency_key = %s
+            """,
+            (usage.scope.tenant_id, usage.scope.subject_id, usage.idempotency_key),
+        ).fetchone()
+
+    def _replayed_usage(
+        self,
+        connection: DbConnection,
+        row: DbRow,
+        requested: MemoryUsage,
+    ) -> tuple[MemoryUsage, bool]:
+        item_rows = connection.execute(
+            """
+            SELECT revision_id FROM memory_usage_items
+            WHERE usage_id = %s AND tenant_id = %s AND subject_id = %s
+            ORDER BY ordinal
+            """,
+            (row["id"], requested.scope.tenant_id, requested.scope.subject_id),
+        ).fetchall()
+        existing = _memory_usage(row, item_rows)
+        if (
+            existing.trace_id != requested.trace_id
+            or existing.algorithm != requested.algorithm
+            or existing.budget_characters != requested.budget_characters
+            or existing.source_projection_sha256 != requested.source_projection_sha256
+            or existing.delivered_context_sha256 != requested.delivered_context_sha256
+            or existing.revision_ids != requested.revision_ids
+        ):
+            raise ConflictError("usage idempotency key was reused with different data")
+        return existing, False
+
     def utility_for(
         self,
         scope: Scope,
@@ -684,9 +817,9 @@ class PostgresMemoryStore:
             connection.execute(
                 """
                 INSERT INTO outcomes (
-                    id, tenant_id, subject_id, trace_id, revision_id, kind,
+                    id, tenant_id, subject_id, trace_id, revision_id, usage_id, kind,
                     idempotency_key, occurred_at, recorded_at, weight, note
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     outcome.id,
@@ -694,6 +827,7 @@ class PostgresMemoryStore:
                     outcome.scope.subject_id,
                     outcome.trace_id,
                     outcome.revision_id,
+                    outcome.usage_id,
                     outcome.kind.value,
                     outcome.idempotency_key,
                     outcome.occurred_at,
@@ -744,6 +878,7 @@ class PostgresMemoryStore:
                     "subject_id": outcome.scope.subject_id,
                     "trace_id": str(outcome.trace_id),
                     "revision_id": str(outcome.revision_id),
+                    "usage_id": str(outcome.usage_id) if outcome.usage_id is not None else None,
                     "kind": outcome.kind.value,
                     "occurred_at": outcome.occurred_at.isoformat(),
                 },
@@ -776,6 +911,7 @@ class PostgresMemoryStore:
         existing = _outcome(row)
         if (
             existing.trace_id != requested.trace_id
+            or existing.usage_id != requested.usage_id
             or existing.revision_id != requested.revision_id
             or existing.kind != requested.kind
             or existing.weight != requested.weight
@@ -783,6 +919,101 @@ class PostgresMemoryStore:
             raise ConflictError("outcome idempotency key was reused with different data")
         utility = self.utility_for(requested.scope, requested.revision_id, context)
         return existing, utility, False
+
+    def erase_scope(self, scope: Scope) -> ErasureSummary:
+        """Physically erase every authoritative and queued copy for one Scope."""
+        tenant_id = scope.tenant_id
+        subject_id = scope.subject_id
+        with self._connection() as connection, connection.transaction():
+            counts = {
+                "observations": self._scope_count(connection, "observations", scope),
+                "candidates": self._scope_count(connection, "candidates", scope),
+                "memory_records": self._scope_count(connection, "memory_records", scope),
+                "memory_revisions": self._scope_count(connection, "memory_revisions", scope),
+                "revision_transitions": self._scope_count(
+                    connection, "revision_transitions", scope
+                ),
+                "recall_traces": self._scope_count(connection, "recall_traces", scope),
+                "recall_trace_items": self._scope_count(connection, "recall_trace_items", scope),
+                "memory_usages": self._scope_count(connection, "memory_usages", scope),
+                "memory_usage_items": self._scope_count(connection, "memory_usage_items", scope),
+                "outcomes": self._scope_count(connection, "outcomes", scope),
+                "utility_estimates": self._scope_count(connection, "utility_estimates", scope),
+            }
+            evidence_row = connection.execute(
+                """
+                SELECT count(*) AS count
+                FROM evidence_spans evidence
+                JOIN observations observation ON observation.id = evidence.observation_id
+                WHERE observation.tenant_id = %s AND observation.subject_id = %s
+                """,
+                (tenant_id, subject_id),
+            ).fetchone()
+            counts["evidence_spans"] = int(evidence_row["count"] if evidence_row else 0)
+            projection_row = connection.execute(
+                """
+                SELECT count(*) AS count
+                FROM projection_jobs job
+                JOIN outbox_events event ON event.id = job.event_id
+                WHERE event.payload ->> 'tenant_id' = %s
+                  AND event.payload ->> 'subject_id' = %s
+                """,
+                (tenant_id, subject_id),
+            ).fetchone()
+            counts["projection_jobs"] = int(projection_row["count"] if projection_row else 0)
+            outbox_row = connection.execute(
+                """
+                SELECT count(*) AS count FROM outbox_events
+                WHERE payload ->> 'tenant_id' = %s AND payload ->> 'subject_id' = %s
+                """,
+                (tenant_id, subject_id),
+            ).fetchone()
+            counts["outbox_events"] = int(outbox_row["count"] if outbox_row else 0)
+
+            for table in (
+                "outcomes",
+                "utility_estimates",
+                "memory_usage_items",
+                "memory_usages",
+                "recall_trace_items",
+                "recall_traces",
+                "candidates",
+                "revision_transitions",
+            ):
+                connection.execute(
+                    f"DELETE FROM {table} WHERE tenant_id = %s AND subject_id = %s",
+                    (tenant_id, subject_id),
+                )
+            connection.execute(
+                """
+                UPDATE memory_records SET active_revision_id = NULL
+                WHERE tenant_id = %s AND subject_id = %s
+                """,
+                (tenant_id, subject_id),
+            )
+            connection.execute(
+                "DELETE FROM memory_records WHERE tenant_id = %s AND subject_id = %s",
+                (tenant_id, subject_id),
+            )
+            connection.execute(
+                "DELETE FROM observations WHERE tenant_id = %s AND subject_id = %s",
+                (tenant_id, subject_id),
+            )
+            connection.execute(
+                """
+                DELETE FROM outbox_events
+                WHERE payload ->> 'tenant_id' = %s AND payload ->> 'subject_id' = %s
+                """,
+                (tenant_id, subject_id),
+            )
+        return ErasureSummary(**counts)
+
+    def _scope_count(self, connection: DbConnection, table: str, scope: Scope) -> int:
+        row = connection.execute(
+            f"SELECT count(*) AS count FROM {table} WHERE tenant_id = %s AND subject_id = %s",
+            (scope.tenant_id, scope.subject_id),
+        ).fetchone()
+        return int(row["count"] if row else 0)
 
     def save_strategy(self, strategy: StrategySnapshot) -> None:
         """Persist an immutable strategy before traces can reference it."""
@@ -1469,8 +1700,25 @@ def _outcome(row: DbRow) -> OutcomeEvent:
         idempotency_key=row["idempotency_key"],
         occurred_at=row["occurred_at"],
         recorded_at=row["recorded_at"],
+        usage_id=row.get("usage_id"),
         weight=row["weight"],
         note=row["note"],
+    )
+
+
+def _memory_usage(row: DbRow, item_rows: list[DbRow]) -> MemoryUsage:
+    return MemoryUsage(
+        id=row["id"],
+        scope=Scope(row["tenant_id"], row["subject_id"]),
+        trace_id=row["trace_id"],
+        algorithm=ContextCompressionAlgorithm(row["algorithm"]),
+        budget_characters=row["budget_characters"],
+        source_projection_sha256=row["source_projection_sha256"],
+        delivered_context_sha256=row["delivered_context_sha256"],
+        revision_ids=tuple(item["revision_id"] for item in item_rows),
+        idempotency_key=row["idempotency_key"],
+        occurred_at=row["occurred_at"],
+        recorded_at=row["recorded_at"],
     )
 
 

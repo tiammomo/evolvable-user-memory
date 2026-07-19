@@ -122,12 +122,19 @@ def test_jwt_authorization_settings_are_loaded_from_environment(
     monkeypatch.setenv("EMF_AUTH_JWT_ALGORITHMS", "RS256,ES256")
     monkeypatch.setenv("EMF_AUTH_REQUIRED_SCOPE", "memory.read")
     monkeypatch.setenv("EMF_AUTH_AUDIT_HMAC_KEY", "x" * 32)
+    monkeypatch.setenv("EMF_AUTH_AUDIT_SINK", "postgres")
+    monkeypatch.setenv("EMF_STORE", "postgres")
+    monkeypatch.setenv("EMF_DATABASE_URL", "postgresql://user:secret@db/memory")
+    monkeypatch.setenv("EMF_GOVERNANCE_MODE", "postgres")
+    monkeypatch.setenv("EMF_GOVERNANCE_HMAC_KEY", "g" * 32)
 
     settings = Settings.from_environment()
 
     assert settings.auth_mode == "jwt"
     assert settings.auth_jwt_algorithms == ("RS256", "ES256")
     assert settings.auth_required_scope == "memory.read"
+    assert settings.auth_audit_sink == "postgres"
+    assert settings.governance_mode == "postgres"
 
 
 def test_postgres_settings_and_runtime_urls_are_loaded(

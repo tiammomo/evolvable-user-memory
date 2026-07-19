@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from evolvable_memory.application.ports import (
     Clock,
+    PrivacyGovernancePort,
     ProjectionEventSourcePort,
     ProjectionSinkPort,
 )
@@ -47,6 +48,7 @@ class MemoryProjectionWorker:
         clock: Clock,
         worker_id: str,
         settings: ProjectionWorkerSettings,
+        governance: PrivacyGovernancePort | None = None,
     ) -> None:
         if not worker_id.strip():
             raise ValueError("worker_id must not be blank")
@@ -55,6 +57,7 @@ class MemoryProjectionWorker:
         self._clock = clock
         self._worker_id = worker_id
         self._settings = settings
+        self._governance = governance
 
     def is_ready(self) -> bool:
         return self._source.is_ready() and self._sink.is_ready()
@@ -79,7 +82,15 @@ class MemoryProjectionWorker:
         dead_lettered = 0
         for item in items:
             try:
-                self._sink.upsert(self._source.load_document(item))
+                document = self._source.load_document(item)
+                if self._governance is None:
+                    self._sink.upsert(document)
+                else:
+                    with self._governance.projection_context(
+                        document.scope,
+                        at=self._clock.now(),
+                    ):
+                        self._sink.upsert(document)
                 self._source.complete(
                     self._settings.projection_name,
                     item=item,
@@ -122,5 +133,9 @@ class MemoryProjectionWorker:
         )
 
     def close(self) -> None:
-        self._source.close()
-        self._sink.close()
+        try:
+            if self._governance is not None:
+                self._governance.close()
+        finally:
+            self._source.close()
+            self._sink.close()
