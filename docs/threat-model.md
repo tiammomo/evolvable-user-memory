@@ -101,7 +101,7 @@ PostgreSQL authority + outbox
 | T7 | 伪造 Trace 或 revision 提交 Outcome，污染 Utility | JWT 身份、`experience.outcome_write`、应用归因检查与数据库 Trace-item 复合外键 | actor/decision 持久溯源、委托链、异常率监控和跨 Scope 并发测试 |
 | T8 | outbox 丢失、重复、乱序或恶意重放 | Milvus job receipt、租约、重试/死信、幂等 upsert、游标 | 通用发布确认、受权重放、删除屏障和积压告警 |
 | T9 | 投影跨 Scope 泄漏、陈旧结果或删除后复活 | 独立投影尚未实现 | Scope 键、源 revision/游标、删除屏障、确定性重建与投影延迟降级测试 |
-| T10 | 在线数据已删，但 Trace、Outcome、缓存、投影或备份仍可还原 | 未实现隐私生命周期 | 按[隐私生命周期设计](privacy-lifecycle.md)实现清单、抑制、编排、恢复屏障与证明 |
+| T10 | 在线数据已删，但备份、导出或未登记副本仍可还原 | 在线 Scope 清理已覆盖 Trace、Outcome、outbox 和 Milvus；备份仍是部署责任 | 按[隐私生命周期设计](privacy-lifecycle.md)执行数据清单、备份到期、恢复屏障与抽样核验 |
 | T11 | 演化策略放宽治理规则、注册候选时偷换活动策略，或伪造阶段/证据后晋升 | 领域动作空间排除治理规则；候选注册与激活分离；幂等实验、合法阶段数据库守卫、append-only 转换历史、HMAC Gate Receipt 身份/阶段/决策/有效期绑定及原子晋升/回滚 | 授权控制面、外部产物摘要复核、非对称证明与独立 Receipt 审计存储、真实离线/影子/灰度编排和双人审批 |
 | T12 | 数据库凭据、备份、迁移或运维控制面被滥用 | 本机网络与非 root 容器 | 秘密管理、TLS、最小数据库角色、短期凭据、双人审批、不可篡改审计与恢复演练 |
 | T13 | 浏览器认证引入 token 泄漏、CSRF、错误 CORS 或会话固定 | API Bearer 校验、精确开发 CORS、安全响应头 | 生产 BFF/会话模型、PKCE、CSRF、防泄漏、登出/撤销和增强认证测试 |

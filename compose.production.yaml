@@ -1,0 +1,74 @@
+name: evolvable-user-memory
+
+# Production-pilot hardening overlay. It deliberately contains no defaults for
+# identity, database, object-storage, or pseudonymization secrets. Compose must
+# fail during interpolation instead of silently falling back to local values.
+services:
+  postgres:
+    environment:
+      POSTGRES_DB: ${EMF_POSTGRES_DB:?set EMF_POSTGRES_DB}
+      POSTGRES_USER: ${EMF_POSTGRES_USER:?set EMF_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${EMF_POSTGRES_PASSWORD:?set EMF_POSTGRES_PASSWORD}
+
+  minio:
+    environment:
+      MINIO_ROOT_USER: ${EMF_MINIO_ROOT_USER:?set EMF_MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${EMF_MINIO_ROOT_PASSWORD:?set EMF_MINIO_ROOT_PASSWORD}
+
+  milvus:
+    environment:
+      MINIO_ACCESS_KEY_ID: ${EMF_MINIO_ROOT_USER:?set EMF_MINIO_ROOT_USER}
+      MINIO_SECRET_ACCESS_KEY: ${EMF_MINIO_ROOT_PASSWORD:?set EMF_MINIO_ROOT_PASSWORD}
+
+  migrate:
+    environment:
+      EMF_STORE: postgres
+      EMF_DATABASE_URL: ${EMF_DATABASE_URL:?set EMF_DATABASE_URL}
+
+  backend:
+    environment:
+      EMF_ENVIRONMENT: production
+      EMF_STORE: postgres
+      EMF_DATABASE_URL: ${EMF_DATABASE_URL:?set EMF_DATABASE_URL}
+      EMF_AUTH_MODE: jwt
+      EMF_AUTH_JWT_ISSUER: ${EMF_AUTH_JWT_ISSUER:?set an HTTPS issuer}
+      EMF_AUTH_JWT_AUDIENCE: ${EMF_AUTH_JWT_AUDIENCE:?set EMF_AUTH_JWT_AUDIENCE}
+      EMF_AUTH_JWT_JWKS_URL: ${EMF_AUTH_JWT_JWKS_URL:?set an HTTPS JWKS URL}
+      EMF_AUTH_JWT_ALGORITHMS: ${EMF_AUTH_JWT_ALGORITHMS:-RS256}
+      EMF_AUTH_REQUIRED_SCOPE: ${EMF_AUTH_REQUIRED_SCOPE:-memory}
+      EMF_AUTH_AUDIT_SINK: postgres
+      EMF_AUTH_AUDIT_HMAC_KEY: ${EMF_AUTH_AUDIT_HMAC_KEY:?set a separate 32+ character secret}
+      EMF_GOVERNANCE_MODE: postgres
+      EMF_GOVERNANCE_HMAC_KEY: ${EMF_GOVERNANCE_HMAC_KEY:?set a separate 32+ character secret}
+      EMF_GOVERNANCE_PSEUDONYM_KEY_ID: ${EMF_GOVERNANCE_PSEUDONYM_KEY_ID:?set a rotation key ID}
+      EMF_PRIVACY_POLICY_VERSION: ${EMF_PRIVACY_POLICY_VERSION:?set a policy version}
+      EMF_PUBLIC_API_URL: ${EMF_PUBLIC_API_URL:?set the public HTTPS API URL}
+      EMF_FRONTEND_URL: ${EMF_FRONTEND_URL:?set the public HTTPS frontend URL}
+      EMF_CORS_ORIGINS: ${EMF_CORS_ORIGINS:?set exact HTTPS origins}
+      EMF_PROJECTION_REQUIRED: "true"
+
+  projector:
+    environment:
+      EMF_ENVIRONMENT: production
+      EMF_STORE: postgres
+      EMF_DATABASE_URL: ${EMF_DATABASE_URL:?set EMF_DATABASE_URL}
+      EMF_AUTH_MODE: jwt
+      EMF_AUTH_JWT_ISSUER: ${EMF_AUTH_JWT_ISSUER:?set an HTTPS issuer}
+      EMF_AUTH_JWT_AUDIENCE: ${EMF_AUTH_JWT_AUDIENCE:?set EMF_AUTH_JWT_AUDIENCE}
+      EMF_AUTH_JWT_JWKS_URL: ${EMF_AUTH_JWT_JWKS_URL:?set an HTTPS JWKS URL}
+      EMF_AUTH_JWT_ALGORITHMS: ${EMF_AUTH_JWT_ALGORITHMS:-RS256}
+      EMF_AUTH_REQUIRED_SCOPE: ${EMF_AUTH_REQUIRED_SCOPE:-memory}
+      EMF_AUTH_AUDIT_SINK: postgres
+      EMF_AUTH_AUDIT_HMAC_KEY: ${EMF_AUTH_AUDIT_HMAC_KEY:?set a separate 32+ character secret}
+      EMF_GOVERNANCE_MODE: postgres
+      EMF_GOVERNANCE_HMAC_KEY: ${EMF_GOVERNANCE_HMAC_KEY:?set a separate 32+ character secret}
+      EMF_GOVERNANCE_PSEUDONYM_KEY_ID: ${EMF_GOVERNANCE_PSEUDONYM_KEY_ID:?set a rotation key ID}
+      EMF_PRIVACY_POLICY_VERSION: ${EMF_PRIVACY_POLICY_VERSION:?set a policy version}
+      EMF_PUBLIC_API_URL: ${EMF_PUBLIC_API_URL:?set the public HTTPS API URL}
+      EMF_FRONTEND_URL: ${EMF_FRONTEND_URL:?set the public HTTPS frontend URL}
+      EMF_CORS_ORIGINS: ${EMF_CORS_ORIGINS:?set exact HTTPS origins}
+      EMF_PROJECTION_REQUIRED: "true"
+
+  frontend:
+    environment:
+      EMF_PUBLIC_API_URL: ${EMF_PUBLIC_API_URL:?set the public HTTPS API URL}

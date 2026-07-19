@@ -6,7 +6,7 @@
 
 > **项目状态：开发预览版 `0.1.0`**
 >
-> 已提供完整可运行的偏好记忆闭环、Web 工作台、OpenAPI、进程内存与 PostgreSQL 适配器。原生快速开始默认使用内存，后端重启后数据会清空；默认 Compose 使用 PostgreSQL。API 已具备本地开发身份与 JWT 授权基线，但完整权限治理、删除证明和生产运维仍未完成，请勿直接暴露到公网或写入真实敏感数据。
+> 已提供完整可运行的偏好记忆闭环、Web 工作台、OpenAPI、进程内存与 PostgreSQL 适配器。原生快速开始默认使用内存，后端重启后数据会清空；默认 Compose 使用 PostgreSQL。可信 JWT、ProcessingGrant、在线抑制/删除和持久审计已经实现，但 IdP 治理、自动保留、备份到期、RLS 和生产运维仍需部署方完成；默认开发配置请勿直接暴露到公网或写入真实敏感数据。
 
 [快速开始](#快速开始) · [容器运行](docs/deployment.md) · [首次体验](#完成第一条记忆闭环) · [评测门禁](#运行内置评测门禁) · [API](#api-一览) · [架构](docs/architecture.md) · [路线图](ROADMAP.md) · [完整文档](docs/index.md)
 
@@ -157,6 +157,12 @@ docker compose down
 
 需要临时内存模式时使用 `docker compose -f compose.memory.yaml up --build -d`。镜像安全设置、数据清理、日志、健康检查和生产缺口见 [部署与运行指南](docs/deployment.md)。
 
+生产试点不要复用默认 Compose 的本地凭据和开发身份。仓库提供
+[`compose.production.yaml`](compose.production.yaml) 和
+[`.env.production.example`](.env.production.example) 的 fail-fast 配置：真实 IdP/JWKS、数据库、
+对象存储与两把独立 HMAC Secret 任一缺失都会拒绝渲染或启动。完整流程见
+[生产身份与授权](docs/deployment.md#生产身份与授权)。
+
 ## 完成第一条记忆闭环
 
 首次打开工作台会显示五屏概念引导；关闭后可通过顶部“新手引导”随时重播。随后按首页可点击的五步清单完成实际操作：
@@ -193,6 +199,7 @@ uv run python examples/first_memory.py
 | `GET` | `/v1/preferences/{record_id}/revisions` | 读取不可变历史 | 否 |
 | `POST` | `/v1/recall` | 执行当前或双时间历史状态召回并产生 Trace | 仅追加 Trace |
 | `POST` | `/v1/recall-contexts` | 从 Trace 生成可归因的有界上下文投影 | 否 |
+| `POST` | `/v1/usages` | 验证投影摘要并记录实际进入消费者上下文的 revision | 是（不学习效用） |
 | `POST` | `/v1/outcomes` | 提交可归因结果并更新效用 | 是 |
 
 完整请求、响应、幂等规则、Outcome 类型和错误码见 [API 使用指南](docs/api-guide.md)。
@@ -287,6 +294,11 @@ uv run evolvable-memory-eval run --dataset builtin:temporal-v1
 | `EMF_AUTH_JWT_ALGORITHMS` | `RS256` | 允许的非对称签名算法，逗号分隔 |
 | `EMF_AUTH_REQUIRED_SCOPE` | `memory` | token 必须包含的粗粒度 OAuth scope |
 | `EMF_AUTH_AUDIT_HMAC_KEY` | 空 | 授权审计引用 HMAC 密钥；`jwt` 模式至少 32 字符 |
+| `EMF_AUTH_AUDIT_SINK` | `log` | `log` 或生产用 `postgres` |
+| `EMF_GOVERNANCE_MODE` | `development` | `development` 或强制门禁的 `postgres` |
+| `EMF_GOVERNANCE_HMAC_KEY` | 空 | 持久治理 HMAC 密钥；至少 32 字符 |
+| `EMF_GOVERNANCE_PSEUDONYM_KEY_ID` | `governance-v1` | HMAC 伪名密钥版本 |
+| `EMF_PRIVACY_POLICY_VERSION` | `privacy-v1` | 治理对象绑定的策略版本 |
 | `EMF_FRONTEND_URL` | `http://127.0.0.1:33009` | 服务发现返回的前端地址 |
 | `EMF_PUBLIC_API_URL` | `http://127.0.0.1:38089` | 后端服务发现、前端请求和前端 CSP 共用的对外 API 基础地址 |
 | `EMF_CORS_ORIGINS` | 两个本机前端 Origin | 逗号分隔的允许来源 |
@@ -304,8 +316,8 @@ uv run evolvable-memory-eval run --dataset builtin:temporal-v1
 - `0003_bitemporal_recall` 会为旧 Outcome 近似回填系统记录时间。旧 Schema 没有保存真实摄入时点，因此迁移结果只能用于 best-effort 历史边界，不能当作精确历史审计事实。
 - 内置 `smoke-v1` / `temporal-v1` 只证明当前提交通过对应 synthetic 契约，不能外推为 LongMemEval、LoCoMo、SOTA 或真实业务质量；时间线回放也不是完整历史策略 replay。
 - 开发模式仍把 `tenant_id` 和 `subject_id` 作为本地目标 Scope；JWT 模式只接受 token 中同一条 `memory_access` grant 明确覆盖的目标。
-- 已实现类型化授权、内置角色、purpose 限制和 JWT 校验基线；尚未实现成员/角色管理 API、撤销控制、临时授权、RLS、同意/保留/抑制/删除执行与证明，以及独立生产审计存储。
-- Milvus 专用 outbox 消费、租约/重试/死信、投影游标和全量重建已经实现；通用事件发布、授权后的运维重放 API、删除屏障与积压告警仍未完成。
+- 已实现可信 JWT、类型化授权、purpose + ProcessingGrant 双门禁、Scope 抑制/删除、最小证明和 PostgreSQL append-only 授权审计；尚未实现成员/角色管理 API、token 撤销、临时授权、RLS、自动保留扫描和备份到期治理。
+- Milvus 专用 outbox 消费、租约/重试/死信、投影游标、全量重建和删除屏障已经实现；通用事件发布、授权后的运维重放 API与积压告警仍未完成。
 - 尚未定义并验证生产 SLO、告警、备份恢复和灾难恢复目标。
 - 演化模块只能调整有界策略参数，不能修改授权、隔离、删除或审计规则。
 - 当前具备可信内部 `EvolutionApplication` 的阶段持久化、HMAC-SHA256 Gate Receipt 验证与原子 promotion/rollback，但没有授权后的 HTTP/API 控制面；系统只验证签发方声明，尚未抓取外部评测产物复核内容摘要、独立持久化完整 Receipt 或自动执行真实 shadow/canary 流量，不能把阶段标签当作质量证明。
@@ -328,6 +340,7 @@ uv run evolvable-memory-eval run --dataset builtin:temporal-v1
 | [记忆评测指南](docs/evaluation.md) | 开发者与策略评审者 | synthetic 契约集、指标、硬门禁和结果边界 |
 | [部署与运行指南](docs/deployment.md) | 新人与运维者 | uv、Docker Compose、健康检查和生产缺口 |
 | [隐私生命周期设计](docs/privacy-lifecycle.md) | 产品、安全与数据治理者 | 同意、抑制、保留、删除与证明的设计验收标准 |
+| [数据生命周期与安全清理](docs/data-lifecycle.md) | 运维、安全与集成者 | Scope 删除、测试隔离、备份和投影恢复边界 |
 | [威胁模型](docs/threat-model.md) | 安全与平台开发者 | 资产、信任边界、威胁场景和生产安全门槛 |
 | [故障排查](docs/troubleshooting.md) | 所有人 | 端口、CORS、空结果和环境问题 |
 | [演化安全模型](docs/evolution-safety.md) | 策略与安全开发者 | 动作空间、门禁和回滚 |

@@ -108,7 +108,7 @@ FROM projection_cursors;
 
 ## 尚未完成的生产门禁
 
-- 删除、抑制与同意撤销尚未形成覆盖 PostgreSQL、outbox、Milvus、备份的可验证执行链；
+- ProcessingGrant 撤销、抑制和在线删除已覆盖 PostgreSQL、outbox 与 Milvus；备份/导出副本仍需部署方执行到期与恢复屏障；
 - 尚无授权后的 dead-letter 重放、暂停、切换和清理控制面；
 - 尚无 projection lag、失败率、模型供应商延迟和召回降级的指标/告警 SLO；
 - 默认 Compose 凭据和单机 Milvus 只适用于本机开发；

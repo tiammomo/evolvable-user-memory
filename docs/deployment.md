@@ -165,6 +165,11 @@ docker run --rm --name emf-frontend \
 | `EMF_AUTH_JWT_ALGORITHMS` | `RS256` | 逗号分隔的非对称签名算法 |
 | `EMF_AUTH_REQUIRED_SCOPE` | `memory` | token 必须包含的 OAuth scope |
 | `EMF_AUTH_AUDIT_HMAC_KEY` | 空 | 授权审计引用密钥；`jwt` 模式至少 32 字符 |
+| `EMF_AUTH_AUDIT_SINK` | `log` | `log` 仅开发；生产必须为 `postgres` |
+| `EMF_GOVERNANCE_MODE` | `development` | 开发旁路或 PostgreSQL 强制处理依据/抑制门禁 |
+| `EMF_GOVERNANCE_HMAC_KEY` | 空 | 治理 Scope/主体伪名密钥；PostgreSQL 模式至少 32 字符 |
+| `EMF_GOVERNANCE_PSEUDONYM_KEY_ID` | `governance-v1` | 伪名密钥版本标识 |
+| `EMF_PRIVACY_POLICY_VERSION` | `privacy-v1` | grant、抑制和删除证明绑定的固定策略版本 |
 | `EMF_FRONTEND_URL` | `http://127.0.0.1:33009` | 服务发现返回的前端入口 |
 | `EMF_PUBLIC_API_URL` | `http://127.0.0.1:38089` | 服务发现、前端请求和前端 CSP 共用的浏览器可达 API 基础地址 |
 | `EMF_CORS_ORIGINS` | 两个本机前端 Origin | 逗号分隔的精确允许来源 |
@@ -191,11 +196,32 @@ export EMF_AUTH_JWT_JWKS_URL='https://identity.example/.well-known/jwks.json'
 export EMF_AUTH_JWT_ALGORITHMS='RS256'
 export EMF_AUTH_REQUIRED_SCOPE='memory'
 export EMF_AUTH_AUDIT_HMAC_KEY='load-this-from-a-secret-manager'
+export EMF_AUTH_AUDIT_SINK=postgres
+export EMF_GOVERNANCE_MODE=postgres
+export EMF_GOVERNANCE_HMAC_KEY='load-a-separate-secret-from-a-secret-manager'
+export EMF_GOVERNANCE_PSEUDONYM_KEY_ID='governance-2026-01'
+export EMF_PRIVACY_POLICY_VERSION='privacy-2026-01'
 ```
 
 不要把审计 HMAC 密钥写入镜像、Compose 文件或 Git。JWT `memory_access` grant、角色、purpose、
-错误语义和仍未完成的生产门禁见[身份与权限设计](authorization.md)。JWT 模式可验证调用身份和
-当前 API 授权，但不会自动提供 IdP 成员治理、撤销、浏览器登录、RLS、双人审批或隐私生命周期。
+错误语义见[身份与权限设计](authorization.md)，处理依据/删除流程见[治理运行手册](governance.md)。
+这些服务能力不会自动提供 IdP 成员治理、token 撤销、浏览器登录、RLS、双人审批、保留扫描或备份到期。
+
+仓库提供 `compose.production.yaml` 作为单机 production pilot 的 fail-fast 覆盖层。它没有任何
+身份、数据库、对象存储或 HMAC Secret 默认值，并且强制 JWT、HTTPS issuer/JWKS、PostgreSQL
+授权审计、PostgreSQL 隐私治理与必需 Milvus 投影。先从 `.env.production.example` 建立由 Secret
+Manager 注入的环境，再仅做渲染检查：
+
+```bash
+docker compose --env-file .env.production \
+  -f compose.yaml -f compose.production.yaml config >/dev/null
+docker compose --env-file .env.production \
+  -f compose.yaml -f compose.production.yaml up -d --build
+```
+
+空值会在 Compose 插值阶段失败；伪造 HTTPS URL 只能通过格式检查，不能替代真实 IdP、TLS、
+撤销与 JWKS 轮换演练。启动后还必须为 probe subject 签发有效 ProcessingGrant，并由消费应用
+执行一次带短期 JWT 的实际 preference list/recall，不能只看 `/health`。
 
 ## PostgreSQL 与迁移
 
@@ -230,8 +256,8 @@ uv run evolvable-memory
 当前版本缺少以下生产前置条件：
 
 1. PostgreSQL 迁移门禁、备份和恢复演练；
-2. IdP 角色治理、撤销/临时授权、增强认证、数据库 RLS 与独立授权审计存储；
-3. 同意、保留、抑制、删除和投影清理证明；
+2. IdP 角色治理、撤销/临时授权、增强认证、数据库 RLS 与审计访问治理；
+3. 处理依据审批、自动保留扫描、备份/导出副本删除和抽样核验；
 4. 生产 CORS、TLS、反向代理、秘密管理与网络策略；
 5. 持久审计、指标、追踪、告警和 SLO；
 6. 依赖、镜像和基础设施安全扫描。

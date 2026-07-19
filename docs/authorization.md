@@ -1,11 +1,11 @@
 # 身份与权限设计
 
-> **状态：可信授权基线已实现，完整治理控制面仍在建设。**
+> **状态：可信 JWT、处理依据门禁与 PostgreSQL 授权审计已实现。**
 >
 > 当前 API 已支持本地开发身份与生产 JWT 身份两种模式；所有记忆用例在 application
 > 权限执行点按 action、tenant、subject 和 purpose 默认拒绝。角色绑定目前来自受信任的
-> JWT `memory_access` claim，尚未提供成员/角色管理 API、撤销列表、数据库 RLS、临时授权、
-> 双人审批或权限管理 UI，因此项目仍不是完整生产权限平台。
+> JWT `memory_access` claim；处理依据、抑制和删除由独立治理控制面决定。项目仍未提供
+> IdP 成员/角色管理、token 撤销列表、数据库 RLS、临时授权、双人审批或权限管理 UI。
 
 ## 1. 安全目标
 
@@ -37,11 +37,13 @@ ActorContext + tenant-local AccessGrant
 AuthorizedMemoryApplication
   action + tenant + subject + purpose
         │
-        ├── deny ──> 403 或隐藏资源的 404 + 审计
-        │
-        └── allow ─> MemoryApplication ─> Domain ─> Store
-                           │
-                           └── 授权决策审计
+        ├── deny ──> 403 或隐藏资源的 404 + PostgreSQL 审计
+        └── allow
+              │
+              ▼
+        ProcessingGrant + SuppressionFence
+              ├── deny ──> 403（不读取/写入业务数据）
+              └── allow ─> MemoryApplication ─> Domain ─> Store
 ```
 
 `api` 负责验证传输身份，`AuthorizedMemoryApplication` 是 application 层统一权限执行点，
@@ -50,6 +52,11 @@ AuthorizedMemoryApplication
 
 请求中的 `tenant_id` / `subject_id` 在 JWT 模式下只是目标资源选择器。它们只有被同一个、
 已经验证的 `AccessGrant` 覆盖后才会形成可信 Scope，客户端无法靠修改 payload 扩权。
+
+`context.project_id` 不参与授权决策，它只是 tenant 内的召回/个性化 facet。接入方必须为
+不同产品或互不信任的业务域分配不同 tenant；不能把 project facet 当成 RLS 或 JWT grant。
+同一产品内部若需要 project-only 偏好，项目 ID 必须由已授权服务端路由写入，并由 Consumer
+在 projection 交付前做第二道精确过滤。
 
 ## 3. 运行模式
 
@@ -123,6 +130,10 @@ grant 的 purpose 拼接后放行。
 | `POST /v1/recall` | `projection.recall` |
 | `POST /v1/recall-contexts` | `projection.compress` |
 | `POST /v1/outcomes` | `experience.outcome_write` |
+| `POST /v1/governance/processing-grants` | `governance.policy_manage` |
+| `POST /v1/governance/processing-grants/{id}/revocation` | `governance.policy_manage` |
+| `POST /v1/governance/suppressions` | `governance.privacy_suppress` |
+| `POST/GET /v1/governance/erasures...` | `governance.erasure_approve` |
 
 ## 5. 内置角色模板
 
@@ -154,8 +165,8 @@ grant 的 purpose 拼接后放行。
 ```
 
 例如只授权 `personalization` 的服务 token 不能把同一份记忆用于 `model-training`。purpose
-不是自由授权开关；它必须由受信任的 grant 预先允许。未来 `ProcessingGrant` 上线后，还需
-同时满足 subject 的处理依据、有效期和生命周期状态。
+不是自由授权开关；它必须同时被 JWT `AccessGrant` 和当前未过期的 `ProcessingGrant`
+显式允许。任何 `SuppressionFence` 都优先于 grant 和双时间参数。
 
 ## 7. 授权审计
 
@@ -166,9 +177,10 @@ grant 的 purpose 拼接后放行。
 - principal kind、认证方式；
 - principal、client、tenant、subject 和 resource 的 HMAC 截断引用。
 
-审计日志不会包含 token、tenant/subject 原值、请求正文、Evidence、Memory value、query 或
-Outcome note。JWT 模式要求独立的至少 32 字符 HMAC 密钥。该日志目前仍输出到运行时日志，
-完整生产环境还需要不可篡改的独立审计存储、访问控制、保留策略、告警和密钥轮换。
+审计不会包含 token、tenant/subject 原值、请求正文、Evidence、Memory value、query 或
+Outcome note。`EMF_AUTH_AUDIT_SINK=postgres` 会把元数据写入
+`authorization_audit_events`；数据库触发器拒绝 UPDATE/DELETE，审计写入失败会阻止业务
+操作。`log` 仅用于开发。部署方仍需配置审计访问控制、保留期、告警、导出和 HMAC 密钥轮换。
 
 ## 8. 错误语义
 
@@ -191,6 +203,11 @@ export EMF_AUTH_JWT_JWKS_URL='https://identity.example/.well-known/jwks.json'
 export EMF_AUTH_JWT_ALGORITHMS='RS256'
 export EMF_AUTH_REQUIRED_SCOPE='memory'
 export EMF_AUTH_AUDIT_HMAC_KEY='replace-with-a-secret-from-your-secret-manager'
+export EMF_AUTH_AUDIT_SINK=postgres
+export EMF_GOVERNANCE_MODE=postgres
+export EMF_GOVERNANCE_HMAC_KEY='a-separate-secret-from-your-secret-manager'
+export EMF_GOVERNANCE_PSEUDONYM_KEY_ID='governance-2026-01'
+export EMF_PRIVACY_POLICY_VERSION='privacy-2026-01'
 ```
 
 即使这些配置有效，当前版本仍不能直接宣称生产就绪。部署方还必须提供：
@@ -198,9 +215,9 @@ export EMF_AUTH_AUDIT_HMAC_KEY='replace-with-a-secret-from-your-secret-manager'
 - IdP 中角色/成员变更、撤销、离职和 token 生命周期管理；
 - JWKS 网络故障、轮换和缓存策略；
 - 短时 token、增强认证和高风险操作双人审批；
-- 独立审计存储、告警、导出和保留策略；
+- 审计访问控制、告警、导出、保留策略和密钥轮换；
 - 数据库非 owner 应用角色与 RLS；
-- `ProcessingGrant`、抑制、删除和删除证明；
+- 处理依据签发人的业务审批流程、保留扫描与备份删除策略；
 - 权限管理 API/UI、有效权限预览和策略模拟。
 
 ## 10. 数据库 RLS 后续设计

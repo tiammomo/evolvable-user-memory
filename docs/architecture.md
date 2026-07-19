@@ -108,7 +108,9 @@ bootstrap  →  api / adapters  →  application  →  domain
 - 综合得分与评分分量
 - 创建时间
 
-`OutcomeEvent` 必须引用同 Scope 的 Trace，并引用该 Trace 中实际出现的 revision。它区分调用方提供的业务 `occurred_at` 与服务端生成的系统 `recorded_at`；历史 Utility 只使用在 `known_at` 之前已经记录的 Outcome。
+`MemoryUsage` 表示消费者真正把哪些 revision 放入下游上下文。调用方提交投影算法、预算、源投影摘要和实际交付摘要；application 从不可变 Trace 重建源投影，拒绝摘要不匹配或投影外 revision，并签发不可变 `usage_id`。
+
+`OutcomeEvent` 必须引用同 Scope 的 Trace。新消费者还应引用 `MemoryUsage`，此时 revision 必须真实存在于该次 Usage；未传 `usage_id` 的旧消费者仍按 Trace 归因。Outcome 区分调用方提供的业务 `occurred_at` 与服务端生成的系统 `recorded_at`；历史 Utility 只使用在 `known_at` 之前已经记录的 Outcome。
 
 `UtilityEstimate` 以 `(revision_id, context_fingerprint)` 为键，使用带先验的成功/失败权重更新均值。
 
@@ -233,6 +235,16 @@ source revision attribution + reproducibility digests
 这一步是纯读取投影。相同 Trace、算法和字符预算得到相同结果；过长条目会整条省略而不是
 截断事实，读取仍不修改 Belief 或 Utility。
 
+消费者实际采用后形成另一条经验事实：
+
+```text
+RecallContextProjection + delivered digest + adopted revisions
+  ↓ server-side reconstruction and digest verification
+immutable MemoryUsage receipt
+  ↓ optional strict attribution
+OutcomeEvent(usage_id, trace_id, revision_id)
+```
+
 固定 relevance admission 先于加权评分：候选必须有词法命中，或者保存与请求两侧都提供了显式上下文且上下文为正向匹配。信念、效用和时效分量本身不能把无关候选变成相关结果。这条安全底线不属于 `StrategySnapshot` 的可演化权重，策略调优不能降低或绕过它。
 
 默认权重：
@@ -331,12 +343,12 @@ Milvus 和未来图存储只能消费投影事件，不能反向写入权威 Rev
 - RecallTrace 的双时间边界和 item 修订时间通过数据库非空、检查、唯一键与复合外键保持一致。
 - Outcome 的 Trace 与 revision 归因完整性。
 
-隐私生命周期的目标状态与删除证明验收标准见[隐私生命周期设计](privacy-lifecycle.md)，生产信任边界与攻击场景见[威胁模型](threat-model.md)。二者都是设计基线，不代表当前已有对应执行能力。
+隐私生命周期的验收标准见[隐私生命周期设计](privacy-lifecycle.md)，生产信任边界与攻击场景见[威胁模型](threat-model.md)。在线处理依据、抑制、删除和证明已经实现；自动保留、备份/导出副本与恢复演练仍是部署缺口。
 
 ## 9. 有意未实现
 
 - 成员/角色治理控制面、撤销/临时授权与数据库 RLS
-- 删除证明、保留与抑制策略
+- 自动保留、备份/导出副本删除与恢复屏障演练
 - 通用 outbox 发布、授权后的重放控制、删除屏障与积压 SLO
 - 图和摘要检索器，以及生产级 embedding 质量门禁
 - 代表性离线回放数据集、影子路由与灰度控制面

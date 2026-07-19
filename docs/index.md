@@ -18,10 +18,11 @@
 
 ### API 集成者
 
-1. [API 使用指南](api-guide.md)
-2. [身份与权限设计](authorization.md)
-3. [架构说明](architecture.md)
-4. 交互式文档：后端启动后打开 <http://127.0.0.1:38089/docs>
+1. [HTTP 消费者集成契约](integration-contract.md)
+2. [API 使用指南](api-guide.md)
+3. [身份与权限设计](authorization.md)
+4. [架构说明](architecture.md)
+5. 交互式文档：后端启动后打开 <http://127.0.0.1:38089/docs>
 
 重点理解作用域、幂等键、`valid_at` / `known_at` 双时间、`RecallTrace` 归因和错误码。
 
@@ -54,10 +55,12 @@
 4. [身份与权限设计](authorization.md)
 5. [威胁模型](threat-model.md)
 6. [隐私生命周期设计](privacy-lifecycle.md)
-7. [架构说明](architecture.md)中的 Scope 与持久化边界
-8. [路线图](../ROADMAP.md)
+7. [治理运行手册](governance.md)
+8. [数据生命周期与安全清理](data-lifecycle.md)
+9. [架构说明](architecture.md)中的 Scope 与持久化边界
+10. [路线图](../ROADMAP.md)
 
-当前容器仅用于本机开发评估。PostgreSQL 权威存储、迁移、数据库约束、同事务 outbox、Milvus 投影 worker 和 JWT 授权基线已经实现；生产化前仍必须补齐权限治理控制面、数据库 RLS、隐私生命周期执行、受控重放/删除屏障、故障恢复和可观测性 SLO。
+默认容器仍用于本机开发评估。PostgreSQL 权威存储、同事务 outbox、Milvus 投影、可信 JWT、处理依据、抑制/删除和持久审计已经实现；生产化前仍需部署真实 IdP、审批流程、数据库 RLS、保留/备份治理、故障恢复和可观测性 SLO。
 
 ## 当前版本地图
 
@@ -68,6 +71,7 @@
 | 不可变修订 | 已实现 | 修正弹窗或 corrections API |
 | 词法/向量与上下文混合召回 | 已实现；Milvus 可降级 | 前端“记忆召回”或 `POST /v1/recall` |
 | 双时间历史状态投影 | 已实现；不是完整历史策略 replay | `POST /v1/recall` 的 `valid_at` / `known_at` |
+| 服务端可验证的实际使用凭证 | 已实现 | `POST /v1/usages` |
 | Outcome 效用学习 | 已实现 | 召回结果反馈或 `POST /v1/outcomes` |
 | 有界策略提案 | 领域模型已实现 | `domain/evolution.py` |
 | synthetic retrieval/invariant 与双时间评测 | 已实现（smoke-v1 / temporal-v1） | [记忆评测指南](evaluation.md) |
@@ -79,7 +83,7 @@
 | Milvus 消费、重试、死信、游标与重建 | 已实现；远程受控重放未实现 | [Milvus 投影指南](milvus-projection.md) |
 | JWT 身份与 application 授权执行点 | 已实现（治理基线） | [身份与权限设计](authorization.md) |
 | 角色管理、撤销、临时授权和数据库 RLS | 未实现 | [身份与权限设计](authorization.md) |
-| 同意、保留、抑制、删除与证明 | 仅有设计，未实现 | [隐私生命周期设计](privacy-lifecycle.md) |
+| ProcessingGrant、抑制、在线删除与证明 | 已实现；保留扫描/备份治理待部署 | [治理运行手册](governance.md) |
 | 生产监控、告警与 SLO | 未实现 | [路线图](../ROADMAP.md) |
 
 ## 术语速查
@@ -95,6 +99,7 @@
 | valid time | 由 `valid_from` / `valid_at` 表示的业务有效时间轴 |
 | known time | 由 `recorded_at` / `known_at` 表示的系统知识时间轴 |
 | RecallTrace | 某次召回的双时间边界、策略版本、候选和评分记录 |
+| MemoryUsage | 消费者实际交付的 revision、源投影摘要和交付摘要组成的不可变凭证 |
 | OutcomeEvent | 引用 RecallTrace 的真实业务结果；区分业务发生时间与系统记录时间 |
 | UtilityEstimate | 某修订在某上下文中的结果效用估计 |
 | StrategySnapshot | 不可变、可回滚的检索策略参数快照 |
